@@ -280,7 +280,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
                     dec_builder.append_value(v_i128);
                 }
-                Type::TIMESTAMP => {
+                ref pg_type @ (Type::TIMESTAMP | Type::TIMESTAMPTZ) => {
                     let Some(builder) = builder else {
                         return NoBuilderForIndexSnafu { index: i }.fail();
                     };
@@ -293,11 +293,11 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                         }
                         .fail();
                     };
-                    let v = row.try_get::<usize, Option<SystemTime>>(i).context(
-                        FailedToGetRowValueSnafu {
-                            pg_type: Type::TIMESTAMP,
-                        },
-                    )?;
+                    let v = row
+                        .try_get::<usize, Option<SystemTime>>(i)
+                        .with_context(|_| FailedToGetRowValueSnafu {
+                            pg_type: pg_type.clone(),
+                        })?;
 
                     match v {
                         Some(v) => {
@@ -419,7 +419,9 @@ fn map_column_type_to_data_type(column_type: &Type) -> Option<DataType> {
         // Inspect the scale from the first row. Precision will always be 38 for Decimal128.
         Type::NUMERIC => None,
         // We get a SystemTime that we can always convert into milliseconds
-        Type::TIMESTAMP => Some(DataType::Timestamp(TimeUnit::Millisecond, None)),
+        Type::TIMESTAMP | Type::TIMESTAMPTZ => {
+            Some(DataType::Timestamp(TimeUnit::Millisecond, None))
+        }
         Type::DATE => Some(DataType::Date32),
         Type::INT2_ARRAY => Some(DataType::List(Arc::new(Field::new(
             "item",
