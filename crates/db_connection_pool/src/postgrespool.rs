@@ -86,6 +86,9 @@ impl PostgresConnectionPool {
                 "pg_connection_string_key",
                 "pg_connection_string",
             ) {
+                if pg_connection_string.contains("sslmode=") {
+                    ssl_mode = "";
+                }
                 connection_string.push_str(pg_connection_string.as_str());
             } else {
                 if let Some(pg_host) = params.get("pg_host") {
@@ -131,14 +134,16 @@ impl PostgresConnectionPool {
             }
         }
 
-        let mode = match ssl_mode {
-            "disable" => "disable",
-            "prefer" => "prefer",
-            // tokio_postgres supports only disable, require and prefer
-            _ => "require",
+        if !ssl_mode.is_empty() {
+            let mode = match ssl_mode {
+                "disable" => "disable",
+                "prefer" => "prefer",
+                // tokio_postgres supports only disable, require and prefer
+                _ => "require",
+            };
+            connection_string.push_str(format!(" sslmode={mode}").as_str());
         };
 
-        connection_string.push_str(format!("sslmode={mode} ").as_str());
         let config = Config::from_str(connection_string.as_str()).context(ConnectionPoolSnafu)?;
 
         for host in config.get_hosts() {
