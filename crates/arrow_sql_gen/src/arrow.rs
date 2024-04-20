@@ -17,9 +17,10 @@ limitations under the License.
 use arrow::{
     array::{
         ArrayBuilder, BinaryBuilder, BooleanBuilder, Date32Builder, Decimal128Builder,
-        Float32Builder, Float64Builder, Int16Builder, Int32Builder, Int64Builder, Int8Builder,
-        ListBuilder, StringBuilder, TimestampMicrosecondBuilder, TimestampMillisecondBuilder,
-        TimestampNanosecondBuilder, TimestampSecondBuilder, UInt64Builder,
+        FixedSizeBinaryBuilder, Float32Builder, Float64Builder, Int16Builder, Int32Builder,
+        Int64Builder, Int8Builder, ListBuilder, StringBuilder, TimestampMicrosecondBuilder,
+        TimestampMillisecondBuilder, TimestampNanosecondBuilder, TimestampSecondBuilder,
+        UInt64Builder,
     },
     datatypes::{DataType, TimeUnit},
 };
@@ -65,6 +66,7 @@ pub fn map_data_type_to_array_builder(data_type: &DataType) -> Box<dyn ArrayBuil
             }
         },
         DataType::Date32 => Box::new(Date32Builder::new()),
+        DataType::FixedSizeBinary(s) => Box::new(FixedSizeBinaryBuilder::new(*s)),
         // We can't recursively call map_data_type_to_array_builder here because downcasting will not work if the
         // values_builder is boxed.
         DataType::List(values_field) => match values_field.data_type() {
