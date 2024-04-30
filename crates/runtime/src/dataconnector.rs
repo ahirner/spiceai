@@ -20,7 +20,7 @@ use datafusion::common::OwnedTableReference;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::execution::context::SessionContext;
-use datafusion::logical_expr::LogicalPlanBuilder;
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use lazy_static::lazy_static;
 use object_store::ObjectStore;
 use snafu::prelude::*;
@@ -35,6 +35,8 @@ use url::Url;
 use secrets::Secret;
 use std::future::Future;
 
+#[cfg(feature = "clickhouse")]
+pub mod clickhouse;
 #[cfg(feature = "databricks")]
 pub mod databricks;
 #[cfg(feature = "dremio")]
@@ -75,6 +77,11 @@ pub enum Error {
 
     #[snafu(display("Unable to create data frame: {source}"))]
     UnableToCreateDataFrame {
+        source: datafusion::error::DataFusionError,
+    },
+
+    #[snafu(display("Unable to filter data frame: {source}"))]
+    UnableToFilterDataFrame {
         source: datafusion::error::DataFusionError,
     },
 }
@@ -146,6 +153,8 @@ pub async fn register_all() {
     register_connector_factory("postgres", postgres::Postgres::create).await;
     #[cfg(feature = "duckdb")]
     register_connector_factory("duckdb", duckdb::DuckDB::create).await;
+    #[cfg(feature = "clickhouse")]
+    register_connector_factory("clickhouse", clickhouse::Clickhouse::create).await;
 }
 
 pub trait DataConnectorFactory {
@@ -184,14 +193,15 @@ pub trait DataConnector: Send + Sync {
     }
 }
 
-// Gets all data from a table provider and returns it as a vector of RecordBatches.
-pub async fn get_all_data(
+// Gets data from a table provider and returns it as a vector of RecordBatches.
+pub async fn get_data(
     ctx: &mut SessionContext,
     table_name: OwnedTableReference,
     table_provider: Arc<dyn TableProvider>,
     sql: Option<String>,
+    filters: Vec<Expr>,
 ) -> Result<(SchemaRef, Vec<arrow::record_batch::RecordBatch>)> {
-    let df = match sql {
+    let mut df = match sql {
         None => {
             let table_source = Arc::new(DefaultTableSource::new(Arc::clone(&table_provider)));
             let logical_plan = LogicalPlanBuilder::scan(table_name.clone(), table_source, None)
@@ -206,6 +216,10 @@ pub async fn get_all_data(
             .await
             .context(UnableToCreateDataFrameSnafu {})?,
     };
+
+    for filter in filters {
+        df = df.filter(filter).context(UnableToFilterDataFrameSnafu {})?;
+    }
 
     let batches = df.collect().await.context(UnableToScanTableProviderSnafu)?;
 
