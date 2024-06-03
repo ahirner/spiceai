@@ -37,6 +37,12 @@ Before you file an issue, make sure you've checked the following:
 
 This section describes the guidelines for contributing code / docs to Spice.ai.
 
+### Follow principles and guidelines
+
+- [Principles](/docs/PRINCIPLES.md)
+- [Style Guide](/docs/dev/style_guide.md)
+- [Error Handling](/docs/dev/error_handling.md)
+
 ### Pull Requests
 
 All contributions come through pull requests. To submit a proposed change, we recommend following this workflow:
@@ -92,8 +98,14 @@ brew install protobuf
 git clone https://github.com/spiceai/spiceai.git
 cd spiceai
 
-# Build and install OSS project
+# Build and install OSS project in release mode
 make install
+
+# Build and install OSS project in dev mode
+make install-dev
+
+# Also you can specify specific features
+SPICED_CUSTOM_FEATURES="postgres sqlite" make install
 
 # Run the following to temporarily add spice to your PATH.
 # Add it to the end of your .bashrc or .zshrc to permanently add spice to your PATH.

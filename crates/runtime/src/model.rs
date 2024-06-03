@@ -14,137 +14,220 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::modelruntime::ModelRuntime;
-use crate::modelruntime::Runnable;
-use crate::modelsource::create_source_from;
-use crate::DataFusion;
 use arrow::record_batch::RecordBatch;
-use secrets::Secret;
-use snafu::prelude::*;
+use llms::embeddings::Embed;
+use llms::nql::{Error as LlmError, Nql};
+use llms::openai::{DEFAULT_EMBEDDING_MODEL, DEFAULT_LLM_MODEL};
+use model_components::model::{Error as ModelError, Model};
+use spicepod::component::embeddings::{EmbeddingParams, EmbeddingPrefix};
+use spicepod::component::llms::{Architecture, LlmParams, LlmPrefix};
+use std::collections::HashMap;
+use std::result::Result;
 use std::sync::Arc;
-use tokio::sync::RwLock;
 
-pub struct Model {
-    runnable: Box<dyn Runnable>,
-    pub model: spicepod::component::model::Model,
-}
+use crate::DataFusion;
 
-pub type Result<T, E = Error> = std::result::Result<T, E>;
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display("Unknown model source: {source}"))]
-    UnknownModelSource { source: crate::modelsource::Error },
-
-    #[snafu(display("Unable to load model from path: {source}"))]
-    UnableToLoadModel { source: crate::modelsource::Error },
-
-    #[snafu(display("Unable to init model: {source}"))]
-    UnableToInitModel { source: crate::modelruntime::Error },
-
-    #[snafu(display("Unable to query: {source}"))]
-    UnableToQuery {
-        source: datafusion::error::DataFusionError,
-    },
-
-    #[snafu(display("Unable to run model: {source}"))]
-    UnableToRunModel { source: crate::modelruntime::Error },
-
-    #[snafu(display("Unable to load required secrets"))]
-    UnableToLoadRequiredSecrets {},
-}
-
-impl Model {
-    pub async fn load(
-        model: spicepod::component::model::Model,
-        secret: Option<Secret>,
-    ) -> Result<Self> {
-        let source = source(&model.from);
-        let source = source.as_str();
-
-        let Some(secret) = secret else {
-            tracing::warn!(
-                "Unable to load model {}: unable to get secret for source {}",
-                model.name,
-                source
-            );
-            return UnableToLoadRequiredSecretsSnafu {}.fail();
-        };
-
-        let mut params = std::collections::HashMap::new();
-        params.insert("name".to_string(), model.name.to_string());
-        params.insert("path".to_string(), path(&model.from));
-        params.insert("from".to_string(), path(&model.from));
-        params.insert("files".to_string(), model.files.join(",").to_string());
-
-        let tract = crate::modelruntime::tract::Tract {
-            path: create_source_from(source)
-                .context(UnknownModelSourceSnafu)?
-                .pull(secret, Arc::new(Option::from(params)))
-                .await
-                .context(UnableToLoadModelSnafu)?
-                .clone()
-                .to_string(),
-        }
-        .load()
-        .context(UnableToInitModelSnafu {})?;
-
-        Ok(Self {
-            runnable: tract,
-            model: model.clone(),
-        })
-    }
-
-    pub async fn run(&self, df: Arc<RwLock<DataFusion>>) -> Result<RecordBatch> {
-        let data = df
-            .read()
-            .await
-            .ctx
-            .sql(
-                &(format!(
-                    "select * from datafusion.public.{} order by ts asc",
-                    self.model.datasets[0]
-                )),
-            )
-            .await
-            .context(UnableToQuerySnafu {})?
-            .collect()
-            .await
-            .context(UnableToQuerySnafu {})?;
-
-        let result = self.runnable.run(data).context(UnableToRunModelSnafu {})?;
-
-        Ok(result)
+pub async fn run(m: &Model, df: Arc<DataFusion>) -> Result<RecordBatch, ModelError> {
+    match df
+        .ctx
+        .sql(
+            &(format!(
+                "select * from datafusion.public.{} order by ts asc",
+                m.model.datasets[0]
+            )),
+        )
+        .await
+    {
+        Ok(data) => match data.collect().await {
+            Ok(d) => m.run(d),
+            Err(e) => Err(ModelError::UnableToRunModel {
+                source: Box::new(e),
+            }),
+        },
+        Err(e) => Err(ModelError::UnableToRunModel {
+            source: Box::new(e),
+        }),
     }
 }
 
-#[must_use]
-pub(crate) fn source(from: &str) -> String {
-    match from {
-        s if s.starts_with("spiceai:") => "spiceai".to_string(),
-        s if s.starts_with("huggingface:") => "huggingface".to_string(),
-        s if s.starts_with("file:/") => "localhost".to_string(),
-        _ => "spiceai".to_string(),
+pub fn try_to_embedding(
+    component: &spicepod::component::embeddings::Embeddings,
+) -> Result<Box<dyn Embed>, LlmError> {
+    let prefix = component.get_prefix().ok_or(LlmError::UnknownModelSource {
+        source: format!(
+            "Unknown model source for spicepod component from: {}",
+            component.from.clone()
+        )
+        .into(),
+    })?;
+
+    let model_id = component.get_model_id();
+
+    match construct_embedding_params(&prefix, &(component.params).clone().unwrap_or_default()) {
+        EmbeddingParams::OpenAiParams {
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        } => Ok(Box::new(llms::openai::Openai::new(
+            model_id.unwrap_or(DEFAULT_EMBEDDING_MODEL.to_string()),
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        ))),
+        EmbeddingParams::None => Err(LlmError::UnsupportedTaskForModel {
+            from: component.from.clone(),
+            task: "embedding".into(),
+        }),
     }
 }
 
-#[must_use]
-pub(crate) fn path(from: &str) -> String {
-    let sources = vec!["spiceai:"];
+/// Attempt to derive a runnable NQL model from a given component from the Spicepod definition.
+pub fn try_to_nql(component: &spicepod::component::llms::Llm) -> Result<Box<dyn Nql>, LlmError> {
+    let prefix = component.get_prefix().ok_or(LlmError::UnknownModelSource {
+        source: format!(
+            "Unknown model source for spicepod component from: {}",
+            component.from.clone()
+        )
+        .into(),
+    })?;
 
-    for source in &sources {
-        if from.starts_with(source) {
-            match from.find(':') {
-                Some(index) => return from[index + 1..].to_string(),
-                None => return from.to_string(),
+    let model_id = component.get_model_id();
+
+    match construct_llm_params(
+        &prefix,
+        &model_id,
+        &(component.params).clone().unwrap_or_default(),
+    ) {
+        Ok(LlmParams::OpenAiParams {
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        }) => Ok(Box::new(llms::openai::Openai::new(
+            model_id.unwrap_or(DEFAULT_LLM_MODEL.to_string()),
+            api_base,
+            api_key,
+            org_id,
+            project_id,
+        ))),
+        Ok(LlmParams::LocalModelParams {
+            weights_path,
+            tokenizer_path,
+            tokenizer_config_path,
+        }) => llms::nql::create_local_model(
+            &weights_path,
+            tokenizer_path.as_deref(),
+            tokenizer_config_path.as_ref(),
+        ),
+        Ok(LlmParams::HuggingfaceParams {
+            model_type,
+            weights_path,
+            tokenizer_path,
+            tokenizer_config_path,
+        }) => {
+            match component.get_model_id() {
+                Some(id) => {
+                    llms::nql::create_hf_model(
+                        &id,
+                        model_type.map(|x| x.to_string()),
+                        &weights_path,
+                        &tokenizer_path,
+                        &tokenizer_config_path, // TODO handle inline chat templates
+                    )
+                }
+                None => Err(LlmError::FailedToLoadModel {
+                    source: format!("Failed to load model from: {}", component.from).into(),
+                }),
             }
         }
+        Err(e) => Err(e),
+        _ => Err(LlmError::UnknownModelSource {
+            source: format!(
+                "Unknown model source for spicepod component from: {}",
+                component.from.clone()
+            )
+            .into(),
+        }),
     }
-
-    from.to_string()
 }
 
-#[must_use]
-pub fn version(from: &str) -> String {
-    let path = path(from);
-    path.split(':').last().unwrap_or("").to_string()
+/// Construct the parameters needed to create an LLM based on its source (i.e. prefix).
+/// If a `model_id` is provided (in the `from: `), it is provided.
+fn construct_llm_params(
+    from: &LlmPrefix,
+    model_id: &Option<String>,
+    params: &HashMap<String, String>,
+) -> Result<LlmParams, LlmError> {
+    match from {
+        LlmPrefix::HuggingFace => {
+            let model_type = params.get("model_type").cloned();
+            let arch = match model_type {
+                Some(arch) => {
+                    let a = Architecture::try_from(arch.as_str()).map_err(|_| {
+                        LlmError::UnknownModelSource {
+                            source: format!("Unknown model architecture {arch} for spicepod llm")
+                                .into(),
+                        }
+                    })?;
+                    Some(a)
+                }
+                None => None,
+            };
+
+            Ok(LlmParams::HuggingfaceParams {
+                model_type: arch,
+                weights_path: model_id.clone().or(params.get("weights_path").cloned()),
+                tokenizer_path: params.get("tokenizer_path").cloned(),
+                tokenizer_config_path: params.get("tokenizer_config_path").cloned(),
+            })
+        }
+        LlmPrefix::File => {
+            let weights_path = model_id
+                .clone()
+                .or(params.get("weights_path").cloned())
+                .ok_or(LlmError::FailedToLoadModel {
+                    source: "No 'weights_path' parameter provided".into(),
+                })?
+                .clone();
+            let tokenizer_path = params.get("tokenizer_path").cloned();
+            let tokenizer_config_path = params
+                .get("tokenizer_config_path")
+                .ok_or(LlmError::FailedToLoadTokenizer {
+                    source: "No 'tokenizer_config_path' parameter provided".into(),
+                })?
+                .clone();
+            Ok(LlmParams::LocalModelParams {
+                weights_path,
+                tokenizer_path,
+                tokenizer_config_path,
+            })
+        }
+
+        LlmPrefix::SpiceAi => Ok(LlmParams::SpiceAiParams {}),
+
+        LlmPrefix::OpenAi => Ok(LlmParams::OpenAiParams {
+            api_base: params.get("endpoint").cloned(),
+            api_key: params.get("openai_api_key").cloned(),
+            org_id: params.get("openai_org_id").cloned(),
+            project_id: params.get("openai_project_id").cloned(),
+        }),
+    }
+}
+
+/// Construct the parameters needed to create an [`Embeddings`] based on its source (i.e. prefix).
+/// If a `model_id` is provided (in the `from: `), it is provided.
+fn construct_embedding_params(
+    from: &EmbeddingPrefix,
+    params: &HashMap<String, String>,
+) -> EmbeddingParams {
+    match from {
+        EmbeddingPrefix::OpenAi => EmbeddingParams::OpenAiParams {
+            api_base: params.get("endpoint").cloned(),
+            api_key: params.get("openai_api_key").cloned(),
+            org_id: params.get("openai_org_id").cloned(),
+            project_id: params.get("openai_project_id").cloned(),
+        },
+    }
 }

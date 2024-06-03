@@ -15,7 +15,8 @@ limitations under the License.
 */
 
 use async_trait::async_trait;
-use datafusion::{common::OwnedTableReference, datasource::TableProvider};
+use datafusion::datasource::TableProvider;
+use datafusion::sql::TableReference;
 use deltalake::aws::storage::s3_constants::AWS_S3_ALLOW_UNSAFE_RENAME;
 use deltalake::open_table_with_storage_options;
 use secrets::{ExposeSecret, Secret};
@@ -29,12 +30,12 @@ use crate::deltatable::write::DeltaTableWriter;
 #[derive(Clone)]
 pub struct DatabricksDelta {
     pub secret: Arc<Option<Secret>>,
-    pub params: Arc<Option<HashMap<String, String>>>,
+    pub params: Arc<HashMap<String, String>>,
 }
 
 impl DatabricksDelta {
     #[must_use]
-    pub fn new(secret: Arc<Option<Secret>>, params: Arc<Option<HashMap<String, String>>>) -> Self {
+    pub fn new(secret: Arc<Option<Secret>>, params: Arc<HashMap<String, String>>) -> Self {
         Self { secret, params }
     }
 }
@@ -43,7 +44,7 @@ impl DatabricksDelta {
 impl Read for DatabricksDelta {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
         get_delta_table(
             Arc::clone(&self.secret),
@@ -58,7 +59,7 @@ impl Read for DatabricksDelta {
 impl ReadWrite for DatabricksDelta {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>> {
         let delta_table = get_delta_table(
             Arc::clone(&self.secret),
@@ -73,8 +74,8 @@ impl ReadWrite for DatabricksDelta {
 
 async fn get_delta_table(
     secret: Arc<Option<Secret>>,
-    table_reference: OwnedTableReference,
-    params: Arc<Option<HashMap<String, String>>>,
+    table_reference: TableReference,
+    params: Arc<HashMap<String, String>>,
 ) -> Result<Arc<dyn TableProvider>, Box<dyn Error + Send + Sync>> {
     // Needed to be able to load the s3:// scheme
     deltalake::aws::register_handlers(None);
@@ -104,15 +105,10 @@ struct DatabricksTablesApiResponse {
 
 #[allow(clippy::implicit_hasher)]
 pub async fn resolve_table_uri(
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
     secret: &Arc<Option<Secret>>,
-    params: Arc<Option<HashMap<String, String>>>,
+    params: Arc<HashMap<String, String>>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let params = match params.as_ref() {
-        None => return Err("Dataset params not found".into()),
-        Some(params) => params,
-    };
-
     let Some(endpoint) = params.get("endpoint") else {
         return Err("Endpoint not found in dataset params".into());
     };

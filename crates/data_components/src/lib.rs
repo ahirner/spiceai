@@ -18,7 +18,7 @@ limitations under the License.
 use std::{error::Error, sync::Arc};
 
 use async_trait::async_trait;
-use datafusion::{common::OwnedTableReference, datasource::TableProvider};
+use datafusion::{datasource::TableProvider, sql::TableReference};
 
 pub mod arrow;
 #[cfg(feature = "databricks")]
@@ -37,21 +37,27 @@ pub mod flight;
 pub mod flightsql;
 #[cfg(feature = "mysql")]
 pub mod mysql;
+#[cfg(feature = "odbc")]
+pub mod odbc;
 #[cfg(feature = "postgres")]
 pub mod postgres;
-#[cfg(feature = "databricks")]
+#[cfg(feature = "spark_connect")]
 pub mod spark_connect;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 
+#[cfg(feature = "snowflake")]
+pub mod snowflake;
+
 pub mod delete;
+pub mod object;
 pub mod util;
 
 #[async_trait]
 pub trait Read: Send + Sync {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
 }
 
@@ -59,7 +65,7 @@ pub trait Read: Send + Sync {
 pub trait ReadWrite: Send + Sync {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
 }
 
@@ -68,6 +74,6 @@ pub trait ReadWrite: Send + Sync {
 pub trait Stream: Send + Sync {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
 }

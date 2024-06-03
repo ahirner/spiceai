@@ -21,7 +21,7 @@ use arrow_flight::error::FlightError;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
-    common::{project_schema, OwnedTableReference},
+    common::{project_schema, TableReference},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
@@ -31,7 +31,6 @@ use datafusion::{
         stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
         ExecutionPlan, Partitioning, PlanProperties,
     },
-    sql::TableReference,
 };
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
@@ -41,6 +40,7 @@ use std::{any::Any, fmt, sync::Arc};
 
 use self::write::FlightTableWriter;
 
+pub mod federation;
 pub mod stream;
 pub mod write;
 
@@ -63,13 +63,14 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Clone)]
 pub struct FlightFactory {
+    name: &'static str,
     client: FlightClient,
 }
 
 impl FlightFactory {
     #[must_use]
-    pub fn new(client: FlightClient) -> Self {
-        Self { client }
+    pub fn new(name: &'static str, client: FlightClient) -> Self {
+        Self { name, client }
     }
 }
 
@@ -77,12 +78,18 @@ impl FlightFactory {
 impl Read for FlightFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        FlightTable::create(self.client.clone(), table_reference)
-            .await
-            .map(|f| Arc::new(f) as Arc<dyn TableProvider + 'static>)
-            .boxed()
+        let table_provider =
+            Arc::new(FlightTable::create(self.name, self.client.clone(), table_reference).await?);
+
+        let table_provider = Arc::new(
+            table_provider
+                .create_federated_table_provider()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+        );
+
+        Ok(table_provider)
     }
 }
 
@@ -90,7 +97,7 @@ impl Read for FlightFactory {
 impl ReadWrite for FlightFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let read_provider = Read::table_provider(self, table_reference.clone()).await?;
 
@@ -103,34 +110,45 @@ impl ReadWrite for FlightFactory {
 }
 
 pub struct FlightTable {
+    name: &'static str,
+    join_push_down_context: String,
     client: FlightClient,
     schema: SchemaRef,
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
 }
 
 #[allow(clippy::needless_pass_by_value)]
 impl FlightTable {
     pub async fn create(
+        name: &'static str,
         client: FlightClient,
-        table_reference: impl Into<OwnedTableReference>,
+        table_reference: impl Into<TableReference>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let schema = Self::get_schema(client.clone(), &table_reference).await?;
         Ok(Self {
+            name,
             client: client.clone(),
             schema,
             table_reference,
+            join_push_down_context: format!("url={},username={}", client.url(), client.username()),
         })
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    async fn get_schema<'a>(
+    async fn get_schema(
         client: FlightClient,
-        table_reference: impl Into<TableReference<'a>>,
+        table_reference: &TableReference,
     ) -> Result<SchemaRef> {
         let mut stream = client
             .clone()
-            .query(format!("SELECT * FROM {} limit 1", table_reference.into()).as_str())
+            .query(
+                format!(
+                    "SELECT * FROM {} limit 1",
+                    table_reference.to_quoted_string()
+                )
+                .as_str(),
+            )
             .await
             .context(FlightSnafu)?;
 
@@ -206,7 +224,7 @@ impl TableProvider for FlightTable {
 #[derive(Clone)]
 struct FlightExec {
     projected_schema: SchemaRef,
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
     client: FlightClient,
     filters: Vec<Expr>,
     limit: Option<usize>,
@@ -217,7 +235,7 @@ impl FlightExec {
     fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
-        table_reference: &OwnedTableReference,
+        table_reference: &TableReference,
         client: FlightClient,
         filters: &[Expr],
         limit: Option<usize>,

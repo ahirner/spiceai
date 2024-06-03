@@ -33,7 +33,6 @@ use arrow_flight::{
 };
 use datafusion::{
     arrow::datatypes::SchemaRef,
-    common::OwnedTableReference,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{context::SessionState, TaskContext},
@@ -43,11 +42,14 @@ use datafusion::{
         project_schema, stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType,
         ExecutionMode, ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream,
     },
+    sql::TableReference,
 };
 use tonic::codegen::Bytes;
 use tonic::transport::{channel, Channel};
 
 use crate::Read;
+
+pub mod federation;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -78,12 +80,13 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Clone)]
 pub struct FlightSQLFactory {
     client: FlightSqlServiceClient<Channel>,
+    endpoint: String,
 }
 
 impl FlightSQLFactory {
     #[must_use]
-    pub fn new(client: FlightSqlServiceClient<Channel>) -> Self {
-        Self { client }
+    pub fn new(client: FlightSqlServiceClient<Channel>, endpoint: String) -> Self {
+        Self { client, endpoint }
     }
 }
 
@@ -91,45 +94,70 @@ impl FlightSQLFactory {
 impl Read for FlightSQLFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        FlightSQLTable::create(self.client.clone(), table_reference)
-            .await
-            .map(|f| Arc::new(f) as Arc<dyn TableProvider + 'static>)
-            .boxed()
+        let table_provider = Arc::new(
+            FlightSQLTable::create(
+                "flightsql",
+                &self.endpoint,
+                self.client.clone(),
+                table_reference,
+            )
+            .await?,
+        );
+
+        let table_provider = Arc::new(
+            table_provider
+                .create_federated_table_provider()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+        );
+
+        Ok(table_provider)
     }
 }
 
 pub struct FlightSQLTable {
+    name: &'static str,
+    join_push_down_context: String,
     client: FlightSqlServiceClient<Channel>,
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
     schema: SchemaRef,
 }
 
 #[allow(clippy::needless_pass_by_value)]
 impl FlightSQLTable {
     pub async fn create(
+        name: &'static str,
+        endpoint: &str,
         client: FlightSqlServiceClient<Channel>,
-        table_reference: impl Into<OwnedTableReference>,
+        table_reference: impl Into<TableReference>,
     ) -> Result<Self> {
-        let table_reference: OwnedTableReference = table_reference.into();
+        let table_reference: TableReference = table_reference.into();
         let schema = Self::get_schema(client.clone(), table_reference.clone()).await?;
         Ok(Self {
+            name,
             client,
             table_reference,
             schema,
+            join_push_down_context: format!("endpoint={endpoint}"),
         })
     }
 
     pub async fn from_static(
         s: &'static str,
-        table_reference: impl Into<OwnedTableReference>,
+        table_reference: impl Into<TableReference>,
     ) -> Result<Self> {
         let channel = channel::Endpoint::from_static(s)
             .connect()
             .await
             .context(UnableToConnectToServerSnafu)?;
-        Self::create(FlightSqlServiceClient::new(channel), table_reference.into()).await
+        Self::create(
+            "flightsql",
+            s,
+            FlightSqlServiceClient::new(channel),
+            table_reference.into(),
+        )
+        .await
     }
 
     fn get_str_from_record_batch(b: &RecordBatch, row: usize, col_name: &str) -> Option<String> {
@@ -144,7 +172,7 @@ impl FlightSQLTable {
     #[must_use]
     pub fn get_table_schema_if_present(
         batches: Vec<RecordBatch>,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Option<SchemaRef> {
         let mut possible_schema_bytz: Vec<Vec<u8>> = vec![];
 
@@ -163,7 +191,7 @@ impl FlightSQLTable {
                         .unwrap_or_default();
 
                     // Only check fields in `table_reference` matches.
-                    if table_reference.resolved_eq(&OwnedTableReference::full(
+                    if table_reference.resolved_eq(&TableReference::full(
                         catalog_name,
                         db_schema_name,
                         table_name,
@@ -203,7 +231,7 @@ impl FlightSQLTable {
 
     pub async fn get_schema(
         mut client: FlightSqlServiceClient<Channel>,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<SchemaRef> {
         let flight_info = client
             .get_tables(CommandGetTables {
@@ -310,7 +338,7 @@ impl TableProvider for FlightSQLTable {
 #[derive(Clone)]
 struct FlightSqlExec {
     projected_schema: SchemaRef,
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
     client: FlightSqlServiceClient<Channel>,
     filters: Vec<Expr>,
     limit: Option<usize>,
@@ -321,7 +349,7 @@ impl FlightSqlExec {
     fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
-        table_reference: &OwnedTableReference,
+        table_reference: &TableReference,
         client: FlightSqlServiceClient<Channel>,
         filters: &[Expr],
         limit: Option<usize>,

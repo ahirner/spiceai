@@ -16,7 +16,10 @@ limitations under the License.
 
 #![allow(clippy::module_name_repetitions)]
 use async_trait::async_trait;
-use datafusion::{common::OwnedTableReference, datasource::TableProvider};
+use datafusion::{
+    datasource::TableProvider,
+    sql::{unparser::dialect::MySqlDialect, TableReference},
+};
 use db_connection_pool::DbConnectionPool;
 use mysql_async::prelude::ToValue;
 use snafu::prelude::*;
@@ -57,13 +60,22 @@ impl MySQLTableFactory {
 impl Read for MySQLTableFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
-        let table_provider = SqlTable::new(&pool, table_reference)
-            .await
-            .context(UnableToConstructSQLTableSnafu)?;
+        let table_provider = Arc::new(
+            SqlTable::new("mysql", &pool, table_reference, None)
+                .await
+                .context(UnableToConstructSQLTableSnafu)?
+                .with_dialect(Arc::new(MySqlDialect {})),
+        );
 
-        Ok(Arc::new(table_provider))
+        let table_provider = Arc::new(
+            table_provider
+                .create_federated_table_provider()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+        );
+
+        Ok(table_provider)
     }
 }

@@ -30,6 +30,7 @@ use arrow::datatypes::DataType;
 use arrow::datatypes::Field;
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
+use datafusion::sql::TableReference;
 use indexmap::IndexMap;
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsService;
 use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
@@ -43,7 +44,6 @@ use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
 use opentelemetry_proto::tonic::metrics::v1::DataPointFlags;
 use opentelemetry_proto::tonic::metrics::v1::NumberDataPoint;
 use snafu::prelude::*;
-use tokio::sync::RwLock;
 use tonic_0_9_0::async_trait;
 use tonic_0_9_0::codec::CompressionEncoding;
 use tonic_0_9_0::transport::Server;
@@ -99,7 +99,7 @@ const TIME_UNIX_NANO_COLUMN_NAME: &str = "time_unix_nano";
 const START_TIME_UNIX_NANO_COLUMN_NAME: &str = "start_time_unix_nano";
 
 pub struct Service {
-    data_fusion: Arc<RwLock<DataFusion>>,
+    data_fusion: Arc<DataFusion>,
     once_tracer: OnceTracer,
 }
 
@@ -117,8 +117,6 @@ impl MetricsService for Service {
                     if let Some(data) = metric.data {
                         let existing_schema = match self
                             .data_fusion
-                            .read()
-                            .await
                             .get_arrow_schema(metric.name.as_str())
                             .await
                         {
@@ -134,9 +132,10 @@ impl MetricsService for Service {
 
                         match record_batch_result {
                             Ok(record_batch) => {
-                                let df = self.data_fusion.read().await;
-
-                                if !df.is_writable(metric.name.as_str()) {
+                                if !self
+                                    .data_fusion
+                                    .is_writable(&TableReference::bare(metric.name.to_string()))
+                                {
                                     warn_once!(
                                         self.once_tracer,
                                         "No writable dataset defined for metric {}, skipping",
@@ -154,8 +153,13 @@ impl MetricsService for Service {
                                 };
 
                                 let mut write_failed = false;
-                                if let Err(e) =
-                                    df.write_data(metric.name.as_str(), data_update).await
+                                if let Err(e) = self
+                                    .data_fusion
+                                    .write_data(
+                                        TableReference::bare(metric.name.as_str()),
+                                        data_update,
+                                    )
+                                    .await
                                 {
                                     write_failed = true;
                                     tracing::debug!("Failed to add OpenTelemetry data: {e}");
@@ -580,7 +584,7 @@ fn append_null(
     }
 }
 
-pub async fn start(bind_address: SocketAddr, data_fusion: Arc<RwLock<DataFusion>>) -> Result<()> {
+pub async fn start(bind_address: SocketAddr, data_fusion: Arc<DataFusion>) -> Result<()> {
     let service = Service {
         data_fusion,
         once_tracer: OnceTracer::new(),

@@ -196,3 +196,29 @@ impl SecretsProvider {
         }
     }
 }
+
+#[must_use]
+#[allow(clippy::implicit_hasher)]
+pub fn get_secret_or_param(
+    params: &HashMap<String, String>,
+    secret: &Option<Secret>,
+    secret_param_key: &str,
+    param_key: &str,
+) -> Option<String> {
+    let secret_param_val = match params.get(secret_param_key) {
+        Some(val) => val,
+        None => param_key,
+    };
+
+    if let Some(secrets) = secret {
+        if let Some(secret_val) = secrets.get(secret_param_val) {
+            return Some(secret_val.to_string());
+        };
+    };
+
+    if let Some(param_val) = params.get(param_key) {
+        return Some(param_val.to_string());
+    };
+
+    None
+}

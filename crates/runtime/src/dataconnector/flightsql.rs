@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use super::{DataConnector, DataConnectorFactory};
+use crate::component::dataset::Dataset;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
 use data_components::flightsql::FlightSQLFactory;
@@ -23,7 +24,6 @@ use datafusion::datasource::TableProvider;
 use flight_client::tls::new_tls_flight_channel;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -36,11 +36,6 @@ pub enum Error {
 
     #[snafu(display("Unable to construct TLS flight client: {source}"))]
     UnableToConstructTlsChannel { source: flight_client::tls::Error },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -53,13 +48,12 @@ pub struct FlightSQL {
 impl DataConnectorFactory for FlightSQL {
     fn create(
         secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let endpoint: String = params
-                .as_ref() // &Option<HashMap<String, String>>
-                .as_ref() // Option<&HashMap<String, String>>
-                .and_then(|params| params.get("endpoint").cloned())
+                .get("endpoint")
+                .cloned()
                 .context(MissingEndpointParameterSnafu)?;
             let flight_channel = new_tls_flight_channel(&endpoint)
                 .await
@@ -74,7 +68,7 @@ impl DataConnectorFactory for FlightSQL {
                     )
                     .await;
             };
-            let flightsql_factory = FlightSQLFactory::new(client);
+            let flightsql_factory = FlightSQLFactory::new(client, endpoint);
             Ok(Arc::new(Self { flightsql_factory }) as Arc<dyn DataConnector>)
         })
     }
@@ -89,11 +83,13 @@ impl DataConnector for FlightSQL {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         Ok(
             Read::table_provider(&self.flightsql_factory, dataset.path().into())
                 .await
-                .context(UnableToGetReadProviderSnafu)?,
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "flightsql",
+                })?,
         )
     }
 }

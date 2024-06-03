@@ -15,8 +15,10 @@ limitations under the License.
 */
 
 use std::any::Any;
+use std::error::Error;
 
 use arrow::datatypes::SchemaRef;
+use arrow_sql_gen::postgres::columns_to_schema;
 use arrow_sql_gen::postgres::rows_to_arrow;
 use bb8_postgres::tokio_postgres::types::ToSql;
 use bb8_postgres::PostgresConnectionManager;
@@ -31,7 +33,7 @@ use super::DbConnection;
 use super::Result;
 
 #[derive(Debug, Snafu)]
-pub enum Error {
+pub enum PostgresError {
     #[snafu(display("{source}"))]
     QueryError {
         source: bb8_postgres::tokio_postgres::Error,
@@ -40,6 +42,11 @@ pub enum Error {
     #[snafu(display("Failed to convert query result to Arrow: {source}"))]
     ConversionError {
         source: arrow_sql_gen::postgres::Error,
+    },
+
+    #[snafu(display("{source}"))]
+    InternalError {
+        source: tokio_postgres::error::Error,
     },
 }
 
@@ -86,21 +93,42 @@ impl<'a>
         PostgresConnection { conn }
     }
 
-    async fn get_schema(&self, table_reference: &TableReference) -> Result<SchemaRef> {
-        let rows = self
+    async fn get_schema(
+        &self,
+        table_reference: &TableReference,
+    ) -> Result<SchemaRef, super::Error> {
+        match self
             .conn
-            .query(
-                &format!(
-                    "SELECT * FROM {} LIMIT 1",
-                    table_reference.to_quoted_string()
-                ),
-                &[],
-            )
+            .prepare(&format!(
+                "SELECT * FROM {} LIMIT 1",
+                table_reference.to_quoted_string()
+            ))
             .await
-            .context(QuerySnafu)?;
-        let rec = rows_to_arrow(rows.as_slice()).context(ConversionSnafu)?;
-        let schema = rec.schema();
-        Ok(schema)
+        {
+            Ok(statement) => {
+                return columns_to_schema(statement.columns())
+                    .boxed()
+                    .context(super::UnableToGetSchemaSnafu)
+            }
+            Err(err) => {
+                if let Some(error_source) = err.source() {
+                    if let Some(pg_error) =
+                        error_source.downcast_ref::<tokio_postgres::error::DbError>()
+                    {
+                        if pg_error.code() == &tokio_postgres::error::SqlState::UNDEFINED_TABLE {
+                            return Err(super::Error::UndefinedTable {
+                                source: Box::new(pg_error.clone()),
+                                table_name: table_reference.to_string(),
+                            });
+                        }
+                    }
+                }
+
+                return Err(super::Error::UnableToGetSchema {
+                    source: Box::new(err),
+                });
+            }
+        }
     }
 
     async fn query_arrow(

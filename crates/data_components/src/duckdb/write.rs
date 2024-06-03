@@ -26,7 +26,7 @@ use datafusion::{
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
     physical_plan::{
-        insert::{DataSink, FileSinkExec},
+        insert::{DataSink, DataSinkExec},
         metrics::MetricsSet,
         DisplayAs, DisplayFormatType, ExecutionPlan,
     },
@@ -83,7 +83,7 @@ impl TableProvider for DuckDBTableWriter {
         input: Arc<dyn ExecutionPlan>,
         overwrite: bool,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(FileSinkExec::new(
+        Ok(Arc::new(DataSinkExec::new(
             input,
             Arc::new(DuckDBDataSink::new(Arc::clone(&self.duckdb), overwrite)),
             self.schema(),
@@ -220,20 +220,20 @@ impl DeletionSink for DuckDBDeletionSink {
 mod tests {
     use std::{collections::HashMap, sync::Arc};
 
+    use crate::{delete::get_deletion_provider, duckdb::DuckDBTableProviderFactory};
     use arrow::{
         array::{Int64Array, RecordBatch, StringArray, TimestampSecondArray, UInt64Array},
         datatypes::{DataType, Schema},
     };
     use datafusion::{
-        common::{parsers::CompressionTypeVariant, Constraints, OwnedTableReference, ToDFSchema},
+        common::{parsers::CompressionTypeVariant, Constraints, TableReference, ToDFSchema},
         datasource::provider::TableProviderFactory,
         execution::context::SessionContext,
         logical_expr::{cast, col, lit, CreateExternalTable},
         physical_plan::{collect, test::exec::MockExec},
         scalar::ScalarValue,
     };
-
-    use crate::{delete::get_deletion_provider, duckdb::DuckDBTableProviderFactory};
+    use duckdb::AccessMode;
 
     #[tokio::test]
     #[allow(clippy::too_many_lines)]
@@ -251,7 +251,7 @@ mod tests {
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
         let external_table = CreateExternalTable {
             schema: df_schema,
-            name: OwnedTableReference::bare("test_table"),
+            name: TableReference::bare("test_table"),
             location: String::new(),
             file_type: String::new(),
             has_header: false,
@@ -268,6 +268,7 @@ mod tests {
         };
         let ctx = SessionContext::new();
         let table = DuckDBTableProviderFactory::default()
+            .access_mode(AccessMode::ReadWrite)
             .create(&ctx.state(), &external_table)
             .await
             .expect("table should be created");

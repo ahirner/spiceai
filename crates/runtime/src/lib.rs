@@ -19,43 +19,60 @@ limitations under the License.
 use std::borrow::Borrow;
 use std::collections::HashSet;
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 
+use crate::spice_metrics::MetricsRecorder;
+use crate::{dataconnector::DataConnector, datafusion::DataFusion};
+use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::parser::{self, DFParser};
 use ::datafusion::sql::sqlparser::ast::{SetExpr, TableFactor};
 use ::datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use ::datafusion::sql::sqlparser::{self, ast};
+use ::datafusion::sql::TableReference;
 use accelerated_table::AcceleratedTable;
 use app::App;
+use cache::QueryResultsCacheProvider;
+use component::dataset::{self, Dataset};
 use config::Config;
-use model::Model;
+use datafusion::query::query_history;
+use datafusion::SPICE_RUNTIME_SCHEMA;
+use futures::future::join_all;
+use futures::StreamExt;
+use llms::embeddings::Embed;
+use llms::nql::Nql;
+use metrics::SetRecorderError;
+use model::{try_to_embedding, try_to_nql};
+use model_components::{model::Model, modelsource::source as model_source};
 pub use notify::Error as NotifyError;
 use secrets::{spicepod_secret_store_type, Secret};
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
-use spicepod::component::dataset::Mode;
+use spice_metrics::get_metrics_table_reference;
 use spicepod::component::model::Model as SpicepodModel;
-use std::time::Duration;
 use tokio::sync::oneshot::error::RecvError;
+use tokio::sync::RwLock;
 use tokio::time::sleep;
-use tokio::{signal, sync::RwLock};
+pub use util::shutdown_signal;
 
-use crate::{dataconnector::DataConnector, datafusion::DataFusion};
-mod accelerated_table;
+use crate::extension::{Extension, ExtensionFactory};
+pub mod accelerated_table;
+pub mod component;
 pub mod config;
 pub mod dataaccelerator;
 pub mod dataconnector;
 pub mod datafusion;
 pub mod dataupdate;
 pub mod execution_plan;
+pub mod extension;
 mod flight;
 mod http;
+pub mod internal_table;
 pub mod model;
-pub mod modelformat;
-pub mod modelruntime;
-pub mod modelsource;
+pub mod object_store_registry;
+pub mod objectstore;
 mod opentelemetry;
 pub mod podswatcher;
+pub mod spice_metrics;
 pub mod status;
 pub mod timing;
 pub(crate) mod tracers;
@@ -83,10 +100,9 @@ pub enum Error {
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: NotifyError },
 
-    #[snafu(display("Unable to initialize data connector {data_connector}: {source}"))]
+    #[snafu(display("{source}"))]
     UnableToInitializeDataConnector {
         source: Box<dyn std::error::Error + Send + Sync>,
-        data_connector: String,
     },
 
     #[snafu(display("Unknown data connector: {data_connector}"))]
@@ -103,7 +119,7 @@ pub enum Error {
 
     #[snafu(display("Unable to create view: {source}"))]
     InvalidSQLView {
-        source: spicepod::component::dataset::Error,
+        source: crate::component::dataset::Error,
     },
 
     #[snafu(display("Unable to attach data connector {data_connector}: {source}"))]
@@ -134,54 +150,119 @@ pub enum Error {
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
-    #[snafu(display("The accelerator engine {name} is not available"))]
-    AcceleratorEngineNotAvailable { name: Arc<str> },
+    #[snafu(display("The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."))]
+    AcceleratorEngineNotAvailable { name: String },
+
+    #[snafu(display(
+        "Dataset names should not include a catalog. Unexpected '{}' in '{}'. Remove '{}' from the dataset name and try again.",
+        catalog,
+        name,
+        catalog,
+    ))]
+    DatasetNameIncludesCatalog { catalog: Arc<str>, name: Arc<str> },
 
     #[snafu(display("Unable to load dataset connector: {dataset}"))]
-    UnableToLoadDatasetConnector { dataset: String },
+    UnableToLoadDatasetConnector { dataset: TableReference },
 
     #[snafu(display("Unable to create accelerated table: {dataset}, {source}"))]
     UnableToCreateAcceleratedTable {
-        dataset: String,
+        dataset: TableReference,
         source: datafusion::Error,
     },
 
     #[snafu(display("Unable to receive accelerated table status: {source}"))]
     UnableToReceiveAcceleratedTableStatus { source: RecvError },
+
+    #[snafu(display("Unable to install metrics recorder: {source}"))]
+    UnableToInstallMetricsServer {
+        source: SetRecorderError<MetricsRecorder>,
+    },
+
+    #[snafu(display("Unable to start local metrics: {source}"))]
+    UnableToStartLocalMetrics { source: spice_metrics::Error },
+
+    #[snafu(display("Unable to track query history: {source}"))]
+    UnableToTrackQueryHistory { source: query_history::Error },
+
+    #[snafu(display("Unable to create metrics table: {source}"))]
+    UnableToCreateMetricsTable { source: DataFusionError },
+
+    #[snafu(display("Unable to register metrics table: {source}"))]
+    UnableToRegisterMetricsTable { source: datafusion::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+pub type LLMModelStore = HashMap<String, RwLock<Box<dyn Nql>>>;
+pub type EmbeddingModelStore = HashMap<String, RwLock<Box<dyn Embed>>>;
+
+#[derive(Clone)]
 pub struct Runtime {
     pub app: Arc<RwLock<Option<App>>>,
-    pub config: config::Config,
-    pub df: Arc<RwLock<DataFusion>>,
+    pub df: Arc<DataFusion>,
     pub models: Arc<RwLock<HashMap<String, Model>>>,
-    pub pods_watcher: podswatcher::PodsWatcher,
+    pub llms: Arc<RwLock<LLMModelStore>>,
+    pub embeds: Arc<RwLock<EmbeddingModelStore>>,
+    pub pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
     pub secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
 
+    extensions: Arc<RwLock<Vec<Box<dyn Extension>>>>,
     spaced_tracer: Arc<tracers::SpacedTracer>,
 }
 
 impl Runtime {
     #[must_use]
     pub async fn new(
-        config: Config,
-        app: Arc<RwLock<Option<app::App>>>,
-        df: Arc<RwLock<DataFusion>>,
-        pods_watcher: podswatcher::PodsWatcher,
+        app: Option<app::App>,
+        extension_factories: Arc<Vec<Box<dyn ExtensionFactory>>>,
     ) -> Self {
         dataconnector::register_all().await;
         dataaccelerator::register_all().await;
-        Runtime {
-            app,
-            config,
-            df,
+
+        let mut rt = Runtime {
+            app: Arc::new(RwLock::new(app)),
+            df: Arc::new(DataFusion::new()),
             models: Arc::new(RwLock::new(HashMap::new())),
-            pods_watcher,
+            llms: Arc::new(RwLock::new(HashMap::new())),
+            embeds: Arc::new(RwLock::new(HashMap::new())),
+            pods_watcher: Arc::new(RwLock::new(None)),
             secrets_provider: Arc::new(RwLock::new(secrets::SecretsProvider::new())),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
+            extensions: Arc::new(RwLock::new(vec![])),
+        };
+
+        let mut extensions: Vec<Box<dyn Extension>> = vec![];
+        for factory in extension_factories.iter() {
+            let mut extension = factory.create();
+            let extension_name = extension.name();
+            if let Err(err) = extension.initialize(&mut rt).await {
+                tracing::warn!("Failed to initialize extension {extension_name}: {err}");
+            } else {
+                extensions.push(extension);
+            };
         }
+
+        rt.extensions = Arc::new(RwLock::new(extensions));
+
+        rt
+    }
+
+    #[must_use]
+    pub fn datafusion(&self) -> Arc<DataFusion> {
+        Arc::clone(&self.df)
+    }
+
+    pub async fn start_extensions(&self) {
+        let mut extensions = self.extensions.write().await;
+        for i in 0..extensions.len() {
+            if let Err(err) = extensions[i].on_start(self).await {
+                tracing::warn!("Failed to start extension: {err}");
+            }
+        }
+    }
+
+    pub fn with_pods_watcher(&mut self, pods_watcher: podswatcher::PodsWatcher) {
+        self.pods_watcher = Arc::new(RwLock::new(Some(pods_watcher)));
     }
 
     pub async fn load_secrets(&self) {
@@ -202,14 +283,55 @@ impl Runtime {
         }
     }
 
+    fn datasets_iter(app: &App) -> impl Iterator<Item = Result<Dataset>> + '_ {
+        app.datasets.iter().cloned().map(Dataset::try_from)
+    }
+
+    /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
+    fn get_valid_datasets(app: &App, log_failures: bool) -> Vec<Dataset> {
+        Self::datasets_iter(app)
+            .zip(&app.datasets)
+            .filter_map(|(ds, spicepod_ds)| match ds {
+                Ok(ds) => Some(ds),
+                Err(e) => {
+                    if log_failures {
+                        status::update_dataset(
+                            &TableReference::parse_str(&spicepod_ds.name),
+                            status::ComponentStatus::Error,
+                        );
+                        metrics::counter!("datasets_load_error").increment(1);
+                        tracing::error!(dataset = &spicepod_ds.name, "{e}");
+                    }
+                    None
+                }
+            })
+            .collect()
+    }
+
     pub async fn load_datasets(&self) {
         let app_lock = self.app.read().await;
-        if let Some(app) = app_lock.as_ref() {
-            for ds in &app.datasets {
-                status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                self.load_dataset(ds, &app.datasets).await;
+        let Some(app) = app_lock.as_ref() else {
+            return;
+        };
+
+        let valid_datasets = Self::get_valid_datasets(app, true);
+        let mut futures = vec![];
+        for ds in &valid_datasets {
+            status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
+            futures.push(self.load_dataset(ds, &valid_datasets));
+        }
+
+        let app = self.app.read().await;
+
+        if let Some(app) = app.as_ref() {
+            if let Some(parallel_num) = app.runtime.num_of_parallel_loading_at_start_up {
+                let stream = futures::stream::iter(futures).buffer_unordered(parallel_num);
+                let _ = stream.collect::<Vec<_>>().await;
+                return;
             }
         }
+
+        let _ = join_all(futures).await;
     }
 
     // Caller must set `status::update_dataset(...` before calling `load_dataset`. This function will set error/ready statuses appropriately.`
@@ -222,11 +344,7 @@ impl Runtime {
                 Err(err) => {
                     status::update_dataset(&ds.name, status::ComponentStatus::Error);
                     metrics::counter!("datasets_load_error").increment(1);
-                    warn_spaced!(
-                        spaced_tracer,
-                        "Failed to get data connector from source for dataset {}, retrying: {err}",
-                        &ds.name
-                    );
+                    warn_spaced!(spaced_tracer, "{}{err}", "");
                     sleep(Duration::from_secs(1)).await;
                     continue;
                 }
@@ -257,7 +375,7 @@ impl Runtime {
         let existing_tables = all_datasets
             .iter()
             .map(|d| d.name.clone())
-            .collect::<Vec<String>>();
+            .collect::<Vec<TableReference>>();
 
         let secrets_provider = shared_secrets_provider.read().await;
 
@@ -271,7 +389,7 @@ impl Runtime {
         }
 
         let source = ds.source();
-        let params = Arc::new(ds.params.clone().map(|params| params.as_string_map()));
+        let params = Arc::new(ds.params.clone());
         let data_connector: Arc<dyn DataConnector> = match Runtime::get_dataconnector_from_source(
             &source,
             &secrets_provider,
@@ -283,11 +401,7 @@ impl Runtime {
             Err(err) => {
                 status::update_dataset(&ds.name, status::ComponentStatus::Error);
                 metrics::counter!("datasets_load_error").increment(1);
-                warn_spaced!(
-                    spaced_tracer,
-                    "Failed to get data connector from source for dataset {}: {err}",
-                    &ds.name
-                );
+                warn_spaced!(spaced_tracer, "{}{err}", "");
                 return UnableToLoadDatasetConnectorSnafu {
                     dataset: ds.name.clone(),
                 }
@@ -311,6 +425,17 @@ impl Runtime {
         let shared_secrets_provider: Arc<RwLock<secrets::SecretsProvider>> =
             Arc::clone(&self.secrets_provider);
 
+        // test dataset connectivity by attempting to get a read provider
+        if let Err(err) = data_connector.read_provider(&ds).await {
+            status::update_dataset(&ds.name, status::ComponentStatus::Error);
+            metrics::counter!("datasets_load_error").increment(1);
+            warn_spaced!(spaced_tracer, "{}{err}", "");
+            return UnableToLoadDatasetConnectorSnafu {
+                dataset: ds.name.clone(),
+            }
+            .fail();
+        }
+
         let data_connector = Arc::clone(&data_connector);
         match Runtime::register_dataset(
             &ds,
@@ -323,12 +448,12 @@ impl Runtime {
         .await
         {
             Ok(()) => {
-                tracing::info!("Loaded dataset: {}", &ds.name);
+                tracing::info!("Registered dataset {}", &ds.name);
                 let engine = ds.acceleration.map_or_else(
                     || "None".to_string(),
                     |acc| {
                         if acc.enabled {
-                            acc.engine().to_string()
+                            acc.engine.to_string()
                         } else {
                             "None".to_string()
                         }
@@ -349,33 +474,27 @@ impl Runtime {
                 {
                     tracing::error!("{source}");
                 }
-                warn_spaced!(
-                    spaced_tracer,
-                    "Failed to initialize data connector for dataset {}: {err}",
-                    &ds.name
-                );
+                warn_spaced!(spaced_tracer, "{}{err}", "");
 
                 Err(err)
             }
         }
     }
 
-    pub async fn remove_dataset(&self, ds: &Dataset) {
-        let mut df = self.df.write().await;
-
-        if df.table_exists(&ds.name) {
-            if let Err(e) = df.remove_table(&ds.name) {
+    pub fn remove_dataset(&self, ds: &Dataset) {
+        if self.df.table_exists(ds.name.clone()) {
+            if let Err(e) = self.df.remove_table(&ds.name) {
                 tracing::warn!("Unable to unload dataset {}: {}", &ds.name, e);
                 return;
             }
         }
 
-        tracing::info!("Unloaded dataset: {}", &ds.name);
+        tracing::info!("Unloaded dataset {}", &ds.name);
         let engine = ds.acceleration.as_ref().map_or_else(
             || "None".to_string(),
             |acc| {
                 if acc.enabled {
-                    acc.engine().to_string()
+                    acc.engine.to_string()
                 } else {
                     "None".to_string()
                 }
@@ -387,11 +506,10 @@ impl Runtime {
     pub async fn update_dataset(&self, ds: &Dataset, all_datasets: &[Dataset]) {
         status::update_dataset(&ds.name, status::ComponentStatus::Refreshing);
         if let Ok(connector) = self.load_dataset_connector(ds, all_datasets).await {
-            if ds.is_file_accelerated() {
-                tracing::warn!("File accelerated datasets currently don't support hot reload, falling back to full dataset reload");
-            } else if ds.is_accelerated() {
-                tracing::info!("Hot reloading accelerated dataset: {}...", &ds.name);
+            tracing::info!("Updating accelerated dataset {}...", &ds.name);
 
+            // File accelerated datasets don't support hot reload.
+            if ds.is_accelerated() {
                 if let Ok(()) = &self
                     .reload_accelerated_dataset(ds, Arc::clone(&connector))
                     .await
@@ -399,12 +517,10 @@ impl Runtime {
                     status::update_dataset(&ds.name, status::ComponentStatus::Ready);
                     return;
                 }
-                tracing::error!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
+                tracing::debug!("Failed to create accelerated table for dataset {}, falling back to full dataset reload", ds.name);
             }
 
-            tracing::info!("Updating dataset: {}...", &ds.name);
-
-            self.remove_dataset(ds).await;
+            self.remove_dataset(ds);
 
             if let Ok(()) = self
                 .register_loaded_dataset(ds, Arc::clone(&connector), None)
@@ -430,8 +546,6 @@ impl Runtime {
         // create new accelerated table for updated data connector
         let (accelerated_table, is_ready) = self
             .df
-            .read()
-            .await
             .create_accelerated_table(ds, Arc::clone(&connector), acceleration_secret)
             .await
             .context(UnableToCreateAcceleratedTableSnafu {
@@ -443,7 +557,7 @@ impl Runtime {
             .await
             .context(UnableToReceiveAcceleratedTableStatusSnafu)?;
 
-        tracing::info!("Accelerated table for dataset {} is ready", ds.name);
+        tracing::debug!("Accelerated table for dataset {} is ready", ds.name);
 
         self.register_loaded_dataset(ds, Arc::clone(&connector), Some(accelerated_table))
             .await?;
@@ -454,7 +568,7 @@ impl Runtime {
     async fn get_dataconnector_from_source(
         source: &str,
         secrets_provider: &secrets::SecretsProvider,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Result<Arc<dyn DataConnector>> {
         let secret = secrets_provider.get_secret(source).await.context(
             UnableToGetSecretForDataConnectorSnafu {
@@ -463,9 +577,7 @@ impl Runtime {
         )?;
 
         match dataconnector::create_new_connector(source, secret, params).await {
-            Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {
-                data_connector: source,
-            }),
+            Some(dc) => dc.context(UnableToInitializeDataConnectorSnafu {}),
             None => UnknownDataConnectorSnafu {
                 data_connector: source,
             }
@@ -487,11 +599,11 @@ impl Runtime {
                     name: ds.name.to_string(),
                 })?;
 
-        if ds.mode() == Mode::ReadWrite && !replicate {
+        if ds.mode() == dataset::Mode::ReadWrite && !replicate {
             AcceleratedReadWriteTableWithoutReplicationSnafu.fail()?;
         }
 
-        let accelerator_engine = acceleration_settings.engine();
+        let accelerator_engine = acceleration_settings.engine;
         let secret_key = acceleration_settings
             .engine_secret
             .clone()
@@ -513,7 +625,7 @@ impl Runtime {
     async fn register_dataset(
         ds: impl Borrow<Dataset>,
         data_connector: Arc<dyn DataConnector>,
-        df: Arc<RwLock<DataFusion>>,
+        df: Arc<DataFusion>,
         source: &str,
         secrets_provider: Arc<RwLock<secrets::SecretsProvider>>,
         accelerated_table: Option<AcceleratedTable>,
@@ -523,9 +635,7 @@ impl Runtime {
         // VIEW
         if let Some(view_sql) = ds.view_sql() {
             let view_sql = view_sql.context(InvalidSQLViewSnafu)?;
-            df.write()
-                .await
-                .register_table(ds, datafusion::Table::View(view_sql))
+            df.register_table(ds, datafusion::Table::View(view_sql))
                 .await
                 .context(UnableToAttachViewSnafu)?;
             return Ok(());
@@ -535,19 +645,18 @@ impl Runtime {
 
         // FEDERATED TABLE
         if !ds.is_accelerated() {
-            if ds.mode() == Mode::ReadWrite && !replicate {
+            if ds.mode() == dataset::Mode::ReadWrite && !replicate {
                 // A federated dataset was configured as ReadWrite, but the replication setting wasn't set - error out.
                 FederatedReadWriteTableWithoutReplicationSnafu.fail()?;
             }
 
-            df.write()
-                .await
-                .register_table(ds, datafusion::Table::Federated(data_connector))
-                .await
-                .context(UnableToAttachDataConnectorSnafu {
-                    data_connector: source,
-                })?;
-            return Ok(());
+            return Runtime::register_table(
+                df,
+                ds,
+                datafusion::Table::Federated(data_connector),
+                source,
+            )
+            .await;
         }
 
         // ACCELERATED TABLE
@@ -557,31 +666,95 @@ impl Runtime {
                 .ok_or_else(|| Error::ExpectedAccelerationSettings {
                     name: ds.name.to_string(),
                 })?;
-        let accelerator_engine = acceleration_settings.engine();
+        let accelerator_engine = acceleration_settings.engine;
         let acceleration_secret = Runtime::get_acceleration_secret(ds, secrets_provider).await?;
 
-        dataaccelerator::get_accelerator_engine(&accelerator_engine)
+        dataaccelerator::get_accelerator_engine(accelerator_engine)
             .await
             .context(AcceleratorEngineNotAvailableSnafu {
-                name: accelerator_engine,
+                name: accelerator_engine.to_string(),
             })?;
 
-        df.write()
-            .await
-            .register_table(
-                ds,
-                datafusion::Table::Accelerated {
-                    source: data_connector,
-                    acceleration_secret,
-                    accelerated_table,
-                },
-            )
+        Runtime::register_table(
+            df,
+            ds,
+            datafusion::Table::Accelerated {
+                source: data_connector,
+                acceleration_secret,
+                accelerated_table,
+            },
+            source,
+        )
+        .await
+    }
+
+    async fn register_table(
+        df: Arc<DataFusion>,
+        ds: &Dataset,
+        table: datafusion::Table,
+        source: &str,
+    ) -> Result<()> {
+        df.register_table(ds, table)
             .await
             .context(UnableToAttachDataConnectorSnafu {
                 data_connector: source,
             })?;
 
         Ok(())
+    }
+
+    pub async fn load_llms(&self) {
+        let app_lock = self.app.read().await;
+        if let Some(app) = app_lock.as_ref() {
+            for in_llm in &app.llms {
+                status::update_llm(&in_llm.name, status::ComponentStatus::Initializing);
+                match try_to_nql(in_llm) {
+                    Ok(l) => {
+                        let mut llm_map = self.llms.write().await;
+                        llm_map.insert(in_llm.name.clone(), l.into());
+                        tracing::info!("Llm [{}] deployed, ready for inferencing", in_llm.name);
+                        metrics::gauge!("llms_count", "llm" => in_llm.name.clone(), "source" => in_llm.get_prefix().map(|x| x.to_string()).unwrap_or_default()).increment(1.0);
+                        status::update_llm(&in_llm.name, status::ComponentStatus::Ready);
+                    }
+                    Err(e) => {
+                        metrics::counter!("llms_load_error").increment(1);
+                        status::update_llm(&in_llm.name, status::ComponentStatus::Error);
+                        tracing::warn!(
+                            "Unable to load LLM from spicepod {}, error: {}",
+                            in_llm.name,
+                            e,
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn load_embeddings(&self) {
+        let app_lock = self.app.read().await;
+        if let Some(app) = app_lock.as_ref() {
+            for in_embed in &app.embeddings {
+                status::update_embedding(&in_embed.name, status::ComponentStatus::Initializing);
+                match try_to_embedding(in_embed) {
+                    Ok(e) => {
+                        let mut embeds_map = self.embeds.write().await;
+                        embeds_map.insert(in_embed.name.clone(), e.into());
+                        tracing::info!("Embedding [{}] ready to embed", in_embed.name);
+                        metrics::gauge!("embeddings_count", "embeddings" => in_embed.name.clone(), "source" => in_embed.get_prefix().map(|x| x.to_string()).unwrap_or_default()).increment(1.0);
+                        status::update_embedding(&in_embed.name, status::ComponentStatus::Ready);
+                    }
+                    Err(e) => {
+                        metrics::counter!("embeddings_load_error").increment(1);
+                        status::update_embedding(&in_embed.name, status::ComponentStatus::Error);
+                        tracing::warn!(
+                            "Unable to load embedding from spicepod {}, error: {}",
+                            in_embed.name,
+                            e,
+                        );
+                    }
+                }
+            }
+        }
     }
 
     pub async fn load_models(&self) {
@@ -596,17 +769,19 @@ impl Runtime {
 
     // Caller must set `status::update_model(...` before calling `load_model`. This function will set error/ready statues appropriately.`
     pub async fn load_model(&self, m: &SpicepodModel) {
-        measure_scope_ms!("load_model", "model" => m.name, "source" => model::source(&m.from));
+        measure_scope_ms!("load_model", "model" => m.name, "source" => model_source(&m.from));
         tracing::info!("Loading model [{}] from {}...", m.name, m.from);
-        let mut model_map = self.models.write().await;
 
         let model = m.clone();
-        let source = model::source(&model.from);
+        let source = model_source(model.from.as_str());
 
         let shared_secrets_provider = Arc::clone(&self.secrets_provider);
         let secrets_provider = shared_secrets_provider.read().await;
 
-        let secret = match secrets_provider.get_secret(source.as_str()).await {
+        let secret = match secrets_provider
+            .get_secret(source.to_string().as_str())
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 metrics::counter!("models_load_error").increment(1);
@@ -622,9 +797,10 @@ impl Runtime {
 
         match Model::load(m.clone(), secret).await {
             Ok(in_m) => {
+                let mut model_map = self.models.write().await;
                 model_map.insert(m.name.clone(), in_m);
                 tracing::info!("Model [{}] deployed, ready for inferencing", m.name);
-                metrics::gauge!("models_count", "model" => m.name.clone(), "source" => model::source(&m.from)).increment(1.0);
+                metrics::gauge!("models_count", "model" => m.name.clone(), "source" => model_source(&m.from).to_string()).increment(1.0);
                 status::update_model(&model.name, status::ComponentStatus::Ready);
             }
             Err(e) => {
@@ -650,7 +826,7 @@ impl Runtime {
         }
         model_map.remove(&m.name);
         tracing::info!("Model [{}] has been unloaded", m.name);
-        metrics::gauge!("models_count", "model" => m.name.clone(), "source" => model::source(&m.from)).decrement(1.0);
+        metrics::gauge!("models_count", "model" => m.name.clone(), "source" => model_source(&m.from).to_string()).decrement(1.0);
     }
 
     pub async fn update_model(&self, m: &SpicepodModel) {
@@ -659,22 +835,47 @@ impl Runtime {
         self.load_model(m).await;
     }
 
-    pub async fn start_servers(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
+    pub async fn start_metrics(&mut self, with_metrics: Option<SocketAddr>) -> Result<()> {
+        if let Some(metrics_socket) = with_metrics {
+            let mut recorder = MetricsRecorder::new(metrics_socket);
+
+            let table_reference = get_metrics_table_reference();
+            let metrics_table = self.df.get_table(table_reference).await;
+
+            if let Some(metrics_table) = metrics_table {
+                recorder.set_remote_schema(Arc::new(Some(metrics_table.schema())));
+            } else {
+                tracing::debug!("Registering local metrics table");
+                MetricsRecorder::register_metrics_table(&Arc::clone(&self.df))
+                    .await
+                    .context(UnableToStartLocalMetricsSnafu)?;
+            }
+
+            recorder.start(&self.df);
+        }
+
+        Ok(())
+    }
+
+    pub async fn start_servers(
+        &self,
+        config: Config,
+        with_metrics: Option<SocketAddr>,
+    ) -> Result<()> {
         let http_server_future = http::start(
-            self.config.http_bind_address,
+            config.http_bind_address,
             Arc::clone(&self.app),
             Arc::clone(&self.df),
             Arc::clone(&self.models),
-            self.config.clone().into(),
+            Arc::clone(&self.llms),
+            Arc::clone(&self.embeds),
+            config.clone().into(),
             with_metrics,
         );
 
-        let flight_server_future =
-            flight::start(self.config.flight_bind_address, Arc::clone(&self.df));
-        let open_telemetry_server_future = opentelemetry::start(
-            self.config.open_telemetry_bind_address,
-            Arc::clone(&self.df),
-        );
+        let flight_server_future = flight::start(config.flight_bind_address, Arc::clone(&self.df));
+        let open_telemetry_server_future =
+            opentelemetry::start(config.open_telemetry_bind_address, Arc::clone(&self.df));
         let pods_watcher_future = self.start_pods_watcher();
 
         tokio::select! {
@@ -689,8 +890,12 @@ impl Runtime {
         }
     }
 
-    pub async fn start_pods_watcher(&mut self) -> notify::Result<()> {
-        let mut rx = self.pods_watcher.watch()?;
+    pub async fn start_pods_watcher(&self) -> notify::Result<()> {
+        let mut pods_watcher = self.pods_watcher.write().await;
+        let Some(mut pods_watcher) = pods_watcher.take() else {
+            return Ok(());
+        };
+        let mut rx = pods_watcher.watch()?;
 
         while let Some(new_app) = rx.recv().await {
             let mut app_lock = self.app.write().await;
@@ -703,16 +908,19 @@ impl Runtime {
                 tracing::debug!("Previous pods information: {:?}", current_app);
 
                 // check for new and updated datasets
-                for ds in &new_app.datasets {
-                    if let Some(current_ds) =
-                        current_app.datasets.iter().find(|d| d.name == ds.name)
+                let valid_datasets = Self::get_valid_datasets(&new_app, true);
+                for ds in &valid_datasets {
+                    if let Some(current_ds) = current_app
+                        .datasets
+                        .iter()
+                        .find(|d| TableReference::parse_str(&d.name) == ds.name)
                     {
-                        if current_ds != ds {
-                            self.update_dataset(ds, &new_app.datasets).await;
+                        if TableReference::parse_str(&current_ds.name) != ds.name {
+                            self.update_dataset(ds, &valid_datasets).await;
                         }
                     } else {
                         status::update_dataset(&ds.name, status::ComponentStatus::Initializing);
-                        self.load_dataset(ds, &new_app.datasets).await;
+                        self.load_dataset(ds, &valid_datasets).await;
                     }
                 }
 
@@ -741,8 +949,15 @@ impl Runtime {
                 // Remove datasets that are no longer in the app
                 for ds in &current_app.datasets {
                     if !new_app.datasets.iter().any(|d| d.name == ds.name) {
+                        let ds = match Dataset::try_from(ds.clone()) {
+                            Ok(ds) => ds,
+                            Err(e) => {
+                                tracing::error!("Could not remove dataset {}: {e}", ds.name);
+                                continue;
+                            }
+                        };
                         status::update_dataset(&ds.name, status::ComponentStatus::Disabled);
-                        self.remove_dataset(ds).await;
+                        self.remove_dataset(&ds);
                     }
                 }
 
@@ -754,9 +969,44 @@ impl Runtime {
 
         Ok(())
     }
+
+    pub async fn init_results_cache(&self) {
+        let app = self.app.read().await;
+        let Some(app) = app.as_ref() else { return };
+
+        let cache_config = &app.runtime.results_cache;
+
+        if !cache_config.enabled {
+            return;
+        }
+
+        match QueryResultsCacheProvider::new(cache_config) {
+            Ok(cache_provider) => {
+                tracing::info!("Initialized results cache; {cache_provider}");
+                self.datafusion().set_cache_provider(cache_provider);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize results cache: {e}");
+            }
+        };
+    }
+
+    pub async fn init_query_history(&self) -> Result<()> {
+        let query_history_table_reference = TableReference::partial(
+            SPICE_RUNTIME_SCHEMA,
+            query_history::DEFAULT_QUERY_HISTORY_TABLE,
+        );
+        match query_history::instantiate_query_history_table().await {
+            Ok(table) => self
+                .df
+                .register_runtime_table(query_history_table_reference, table)
+                .context(UnableToCreateBackendSnafu),
+            Err(err) => Err(Error::UnableToTrackQueryHistory { source: err }),
+        }
+    }
 }
 
-fn verify_dependent_tables(ds: &Dataset, existing_tables: &[String]) -> bool {
+fn verify_dependent_tables(ds: &Dataset, existing_tables: &[TableReference]) -> bool {
     if !ds.is_view() {
         return true;
     }
@@ -787,7 +1037,7 @@ fn verify_dependent_tables(ds: &Dataset, existing_tables: &[String]) -> bool {
     true
 }
 
-fn get_view_dependent_tables(dataset: impl Borrow<Dataset>) -> Result<Vec<String>> {
+fn get_view_dependent_tables(dataset: impl Borrow<Dataset>) -> Result<Vec<TableReference>> {
     let ds = dataset.borrow();
 
     let Some(sql) = ds.view_sql() else {
@@ -813,7 +1063,7 @@ fn get_view_dependent_tables(dataset: impl Borrow<Dataset>) -> Result<Vec<String
     Ok(get_dependent_table_names(&statements[0]))
 }
 
-fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
+fn get_dependent_table_names(statement: &parser::Statement) -> Vec<TableReference> {
     let mut table_names = Vec::new();
     let mut cte_names = HashSet::new();
 
@@ -822,7 +1072,7 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
             // Collect names of CTEs
             if let Some(with) = statement.with {
                 for table in with.cte_tables {
-                    cte_names.insert(table.alias.name.to_string());
+                    cte_names.insert(TableReference::bare(table.alias.name.to_string()));
                     let cte_table_names = get_dependent_table_names(&parser::Statement::Statement(
                         Box::new(ast::Statement::Query(table.query)),
                     ));
@@ -849,7 +1099,7 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
                                 version: _,
                                 partitions: _,
                             } => {
-                                table_names.push(name.to_string());
+                                table_names.push(name.to_string().into());
                             }
                             TableFactor::Derived {
                                 lateral: _,
@@ -875,17 +1125,4 @@ fn get_dependent_table_names(statement: &parser::Statement) -> Vec<String> {
         .into_iter()
         .filter(|name| !cte_names.contains(name))
         .collect()
-}
-
-async fn shutdown_signal() {
-    let ctrl_c = async {
-        let signal_result = signal::ctrl_c().await;
-        if let Err(err) = signal_result {
-            tracing::error!("Failed to listen to shutdown signal: {err}");
-        }
-    };
-
-    tokio::select! {
-        () = ctrl_c => {},
-    }
 }

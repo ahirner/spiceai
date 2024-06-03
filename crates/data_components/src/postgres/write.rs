@@ -23,7 +23,7 @@ use datafusion::{
     execution::{context::SessionState, SendableRecordBatchStream, TaskContext},
     logical_expr::Expr,
     physical_plan::{
-        insert::{DataSink, FileSinkExec},
+        insert::{DataSink, DataSinkExec},
         metrics::MetricsSet,
         DisplayAs, DisplayFormatType, ExecutionPlan,
     },
@@ -81,7 +81,7 @@ impl TableProvider for PostgresTableWriter {
         input: Arc<dyn ExecutionPlan>,
         overwrite: bool,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(FileSinkExec::new(
+        Ok(Arc::new(DataSinkExec::new(
             input,
             Arc::new(PostgresDataSink::new(Arc::clone(&self.postgres), overwrite)),
             self.schema(),
@@ -185,7 +185,13 @@ impl DataSink for PostgresDataSink {
 
         while let Some(batch) = data.next().await {
             let batch = batch?;
-            num_rows += batch.num_rows() as u64;
+            let batch_num_rows = batch.num_rows();
+
+            if batch_num_rows == 0 {
+                continue;
+            };
+
+            num_rows += batch_num_rows as u64;
 
             self.postgres
                 .insert_batch(&tx, batch)

@@ -1,9 +1,13 @@
+OPT_LEVEL = --release
+SPICED_FEATURES := $(if $(SPICED_NON_DEFAULT_FEATURES),--features $(SPICED_NON_DEFAULT_FEATURES),)
+
 ifdef REL_VERSION
-	SPICED_FEATURES := --features release
+	SPICED_FEATURES := --features release $(SPICED_NON_DEFAULT_FEATURES)
 endif
 
 ifdef DEV
-	SPICED_FEATURES := --features dev
+	SPICED_FEATURES := --features dev $(SPICED_NON_DEFAULT_FEATURES)
+	OPT_LEVEL = --profile dev
 endif
 
 ifdef SPICED_TARGET_DIR
@@ -18,4 +22,4 @@ endif
 
 .PHONY: all
 all:
-	cargo build --release $(SPICED_FEATURES) --target-dir $(TARGET_DIR) $(CUSTOM_FEATURES)
+	cargo build ${OPT_LEVEL} $(SPICED_FEATURES) --target-dir $(TARGET_DIR) $(CUSTOM_FEATURES)

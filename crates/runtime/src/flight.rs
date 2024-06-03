@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::datafusion::query::{Protocol, QueryBuilder};
 use crate::datafusion::DataFusion;
 use crate::dataupdate::DataUpdate;
 use crate::measure_scope_ms;
@@ -25,8 +26,9 @@ use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, SchemaRes
 use arrow_ipc::writer::IpcWriteOptions;
 use bytes::Bytes;
 use datafusion::error::DataFusionError;
-use datafusion::execution::SendableRecordBatchStream;
+use datafusion::execution::context::SQLOptions;
 use datafusion::sql::sqlparser::parser::ParserError;
+use datafusion::sql::TableReference;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
 use snafu::prelude::*;
@@ -52,8 +54,8 @@ use arrow_flight::{
 };
 
 pub struct Service {
-    datafusion: Arc<RwLock<DataFusion>>,
-    channel_map: Arc<RwLock<HashMap<String, Arc<Sender<DataUpdate>>>>>,
+    datafusion: Arc<DataFusion>,
+    channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
 }
 
 #[tonic::async_trait]
@@ -150,13 +152,8 @@ impl FlightService for Service {
 }
 
 impl Service {
-    async fn get_arrow_schema(
-        datafusion: Arc<RwLock<DataFusion>>,
-        sql: String,
-    ) -> Result<Schema, Status> {
+    async fn get_arrow_schema(datafusion: Arc<DataFusion>, sql: String) -> Result<Schema, Status> {
         let df = datafusion
-            .read()
-            .await
             .ctx
             .sql(&sql)
             .await
@@ -174,25 +171,28 @@ impl Service {
     }
 
     async fn sql_to_flight_stream(
-        datafusion: Arc<RwLock<DataFusion>>,
+        datafusion: Arc<DataFusion>,
         sql: String,
     ) -> Result<BoxStream<'static, Result<FlightData, Status>>, Status> {
-        let df = datafusion
-            .read()
-            .await
-            .ctx
-            .sql(&sql)
-            .await
-            .map_err(handle_datafusion_error)?;
-        let schema = df.schema().clone().into();
+        let restricted_sql_options = SQLOptions::new()
+            .with_allow_ddl(false)
+            .with_allow_dml(false)
+            .with_allow_statements(false);
+
+        let query = QueryBuilder::new(sql, Arc::clone(&datafusion), Protocol::Flight)
+            .restricted_sql_options(Some(restricted_sql_options))
+            .protocol(Protocol::Flight)
+            .build();
+
+        let batches_stream = query.run().await.map_err(to_tonic_err)?;
+
+        let schema = batches_stream.data.schema();
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
         let schema_as_ipc = SchemaAsIpc::new(&schema, &options);
         let schema_flight_data = FlightData::from(schema_as_ipc);
 
-        let batches_stream: SendableRecordBatchStream =
-            df.execute_stream().await.map_err(to_tonic_err)?;
-
         let batches_stream = batches_stream
+            .data
             .then(move |batch_result| {
                 let options_clone = options.clone();
                 async move {
@@ -286,7 +286,7 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub async fn start(bind_address: std::net::SocketAddr, df: Arc<RwLock<DataFusion>>) -> Result<()> {
+pub async fn start(bind_address: std::net::SocketAddr, df: Arc<DataFusion>) -> Result<()> {
     let service = Service {
         datafusion: Arc::clone(&df),
         channel_map: Arc::new(RwLock::new(HashMap::new())),

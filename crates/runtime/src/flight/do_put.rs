@@ -18,6 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use arrow_flight::{flight_service_server::FlightService, FlightData, PutResult};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
+use datafusion::sql::TableReference;
 use futures::stream;
 use tokio::sync::{broadcast::Sender, RwLock};
 use tonic::{Request, Response, Status, Streaming};
@@ -30,8 +31,8 @@ use crate::{
 use super::Service;
 
 async fn get_sender_channel(
-    channel_map: Arc<RwLock<HashMap<String, Arc<Sender<DataUpdate>>>>>,
-    path: &str,
+    channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
+    path: &TableReference,
 ) -> Option<Arc<Sender<DataUpdate>>> {
     let channel_map_read = channel_map.read().await;
     if channel_map_read.contains_key(path) {
@@ -59,18 +60,15 @@ pub(crate) async fn handle(
         return Err(Status::invalid_argument("No path provided"));
     };
 
-    let path = fd.path.join(".");
+    let path = TableReference::parse_str(&fd.path.join("."));
 
-    duration_metric.with_labels(vec![("path", path.clone())]);
+    duration_metric.with_labels(vec![("path", path.to_string())]);
 
-    let df = flight_svc.datafusion.read().await;
-
-    if !df.is_writable(&path) {
+    if !flight_svc.datafusion.is_writable(&path) {
         return Err(Status::invalid_argument(format!(
             "Path doesn't exist or is not writable: {path}",
         )));
     };
-    drop(df);
 
     let schema = try_schema_from_flatbuffer_bytes(&message.data_header)
         .map_err(|e| Status::internal(format!("Failed to get schema from data header: {e}")))?;
@@ -125,8 +123,7 @@ pub(crate) async fn handle(
                         let _ = channel.send(data_update.clone());
                     };
 
-                    let df_guard = df.read().await;
-                    if let Err(e) = df_guard.write_data(&path, data_update).await {
+                    if let Err(e) = df.write_data(path.clone(), data_update).await {
                         return Some((
                             Err(Status::internal(format!("Error writing data: {e}"))),
                             flight,

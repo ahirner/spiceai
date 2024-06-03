@@ -17,28 +17,31 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 
 use async_trait::async_trait;
-use datafusion::physical_expr::EquivalenceProperties;
-use datafusion::physical_plan::{ExecutionMode, Partitioning, PlanProperties};
+use datafusion::sql::unparser::dialect::Dialect;
 use db_connection_pool::dbconnection::{get_schema, query_arrow};
 use db_connection_pool::DbConnectionPool;
+use expr::Engine;
 use futures::TryStreamExt;
 use snafu::prelude::*;
+use std::fmt::Display;
 use std::{any::Any, fmt, sync::Arc};
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
-    common::OwnedTableReference,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{context::SessionState, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
+    physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
-        SendableRecordBatchStream,
+        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
+        ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream,
     },
+    sql::TableReference,
 };
 
 pub mod expr;
+pub mod federation;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -57,15 +60,20 @@ pub enum Error {
 type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub struct SqlTable<T: 'static, P: 'static> {
+    name: &'static str,
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     schema: SchemaRef,
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
+    engine: Option<Engine>,
+    dialect: Option<Arc<dyn Dialect + Send + Sync>>,
 }
 
 impl<T, P> SqlTable<T, P> {
     pub async fn new(
+        name: &'static str,
         pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
-        table_reference: impl Into<OwnedTableReference>,
+        table_reference: impl Into<TableReference>,
+        engine: Option<expr::Engine>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
         let conn = pool
@@ -78,21 +86,37 @@ impl<T, P> SqlTable<T, P> {
             .context(UnableToGetSchemaSnafu)?;
 
         Ok(Self {
+            name,
             pool: Arc::clone(pool),
             schema,
             table_reference,
+            engine,
+            dialect: None,
         })
     }
 
     pub fn new_with_schema(
+        name: &'static str,
         pool: &Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         schema: impl Into<SchemaRef>,
-        table_reference: impl Into<OwnedTableReference>,
+        table_reference: impl Into<TableReference>,
+        engine: Option<expr::Engine>,
     ) -> Self {
         Self {
+            name,
             pool: Arc::clone(pool),
             schema: schema.into(),
             table_reference: table_reference.into(),
+            engine,
+            dialect: None,
+        }
+    }
+
+    #[must_use]
+    pub fn with_dialect(self, dialect: Arc<dyn Dialect + Send + Sync>) -> Self {
+        Self {
+            dialect: Some(dialect),
+            ..self
         }
     }
 
@@ -110,7 +134,13 @@ impl<T, P> SqlTable<T, P> {
             Arc::clone(&self.pool),
             filters,
             limit,
+            self.engine,
         )?))
+    }
+
+    // Return the current memory location of the object as a unique identifier
+    fn unique_id(&self) -> usize {
+        std::ptr::from_ref(self) as usize
     }
 }
 
@@ -132,13 +162,13 @@ impl<T, P> TableProvider for SqlTable<T, P> {
         &self,
         filters: &[&Expr],
     ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
-        let mut filter_push_down = vec![];
-        for filter in filters {
-            match expr::to_sql(filter) {
-                Ok(_) => filter_push_down.push(TableProviderFilterPushDown::Exact),
-                Err(_) => filter_push_down.push(TableProviderFilterPushDown::Unsupported),
-            }
-        }
+        let filter_push_down: Vec<TableProviderFilterPushDown> = filters
+            .iter()
+            .map(|f| match expr::to_sql_with_engine(f, self.engine) {
+                Ok(_) => TableProviderFilterPushDown::Exact,
+                Err(_) => TableProviderFilterPushDown::Unsupported,
+            })
+            .collect();
 
         Ok(filter_push_down)
     }
@@ -154,14 +184,21 @@ impl<T, P> TableProvider for SqlTable<T, P> {
     }
 }
 
+impl<T, P> Display for SqlTable<T, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SqlTable {}", self.name)
+    }
+}
+
 #[derive(Clone)]
 struct SqlExec<T, P> {
     projected_schema: SchemaRef,
-    table_reference: OwnedTableReference,
+    table_reference: TableReference,
     pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
     filters: Vec<Expr>,
     limit: Option<usize>,
     properties: PlanProperties,
+    engine: Option<Engine>,
 }
 
 pub fn project_schema_safe(
@@ -185,10 +222,11 @@ impl<T, P> SqlExec<T, P> {
     fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
-        table_reference: &OwnedTableReference,
+        table_reference: &TableReference,
         pool: Arc<dyn DbConnectionPool<T, P> + Send + Sync>,
         filters: &[Expr],
         limit: Option<usize>,
+        engine: Option<Engine>,
     ) -> DataFusionResult<Self> {
         let projected_schema = project_schema_safe(schema, projections)?;
 
@@ -203,6 +241,7 @@ impl<T, P> SqlExec<T, P> {
                 Partitioning::UnknownPartitioning(1),
                 ExecutionMode::Bounded,
             ),
+            engine,
         })
     }
 
@@ -211,7 +250,13 @@ impl<T, P> SqlExec<T, P> {
             .projected_schema
             .fields()
             .iter()
-            .map(|f| format!("\"{}\"", f.name()))
+            .map(|f| {
+                if let Some(Engine::ODBC) = self.engine {
+                    f.name().to_owned()
+                } else {
+                    format!("\"{}\"", f.name())
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -226,7 +271,7 @@ impl<T, P> SqlExec<T, P> {
             let filter_expr = self
                 .filters
                 .iter()
-                .map(expr::to_sql)
+                .map(|f| expr::to_sql_with_engine(f, self.engine))
                 .collect::<expr::Result<Vec<_>>>()
                 .context(UnableToGenerateSQLSnafu)?;
             format!("WHERE {}", filter_expr.join(" AND "))
@@ -318,8 +363,8 @@ mod tests {
     use datafusion::execution::context::SessionContext;
     use datafusion::sql::TableReference;
     use db_connection_pool::dbconnection::duckdbconn::DuckDbConnection;
-    use db_connection_pool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool, Mode};
-    use duckdb::{DuckdbConnectionManager, ToSql};
+    use db_connection_pool::{duckdbpool::DuckDbConnectionPool, DbConnectionPool};
+    use duckdb::{AccessMode, DuckdbConnectionManager, ToSql};
     use tracing::{level_filters::LevelFilter, subscriber::DefaultGuard, Dispatch};
 
     use crate::SqlTable;
@@ -347,11 +392,7 @@ mod tests {
             dyn DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSql>
                 + Send
                 + Sync,
-        > = Arc::new(DuckDbConnectionPool::new(
-            "test",
-            &Mode::Memory,
-            &Arc::new(Option::None),
-        )?);
+        > = Arc::new(DuckDbConnectionPool::new_memory(&AccessMode::ReadWrite)?);
         let conn = pool.connect().await?;
         let db_conn = conn
             .as_any()
@@ -360,7 +401,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new(&pool, "test").await?;
+        let duckdb_table = SqlTable::new("duckdb", &pool, "test", None).await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion limit 1";
         let df = ctx.sql(sql).await?;
@@ -377,11 +418,7 @@ mod tests {
             dyn DbConnectionPool<r2d2::PooledConnection<DuckdbConnectionManager>, &dyn ToSql>
                 + Send
                 + Sync,
-        > = Arc::new(DuckDbConnectionPool::new(
-            "test",
-            &Mode::Memory,
-            &Arc::new(Option::None),
-        )?);
+        > = Arc::new(DuckDbConnectionPool::new_memory(&AccessMode::ReadWrite)?);
         let conn = pool.connect().await?;
         let db_conn = conn
             .as_any()
@@ -390,7 +427,7 @@ mod tests {
         db_conn.conn.execute_batch(
             "CREATE TABLE test (a INTEGER, b VARCHAR); INSERT INTO test VALUES (3, 'bar');",
         )?;
-        let duckdb_table = SqlTable::new(&pool, "test").await?;
+        let duckdb_table = SqlTable::new("duckdb", &pool, "test", None).await?;
         ctx.register_table("test_datafusion", Arc::new(duckdb_table))?;
         let sql = "SELECT * FROM test_datafusion where a > 1 and b = 'bar' limit 1";
         let df = ctx.sql(sql).await?;

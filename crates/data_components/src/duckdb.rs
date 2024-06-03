@@ -18,11 +18,11 @@ use crate::{delete::DeletionTableProviderAdapter, Read, ReadWrite};
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
 use datafusion::{
-    common::OwnedTableReference,
     datasource::{provider::TableProviderFactory, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
     logical_expr::CreateExternalTable,
+    sql::TableReference,
 };
 use db_connection_pool::{
     dbconnection::{duckdbconn::DuckDbConnection, DbConnection},
@@ -30,10 +30,11 @@ use db_connection_pool::{
     DbConnectionPool, Mode,
 };
 use duckdb::{
-    vtab::arrow::arrow_recordbatch_to_query_params, DuckdbConnectionManager, ToSql, Transaction,
+    vtab::arrow::arrow_recordbatch_to_query_params, AccessMode, DuckdbConnectionManager, ToSql,
+    Transaction,
 };
 use snafu::prelude::*;
-use sql_provider_datafusion::SqlTable;
+use sql_provider_datafusion::{expr::Engine, SqlTable};
 use std::{cmp, sync::Arc};
 
 use self::write::DuckDBTableWriter;
@@ -94,12 +95,30 @@ pub enum Error {
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct DuckDBTableProviderFactory {}
+pub struct DuckDBTableProviderFactory {
+    access_mode: AccessMode,
+    db_path_param: String,
+}
 
 impl DuckDBTableProviderFactory {
     #[must_use]
     pub fn new() -> Self {
-        Self {}
+        Self {
+            access_mode: AccessMode::ReadOnly,
+            db_path_param: "open".to_string(),
+        }
+    }
+
+    #[must_use]
+    pub fn access_mode(mut self, access_mode: AccessMode) -> Self {
+        self.access_mode = access_mode;
+        self
+    }
+
+    #[must_use]
+    pub fn db_path_param(mut self, db_path_param: &str) -> Self {
+        self.db_path_param = db_path_param.to_string();
+        self
     }
 }
 
@@ -125,13 +144,23 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
         let mode = options.remove("mode").unwrap_or_default();
         let mode: Mode = mode.as_str().into();
 
-        let params = Arc::new(Some(options));
+        let pool: Arc<DuckDbConnectionPool> = Arc::new(match &mode {
+            Mode::File => {
+                // open duckdb at given path or create a new one
+                let db_path = cmd
+                    .options
+                    .get(self.db_path_param.as_str())
+                    .cloned()
+                    .unwrap_or(format!("{name}.db"));
 
-        let pool: Arc<DuckDbConnectionPool> = Arc::new(
-            DuckDbConnectionPool::new(&name, &mode, &params)
+                DuckDbConnectionPool::new_file(&db_path, &self.access_mode)
+                    .context(DbConnectionPoolSnafu)
+                    .map_err(to_datafusion_error)?
+            }
+            Mode::Memory => DuckDbConnectionPool::new_memory(&self.access_mode)
                 .context(DbConnectionPoolSnafu)
                 .map_err(to_datafusion_error)?,
-        );
+        });
 
         let schema: SchemaRef = Arc::new(cmd.schema.as_ref().into());
         let duckdb = DuckDB::new(name.clone(), Arc::clone(&schema), Arc::clone(&pool));
@@ -154,9 +183,11 @@ impl TableProviderFactory for DuckDBTableProviderFactory {
         let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
 
         let read_provider = Arc::new(SqlTable::new_with_schema(
+            "duckdb",
             &dyn_pool,
             Arc::clone(&schema),
-            OwnedTableReference::bare(name.clone()),
+            TableReference::bare(name.clone()),
+            Some(Engine::DuckDB),
         ));
 
         let read_write_provider = DuckDBTableWriter::create(read_provider, duckdb);
@@ -221,21 +252,13 @@ impl DuckDB {
     }
 
     fn insert_batch(&self, transaction: &Transaction<'_>, batch: &RecordBatch) -> Result<()> {
-        let sql = format!(
-            r#"INSERT INTO "{name}" SELECT * FROM arrow(?, ?)"#,
-            name = self.table_name
-        );
-        tracing::trace!("{sql}");
+        let mut appender = transaction
+            .appender(&self.table_name)
+            .context(UnableToInsertToDuckDBTableSnafu)?;
 
-        for sliced in Self::split_batch(batch) {
-            let arrow_params = arrow_recordbatch_to_query_params(sliced);
-            let arrow_params_vec: Vec<&dyn ToSql> = arrow_params
-                .iter()
-                .map(|p| p as &dyn ToSql)
-                .collect::<Vec<_>>();
-            let arrow_params_ref: &[&dyn ToSql] = &arrow_params_vec;
-            transaction
-                .execute(&sql, arrow_params_ref)
+        for batch in Self::split_batch(batch) {
+            appender
+                .append_record_batch(batch.clone())
                 .context(UnableToInsertToDuckDBTableSnafu)?;
         }
 
@@ -290,7 +313,7 @@ impl DuckDB {
             .collect::<Vec<_>>();
         let arrow_params_ref: &[&dyn ToSql] = &arrow_params_vec;
         let sql = format!(
-            r#"CREATE TABLE "{name}" AS SELECT * FROM arrow(?, ?)"#,
+            r#"CREATE TABLE IF NOT EXISTS "{name}" AS SELECT * FROM arrow(?, ?)"#,
             name = self.table_name
         );
         tracing::trace!("{sql}");
@@ -318,15 +341,23 @@ impl DuckDBTableFactory {
 impl Read for DuckDBTableFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<DynDuckDbConnectionPool> = pool;
-        let table_provider = SqlTable::new(&dyn_pool, table_reference)
+        let table_provider = SqlTable::new("duckdb", &dyn_pool, table_reference, None)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
 
-        Ok(Arc::new(table_provider))
+        let table_provider = Arc::new(table_provider);
+
+        let table_provider = Arc::new(
+            table_provider
+                .create_federated_table_provider()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+        );
+
+        Ok(table_provider)
     }
 }
 
@@ -334,7 +365,7 @@ impl Read for DuckDBTableFactory {
 impl ReadWrite for DuckDBTableFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let read_provider = Read::table_provider(self, table_reference.clone()).await?;
 

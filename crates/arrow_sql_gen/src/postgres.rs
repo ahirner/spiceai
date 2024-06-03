@@ -46,7 +46,7 @@ use bigdecimal::ToPrimitive;
 use snafu::prelude::*;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_postgres::types::FromSql;
-use tokio_postgres::{types::Type, Row};
+use tokio_postgres::{types::Type, Column, Row};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -79,10 +79,10 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to parse raw Postgres Bytes as BigDecimal: {:?}", bytes))]
-    FailedToParseBigDecmialFromPostgres { bytes: Vec<u8> },
+    FailedToParseBigDecimalFromPostgres { bytes: Vec<u8> },
 
     #[snafu(display("Cannot represent BigDecimal as i128: {big_decimal}"))]
-    FailedToConvertBigDecmialToI128 { big_decimal: BigDecimal },
+    FailedToConvertBigDecimalToI128 { big_decimal: BigDecimal },
 
     #[snafu(display("Failed to find field {column_name} in schema"))]
     FailedToFindFieldInSchema { column_name: String },
@@ -140,6 +140,31 @@ macro_rules! handle_primitive_array_type {
             None => builder.append_null(),
         }
     }};
+}
+
+/// Converts Postgres Columns to Arrow Data Types
+///
+/// # Errors
+///
+/// Returns an error if the Postgres column type is not supported
+pub fn columns_to_schema(cols: &[Column]) -> Result<Arc<Schema>> {
+    let mut arrow_fields: Vec<Option<Field>> = Vec::new();
+
+    for column in cols {
+        let column_name = column.name();
+        let column_type = column.type_();
+        let data_type = map_column_type_to_data_type(column_type);
+        match &data_type {
+            Some(data_type) => {
+                arrow_fields.push(Some(Field::new(column_name, data_type.clone(), true)));
+            }
+            None => arrow_fields.push(None),
+        }
+    }
+
+    let arrow_fields = arrow_fields.into_iter().flatten().collect::<Vec<Field>>();
+
+    Ok(Arc::new(Schema::new(arrow_fields)))
 }
 
 /// Converts Postgres `Row`s to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
@@ -277,7 +302,7 @@ pub fn rows_to_arrow(rows: &[Row]) -> Result<RecordBatch> {
                     };
 
                     let Some(v_i128) = v.to_decimal_128() else {
-                        return FailedToConvertBigDecmialToI128Snafu {
+                        return FailedToConvertBigDecimalToI128Snafu {
                             big_decimal: v.inner,
                         }
                         .fail();
@@ -560,14 +585,14 @@ impl<'a> FromSql<'a> for BigDecimalFromSql {
             0x4000 => Sign::Minus,
             0x0000 => Sign::Plus,
             _ => {
-                return Err(Box::new(Error::FailedToParseBigDecmialFromPostgres {
+                return Err(Box::new(Error::FailedToParseBigDecimalFromPostgres {
                     bytes: raw.to_vec(),
                 }))
             }
         };
 
         let Some(digits) = BigInt::from_radix_be(sign, u8_digits.as_slice(), 10) else {
-            return Err(Box::new(Error::FailedToParseBigDecmialFromPostgres {
+            return Err(Box::new(Error::FailedToParseBigDecimalFromPostgres {
                 bytes: raw.to_vec(),
             }));
         };

@@ -19,27 +19,30 @@ use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
 };
-use arrow_sql_gen::statement::{CreateTableBuilder, InsertBuilder};
+use arrow_sql_gen::statement::{CreateTableBuilder, Error as SqlGenError, InsertBuilder};
 use async_trait::async_trait;
 use bb8_postgres::{
     tokio_postgres::{types::ToSql, Transaction},
     PostgresConnectionManager,
 };
 use datafusion::{
-    common::OwnedTableReference,
     datasource::{provider::TableProviderFactory, TableProvider},
     error::{DataFusionError, Result as DataFusionResult},
     execution::context::SessionState,
     logical_expr::CreateExternalTable,
+    sql::TableReference,
 };
 use db_connection_pool::{
     dbconnection::{postgresconn::PostgresConnection, DbConnection},
-    postgrespool::PostgresConnectionPool,
+    postgrespool::{self, PostgresConnectionPool},
     DbConnectionPool,
 };
 use postgres_native_tls::MakeTlsConnector;
 use snafu::prelude::*;
-use sql_provider_datafusion::{expr, SqlTable};
+use sql_provider_datafusion::{
+    expr::{self, Engine},
+    SqlTable,
+};
 use std::sync::Arc;
 
 use crate::{delete::DeletionTableProviderAdapter, Read, ReadWrite};
@@ -66,7 +69,7 @@ pub enum Error {
     },
 
     #[snafu(display("Unable to create Postgres connection pool: {source}"))]
-    UnableToCreatePostgresConnectionPool { source: db_connection_pool::Error },
+    UnableToCreatePostgresConnectionPool { source: postgrespool::Error },
 
     #[snafu(display("Unable to downcast DbConnection to PostgresConnection"))]
     UnableToDowncastDbConnection {},
@@ -111,6 +114,9 @@ pub enum Error {
         source: tokio_postgres::error::Error,
     },
 
+    #[snafu(display("Unable to create insertion statement for Postgres table: {source}"))]
+    UnableToCreateInsertStatement { source: SqlGenError },
+
     #[snafu(display("The table '{table_name}' doesn't exist in the Postgres server"))]
     TableDoesntExist { table_name: String },
 }
@@ -132,15 +138,23 @@ impl PostgresTableFactory {
 impl Read for PostgresTableFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
         let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
-        let table_provider = SqlTable::new(&dyn_pool, table_reference)
-            .await
-            .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+        let table_provider = Arc::new(
+            SqlTable::new("postgres", &dyn_pool, table_reference, None)
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+        );
 
-        Ok(Arc::new(table_provider))
+        let table_provider = Arc::new(
+            table_provider
+                .create_federated_table_provider()
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
+        );
+
+        Ok(table_provider)
     }
 }
 
@@ -148,7 +162,7 @@ impl Read for PostgresTableFactory {
 impl ReadWrite for PostgresTableFactory {
     async fn table_provider(
         &self,
-        table_reference: OwnedTableReference,
+        table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let read_provider = Read::table_provider(self, table_reference.clone()).await?;
 
@@ -185,7 +199,7 @@ impl TableProviderFactory for PostgresTableProviderFactory {
         let options = cmd.options.clone();
         let schema: Schema = cmd.schema.as_ref().into();
 
-        let params = Arc::new(Some(options));
+        let params = Arc::new(options);
 
         let pool = Arc::new(
             PostgresConnectionPool::new(params, None)
@@ -224,9 +238,11 @@ impl TableProviderFactory for PostgresTableProviderFactory {
         let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
 
         let read_provider = Arc::new(SqlTable::new_with_schema(
+            "postgres",
             &dyn_pool,
             Arc::clone(&schema),
-            OwnedTableReference::bare(name.clone()),
+            TableReference::bare(name.clone()),
+            Some(Engine::Postgres),
         ));
 
         let delete_adapter =
@@ -295,7 +311,9 @@ impl Postgres {
 
     async fn insert_batch(&self, transaction: &Transaction<'_>, batch: RecordBatch) -> Result<()> {
         let insert_table_builder = InsertBuilder::new(&self.table_name, vec![batch]);
-        let sql = insert_table_builder.build_postgres();
+        let sql = insert_table_builder
+            .build_postgres()
+            .context(UnableToCreateInsertStatementSnafu)?;
 
         transaction
             .execute(&sql, &[])

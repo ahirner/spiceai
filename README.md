@@ -7,30 +7,30 @@
 
 ## What is Spice?
 
-**Spice** is a small, portable runtime that provides developers with a unified SQL query interface to locally materialize, accelerate, and query datasets sourced from any database, data warehouse, or data lake.
+**Spice** is a portable runtime providing developers with a unified SQL interface to materialize, accelerate, and query data sourced from any database, data warehouse, or data lake.
 
 📣 Read the [Spice.ai OSS announcement blog post](https://blog.spiceai.org/posts/2024/03/28/adding-spice-the-next-generation-of-spice.ai-oss/).
 
-Spice makes it easy to build data-driven and data-intensive applications by streamlining the use of data and machine learning (ML) in software.
+Spice connects, fuses, and delivers data to applications and AI, acting as an application-specific, tier-optimized Database CDN.
 
-The Spice runtime is written in Rust and leverages industry leading technologies like Apache DataFusion, Apache Arrow, Apache Arrow Flight, and DuckDB.
+The Spice runtime is written in Rust and is built-with industry leading technologies like [Apache DataFusion](https://datafusion.apache.org), Apache Arrow, Apache Arrow Flight, SQlite, and DuckDB.
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/spiceai/spiceai/assets/80174/96b5fcef-a550-4ce8-a74a-83931275e83e">  
+  <source media="(prefers-color-scheme: dark)" srcset="https://github.com/spiceai/spiceai/assets/80174/96b5fcef-a550-4ce8-a74a-83931275e83e">
   <img width="900" alt="Spice.ai" src="https://github.com/spiceai/spiceai/assets/80174/f71f227d-d7cd-418c-85b9-5c663a728491" />
 </picture>
 
 ## Why Spice?
 
-Spice makes querying data by SQL across one or more data sources simple and fast. Easily co-locate a managed working set of data with your application or ML, locally accelerated in-memory with Arrow, with SQLite/DuckDB, or with an attached database like PostgreSQL for high-performance, low-latency queries. Accelerated engines run in your infrastructure giving you flexibility and control over price and performance.
+Spice makes querying data by SQL across one or more data sources simple and fast. Easily co-locate a managed working set of data with your application or ML, accelerated with in-memory Arrow, with SQLite/DuckDB, or with attached PostgreSQL for high-performance, low-latency queries. Accelerated engines run tier-native in your infrastructure giving you flexibility and control over cost and performance.
 
 ### How is Spice different?
 
-1. Local Acceleration with **both OLAP (Arrow/DuckDB) and OLTP (SQLite/PostgreSQL)** databases at dataset granularity compared to other OLAP only or OLTP only systems.
+1. Tier-optimized Acceleration with **both OLAP (Arrow/DuckDB) and OLTP (SQLite/PostgreSQL)** databases at dataset granularity compared to other OLAP only or OLTP only systems.
 
 2. **Separation of materialization and storage/compute** compared with monolith data systems and data lakes. Keep compute colocated with source data while bringing a materialized working set next to your application, dashboard, or data/ML pipeline.
 
-3. **Edge to cloud native**. Chainable and designed to be deployed standalone, as a container sidecar, as a microservice, in a cluster across laptops, the Edge, On-Prem, to a POP, and to all public clouds.
+3. **Edge to cloud native**. Designed to be deployed standalone, as a container sidecar, as a microservice, in a cluster across laptops, the Edge, On-Prem, to a POP, and to all public clouds. Spice instances can also be chained, and deployed distributed across tiers of infrastructure.
 
 ### Before Spice
 
@@ -56,32 +56,46 @@ Spice makes querying data by SQL across one or more data sources simple and fast
 
 **4. Easily query many data sources.** Federated SQL query across databases, data warehouses, and data lakes using [Data Connectors](https://docs.spiceai.org/data-connectors).
 
+### FAQ
+
+- **Is Spice a cache?** No, however you can think of Spice data materialization like an _active_ cache or data prefetcher. A cache would fetch data on a cache-miss while Spice prefetches and materializes filtered data on an interval or as new data becomes available. In addition to materialization Spice supports [results caching](https://docs.spiceai.org/features/caching).
+
+- **Is Spice a CDN for databases?** Yes, you can think of Spice like a CDN for different data sources. Using CDN concepts, Spice enables you to ship (load) a working set of your database (or data lake, or data warehouse) where it's most frequently accessed, like from a data application or for AI-inference.
+
+### Watch a 30-sec BI dashboard acceleration demo
+
+https://github.com/spiceai/spiceai/assets/80174/7735ee94-3f4a-4983-a98e-fe766e79e03a
+
 ### Supported Data Connectors
 
 Currently supported data connectors for upstream datasets. More coming soon.
 
-| Name         | Description                                                                                    | Status       | Protocol/Format                                                                                    | Refresh Modes    |
-| ------------ | ---------------------------------------------------------------------------------------------- | ------------ | -------------------------------------------------------------------------------------------------- | ---------------- |
-| `databricks` | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Alpha        | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)<br>S3/Delta Lake | `full`           |
-| `postgres`   | PostgreSQL                                                                                     | Alpha        |                                                                                                    | `full`           |
-| `spiceai`    | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Alpha        | Arrow Flight                                                                                       | `append`, `full` |
-| `s3`         | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Alpha        | Parquet                                                                                            | `full`           |
-| `dremio`     | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha        | Arrow Flight                                                                                       | `full`           |
-| `mysql`      | MySQL                                                                                          | Alpha        |                                                                                                    | `full`           |
-| `duckdb`     | DuckDB                                                                                         | Alpha        |                                                                                                    | `full`           |
-| `snowflake`  | Snowflake                                                                                      | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
-| `bigquery`   | BigQuery                                                                                       | Coming soon! | Arrow Flight SQL                                                                                   | `full`           |
+| Name          | Description                                                                                    | Status | Protocol/Format                                                                                    | Refresh Modes    |
+| ------------- | ---------------------------------------------------------------------------------------------- | ------ | -------------------------------------------------------------------------------------------------- | ---------------- |
+| `databricks`  | [Databricks](https://github.com/spiceai/quickstarts/tree/trunk/databricks#spice-on-databricks) | Alpha  | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)<br>S3/Delta Lake | `full`           |
+| `postgres`    | PostgreSQL                                                                                     | Alpha  |                                                                                                    | `full`           |
+| `spiceai`     | [Spice.ai](https://github.com/spiceai/quickstarts/tree/trunk/spiceai#readme)                   | Alpha  | Arrow Flight                                                                                       | `append`, `full` |
+| `s3`          | [S3](https://github.com/spiceai/quickstarts/tree/trunk/s3#readme)                              | Alpha  | Parquet, CSV                                                                                       | `full`           |
+| `dremio`      | [Dremio](https://github.com/spiceai/quickstarts/tree/trunk/dremio#readme)                      | Alpha  | Arrow Flight                                                                                       | `full`           |
+| `mysql`       | MySQL                                                                                          | Alpha  |                                                                                                    | `full`           |
+| `duckdb`      | DuckDB                                                                                         | Alpha  |                                                                                                    | `full`           |
+| `clickhouse`  | Clickhouse                                                                                     | Alpha  |                                                                                                    | `full`           |
+| `odbc`        | ODBC                                                                                           | Alpha  | ODBC                                                                                               | `full`           |
+| `spark`       | Spark                                                                                          | Alpha  | [Spark Connect](https://spark.apache.org/docs/latest/spark-connect-overview.html)                  | `full`           |
+| `flightsql`   | Apache Arrow Flight SQL                                                                        | Alpha  | Arrow Flight SQL                                                                                   | `full`           |
+| `snowflake`   | Snowflake                                                                                      | Alpha  | Arrow                                                                                              | `full`           |
+| `ftp`, `sftp` | FTP/SFTP                                                                                       | Alpha  | Parquet, CSV                                                                                       | `full`           |
 
 ### Supported Data Stores/Accelerators
 
 Currently supported data stores for local materialization/acceleration. More coming soon.
 
-| Name       | Description                                                                                                   | Status | Engine Modes     | Refresh Modes    |
-| ---------- | ------------------------------------------------------------------------------------------------------------- | ------ | ---------------- | ---------------- |
-| `arrow`    | In-Memory Arrow Records                                                                                       | Alpha  | `memory`         | `append`, `full` |
-| `duckdb`   | Embedded [DuckDB](https://docs.spiceai.org/data-accelerators/duckdb)                                          | Alpha  | `memory`, `file` | `append`, `full` |
-| `sqlite`   | Embedded [SQLite](https://docs.spiceai.org/data-accelerators/sqlite)                                          | Alpha  | `memory`, `file` | `append`, `full` |
-| `postgres` | Attached [PostgreSQL](https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator) | Alpha  |                  | `append`, `full` |
+| Name       | Description                                                                                                   | Status | Engine Modes     |
+| ---------- | ------------------------------------------------------------------------------------------------------------- | ------ | ---------------- |
+| `arrow`    | In-Memory Arrow Records                                                                                       | Alpha  | `memory`         |
+| `duckdb`   | Embedded [DuckDB](https://docs.spiceai.org/data-accelerators/duckdb)                                          | Alpha  | `memory`, `file` |
+| `sqlite`   | Embedded [SQLite](https://docs.spiceai.org/data-accelerators/sqlite)                                          | Alpha  | `memory`, `file` |
+| `postgres` | Attached [PostgreSQL](https://github.com/spiceai/quickstarts/tree/trunk/postgres#postgresql-data-accelerator) | Alpha  | `file`           |
 
 ### Intelligent Applications
 
@@ -136,9 +150,10 @@ Example output will be shown as follows:
 ```bash
 Spice.ai runtime starting...
 Using latest 'local' runtime version.
-2024-02-21T06:11:56.381793Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:3000
-2024-02-21T06:11:56.381853Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
-2024-02-21T06:11:56.382038Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
+2024-05-20T22:37:26.787577Z  INFO spiced: Metrics listening on 127.0.0.1:9000
+2024-05-20T22:37:26.788298Z  INFO runtime::http: Spice Runtime HTTP listening on 127.0.0.1:3000
+2024-05-20T22:37:26.788329Z  INFO runtime::flight: Spice Runtime Flight listening on 127.0.0.1:50051
+2024-05-20T22:37:26.788402Z  INFO runtime::opentelemetry: Spice Runtime OpenTelemetry listening on 127.0.0.1:50052
 ```
 
 The runtime is now started and ready for queries.
@@ -162,8 +177,8 @@ dependencies:
 The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runtime which is now available to query by SQL.
 
 ```bash
-2024-02-22T05:53:48.222952Z  INFO runtime: Loaded dataset: taxi_trips
-2024-02-22T05:53:48.223101Z  INFO runtime::dataconnector: Refreshing data for taxi_trips
+2024-02-22T05:53:48.222952Z  INFO runtime: Registered dataset taxi_trips
+2024-02-22T05:53:48.223101Z  INFO runtime::dataconnector::refresh: Loading data for dataset taxi_trips
 ```
 
 **Step 5.** Start the Spice SQL REPL:
@@ -175,7 +190,7 @@ spice sql
 The SQL REPL inferface will be shown:
 
 ```
-Welcome to the interactive Spice.ai SQL Query Utility! Type 'help' for help.
+Welcome to the Spice.ai SQL REPL! Type 'help' for help.
 
 show tables; -- list available tables
 sql>
@@ -185,13 +200,15 @@ Enter `show tables;` to display the available tables for query:
 
 ```
 sql> show tables
-+------------+
-| table_name |
-+------------+
-| taxi_trips |
-+------------+
++---------------+--------------+---------------+------------+
+| table_catalog | table_schema | table_name    | table_type |
++---------------+--------------+---------------+------------+
+| spice         | public       | taxi_trips    | BASE TABLE |
+| spice         | runtime      | metrics       | BASE TABLE |
+| spice         | runtime      | query_history | BASE TABLE |
++---------------+--------------+---------------+------------+
 
-Query took: 0.007505084 seconds. 1/1 rows displayed.
+Time: 0.007505084 seconds. 1 rows.
 ```
 
 Enter a query to display the longest taxi trips:
@@ -218,7 +235,7 @@ Output:
 | 44018.64      | 52.43        |
 +---------------+--------------+
 
-Query took: 0.002458976 seconds
+Time: 0.002458976 seconds
 ```
 
 ## ⚙️ Runtime Container Deployment
@@ -296,7 +313,7 @@ dataset name: (spice_app) eth_recent_blocks
 Enter the description of the dataset:
 
 ```
-description: eth recent logs
+description: eth recent blocks
 ```
 
 Enter the location of the dataset:
@@ -314,7 +331,8 @@ Locally accelerate (y/n)? y
 You should see the following output from your runtime terminal:
 
 ```bash
-2024-02-21T22:49:10.038461Z  INFO runtime: Loaded dataset: eth_recent_blocks
+2024-05-20T22:50:17.997446Z  INFO runtime: Registered dataset eth_recent_blocks
+2024-05-20T22:50:17.998125Z  INFO runtime::accelerated_table::refresh: Loading data for dataset eth_recent_blocks
 ```
 
 **Step 4.** In a new terminal window, use the Spice SQL REPL to query the dataset
@@ -345,7 +363,7 @@ The output displays the results of the query along with the query execution time
 | 19281336 | 150137 | 13418403 |
 +----------+--------+----------+
 
-Query took: 0.004057791 seconds
+Time: 0.004057791 seconds
 ```
 
 You can experiment with the time it takes to generate queries when using non-accelerated datasets. You can change the acceleration setting from `true` to `false` in the datasets.yaml file.

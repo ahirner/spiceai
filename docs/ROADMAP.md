@@ -8,36 +8,41 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 - See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
 
-## [v0.12-alpha (Apr 2024)](https://github.com/spiceai/spiceai/milestone/20)
+## [v0.14-alpha (May 2024)](https://github.com/spiceai/spiceai/milestone/22)
 
-- Spark data connector (alpha)
+- Query history (Arrow Flight)
+- Accelerated table indexes
 - MotherDuck data connector (alpha)
-- Acceleration retention policies for time-series data
-- RocksDB data accelerator (alpha)
-- DynamoDB data connector (alpha)
-- Key/Value API
-
-## [v0.13-alpha (May 2024)](https://github.com/spiceai/spiceai/milestone/21)
-
-- Clickhouse data connector (alpha)
+- Generic Object-Store connector (alpha)
 - S3 data connector Iceberg support
-- Snowflake data connector (alpha)
-- Data retention improvements
 
-## v0.14-alpha (May 2024)
+## [v0.15-alpha (June 2024)](https://github.com/spiceai/spiceai/milestone/28)
 
-- SFTP/FTP data connector (alpha)
-- BigQuery data connector (alpha)
+- CDC replication refresh mode
 
-## Features being considered for beta (Jul 2024)
+## v0.16-beta (June 2024)
 
+- Catalog Providers
+  - Unity Catalog catalog provider (alpha)
+- Dataset management improvements
+- Bugfixes and performance improvements
+
+## v1.0-stable (Sep 2024)
+
+- Bugfixes and performance improvements
+
+## v1.1 (Oct 2024)
+
+- AWS Glue catalog provider (alpha)
+
+## Features being considered
+
+- Intelligent (AI-powered) accelerators
+- Kafka data connector
+- GraphQL API
 - GraphQL data connector
-- CDC replication mode
-
-## Features being considered for v1.0-stable (Sep 2024)
-
+- BigQuery data connector
+- Key/Value API
+  - RocksDB data accelerator
+  - DynamoDB data connector
 - CLI publish Spicepods to [spicerack.org](https://spicerack.org)
-
-## Beyond v1.0
-
-Based on community feedback!

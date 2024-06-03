@@ -14,15 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::component::dataset::Dataset;
 use async_trait::async_trait;
 use data_components::databricks_delta::DatabricksDelta;
 use data_components::databricks_spark::DatabricksSparkConnect;
 use data_components::{Read, ReadWrite};
-use datafusion::common::OwnedTableReference;
 use datafusion::datasource::TableProvider;
+use datafusion::sql::TableReference;
 use secrets::Secret;
 use snafu::prelude::*;
-use spicepod::component::dataset::Dataset;
 use std::any::Any;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -34,6 +34,15 @@ use super::{DataConnector, DataConnectorFactory};
 pub enum Error {
     #[snafu(display("Missing required parameter: endpoint"))]
     MissingEndpoint,
+
+    #[snafu(display("Missing required parameter: databricks-cluster-id"))]
+    MissingDatabricksClusterId,
+
+    #[snafu(display("Missing required token. {message}"))]
+    MissingDatabricksToken { message: String },
+
+    #[snafu(display("databricks_use_ssl value {value} is invalid, please use true or false"))]
+    InvalidUsessl { value: String },
 
     #[snafu(display("Endpoint {endpoint} is invalid: {source}"))]
     InvalidEndpoint {
@@ -50,16 +59,6 @@ pub enum Error {
     UnableToConstructDatabricksSpark {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
-
-    #[snafu(display("{source}"))]
-    UnableToGetReadWriteProvider {
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -72,19 +71,14 @@ pub struct Databricks {
 impl Databricks {
     pub async fn new(
         secret: Arc<Option<Secret>>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Result<Self> {
-        let ref_params = params.as_ref().as_ref();
-        let mode = ref_params
-            .and_then(|params: &HashMap<String, String>| params.get("mode").cloned())
-            .unwrap_or_default();
-        let format = ref_params
-            .and_then(|params: &HashMap<String, String>| params.get("format").cloned())
-            .unwrap_or_default();
+        let mode = params.get("mode").cloned().unwrap_or_default();
+        let format = params.get("format").cloned().unwrap_or_default();
 
         if mode.as_str() == "s3" {
             if format == "deltalake" {
-                let databricks_delta = DatabricksDelta::new(secret, params);
+                let databricks_delta = DatabricksDelta::new(secret, Arc::clone(&params));
                 Ok(Self {
                     read_provider: Arc::new(databricks_delta.clone()),
                     read_write_provider: Arc::new(databricks_delta),
@@ -93,9 +87,50 @@ impl Databricks {
                 InvalidFormatSnafu { mode, format }.fail()
             }
         } else {
-            let databricks_spark = DatabricksSparkConnect::new(secret, params)
-                .await
-                .context(UnableToConstructDatabricksSparkSnafu)?;
+            let Some(endpoint) = params.get("endpoint") else {
+                return MissingEndpointSnafu.fail();
+            };
+            let user = params.get("user").map(std::borrow::ToOwned::to_owned);
+            let mut databricks_use_ssl = true;
+            if let Some(databricks_use_ssl_value) = params.get("databricks_use_ssl") {
+                databricks_use_ssl = match databricks_use_ssl_value.as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return InvalidUsesslSnafu {
+                            value: databricks_use_ssl_value,
+                        }
+                        .fail()
+                    }
+                };
+            }
+            let ((Some(cluster_id), _) | (_, Some(cluster_id))) = (
+                params.get("databricks_cluster_id"),
+                params.get("databricks-cluster-id"),
+            ) else {
+                return MissingDatabricksClusterIdSnafu.fail();
+            };
+            let Some(secrets) = secret.as_ref() else {
+                return MissingDatabricksTokenSnafu {
+                    message: "Secrets not available".to_string(),
+                }
+                .fail();
+            };
+            let Some(token) = secrets.get("token") else {
+                return MissingDatabricksTokenSnafu {
+                    message: "DATABRICKS TOKEN not set".to_string(),
+                }
+                .fail();
+            };
+            let databricks_spark = DatabricksSparkConnect::new(
+                endpoint.to_string(),
+                user,
+                cluster_id.to_string(),
+                token.to_string(),
+                databricks_use_ssl,
+            )
+            .await
+            .context(UnableToConstructDatabricksSparkSnafu)?;
             Ok(Self {
                 read_provider: Arc::new(databricks_spark.clone()),
                 read_write_provider: Arc::new(databricks_spark),
@@ -107,10 +142,10 @@ impl Databricks {
 impl DataConnectorFactory for Databricks {
     fn create(
         secret: Option<Secret>,
-        params: Arc<Option<HashMap<String, String>>>,
+        params: Arc<HashMap<String, String>>,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
-            let databricks = Databricks::new(Arc::new(secret), params).await?;
+            let databricks = Databricks::new(Arc::new(secret), Arc::clone(&params)).await?;
             Ok(Arc::new(databricks) as Arc<dyn DataConnector>)
         })
     }
@@ -125,29 +160,30 @@ impl DataConnector for Databricks {
     async fn read_provider(
         &self,
         dataset: &Dataset,
-    ) -> super::AnyErrorResult<Arc<dyn TableProvider>> {
-        let table_reference = OwnedTableReference::from(dataset.path());
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        let table_reference = TableReference::from(dataset.path());
         Ok(self
             .read_provider
             .table_provider(table_reference)
             .await
-            .context(UnableToGetReadProviderSnafu)?)
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "databricks",
+            })?)
     }
 
     async fn read_write_provider(
         &self,
         dataset: &Dataset,
-    ) -> Option<super::AnyErrorResult<Arc<dyn TableProvider>>> {
-        let table_reference = OwnedTableReference::from(dataset.path());
+    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+        let table_reference = TableReference::from(dataset.path());
         let read_write_result = self
             .read_write_provider
             .table_provider(table_reference)
             .await
-            .context(UnableToGetReadWriteProviderSnafu)
-            .boxed();
-        match read_write_result {
-            Ok(provider) => Some(Ok(provider)),
-            Err(e) => Some(Err(e)),
-        }
+            .context(super::UnableToGetReadWriteProviderSnafu {
+                dataconnector: "databricks",
+            });
+
+        Some(read_write_result)
     }
 }

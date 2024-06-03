@@ -27,23 +27,36 @@ ci:
 
 .PHONY: test
 test:
-	@cargo test --all
+	@cargo test --all --lib
 
-.PHONY: test
+.PHONY: nextest
 nextest:
 	@cargo nextest run --all
 
-.PHONY: lint
-lint:
-	go vet ./...
-	golangci-lint run
+.PHONY: test-integration
+test-integration:
+	@cargo test -p runtime --test integration --features mysql -- --nocapture
+
+.PHONY: test-bench
+test-bench:
+	@cargo bench -p runtime
+
+.PHONY: lint lint-go lint-rust
+lint: lint-go lint-rust
+
+lint-rust:
 	cargo fmt --all -- --check
-	cargo clippy --all-targets --workspace -- \
+	cargo clippy --all-targets --all-features --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr
+
+lint-go:
+	go vet ./...
+	golangci-lint run
+
 
 .PHONY: run
 run:
@@ -61,12 +74,12 @@ docker-run:
 .PHONY: deps-licenses
 dep-licenses:
 	@cargo install cargo-license --quiet
-	@cargo license -d 
+	@cargo license -d
 
 .PHONY: display-deps
 display-deps:
 	@cargo install cargo-license --quiet
-	@cargo license -d  --tsv --direct-deps-only | grep -v "github.com/spiceai"
+	@cargo license -d  --tsv --direct-deps-only --all-features | grep -v "github.com/spiceai"
 
 
 ################################################################################
@@ -77,6 +90,10 @@ install: build
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spice ~/.spice/bin/spice
 	install -m 755 target/release/spiced ~/.spice/bin/spiced
+
+.PHONY: install-with-models
+install-with-models:
+	make install SPICED_NON_DEFAULT_FEATURES="models"
 
 .PHONY: install-cli
 install-cli: build-cli
@@ -95,7 +112,7 @@ install-runtime: build-runtime
 install-dev: build-dev
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spice ~/.spice/bin/spice
-	install -m 755 target/release/spiced ~/.spice/bin/spiced
+	install -m 755 target/debug/spiced ~/.spice/bin/spiced
 
 ################################################################################
 # Target: modtidy                                                              #

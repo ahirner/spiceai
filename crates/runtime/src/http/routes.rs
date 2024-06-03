@@ -14,8 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{config, datafusion::DataFusion, model::Model};
+use crate::{config, datafusion::DataFusion};
+use crate::{EmbeddingModelStore, LLMModelStore};
 use app::App;
+use axum::routing::patch;
+use model_components::model::Model;
 use std::net::SocketAddr;
 use std::{collections::HashMap, sync::Arc};
 
@@ -34,27 +37,47 @@ use super::v1;
 
 pub(crate) fn routes(
     app: Arc<RwLock<Option<App>>>,
-    df: Arc<RwLock<DataFusion>>,
+    df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
+    llms: Arc<RwLock<LLMModelStore>>,
+    embeddings: Arc<RwLock<EmbeddingModelStore>>,
     config: Arc<config::Config>,
     with_metrics: Option<SocketAddr>,
 ) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/health", get(|| async { "ok\n" }))
         .route("/v1/sql", post(v1::query::post))
         .route("/v1/status", get(v1::status::get))
         .route("/v1/datasets", get(v1::datasets::get))
-        .route("/v1/datasets/:name/refresh", post(v1::datasets::refresh))
+        .route(
+            "/v1/datasets/:name/acceleration/refresh",
+            post(v1::datasets::refresh),
+        )
+        .route(
+            "/v1/datasets/:name/acceleration",
+            patch(v1::datasets::acceleration),
+        )
         .route("/v1/spicepods", get(v1::spicepods::get))
-        .route("/v1/models", get(v1::models::get))
-        .route("/v1/models/:name/predict", get(v1::inference::get))
-        .route("/v1/predict", post(v1::inference::post))
-        .route_layer(middleware::from_fn(track_metrics))
+        .route_layer(middleware::from_fn(track_metrics));
+
+    if cfg!(feature = "models") {
+        router = router
+            .route("/v1/models", get(v1::models::get))
+            .route("/v1/models/:name/predict", get(v1::inference::get))
+            .route("/v1/predict", post(v1::inference::post))
+            .route("/v1/nsql", post(v1::nsql::post))
+            .route("/v1/embed", post(v1::embed::post))
+            .layer(Extension(llms))
+            .layer(Extension(models))
+            .layer(Extension(embeddings));
+    }
+
+    router = router
         .layer(Extension(app))
         .layer(Extension(df))
         .layer(Extension(with_metrics))
-        .layer(Extension(models))
-        .layer(Extension(config))
+        .layer(Extension(config));
+    router
 }
 
 async fn track_metrics(req: Request<Body>, next: Next) -> impl IntoResponse {
