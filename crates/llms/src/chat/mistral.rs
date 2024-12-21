@@ -146,7 +146,7 @@ impl MistralLlama {
         Box::new(LocalModelPaths::new(
             tokenizer.map(Into::into).unwrap_or_default(),
             config.map(Into::into).unwrap_or_default(),
-            tokenizer_config.map(Into::into),
+            tokenizer_config.map(Into::into).unwrap_or_default(),
             model_weights.iter().map(Into::into).collect(),
             None,
             None,

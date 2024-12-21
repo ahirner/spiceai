@@ -1618,7 +1618,7 @@ dependencies = [
  "bitflags 2.6.0",
  "cexpr",
  "clang-sys",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "lazy_static",
  "lazycell",
  "log",
@@ -2060,7 +2060,7 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.8.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=6800496#6800496261a240aa969fdc47cc9814d7914f0862"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=521e33c#521e33ccd1ba77b2140c16e21bde7fe95b012e1a"
 dependencies = [
  "byteorder",
  "candle-kernels 0.8.0",
@@ -2147,7 +2147,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.8.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=6800496#6800496261a240aa969fdc47cc9814d7914f0862"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=521e33c#521e33ccd1ba77b2140c16e21bde7fe95b012e1a"
 dependencies = [
  "bindgen_cuda 0.1.5",
 ]
@@ -2176,7 +2176,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.8.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=6800496#6800496261a240aa969fdc47cc9814d7914f0862"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=521e33c#521e33ccd1ba77b2140c16e21bde7fe95b012e1a"
 dependencies = [
  "metal 0.27.0",
  "once_cell",
@@ -2199,7 +2199,7 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.8.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=6800496#6800496261a240aa969fdc47cc9814d7914f0862"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=521e33c#521e33ccd1ba77b2140c16e21bde7fe95b012e1a"
 dependencies = [
  "candle-core 0.8.0",
  "candle-metal-kernels 0.8.0",
@@ -3670,13 +3670,13 @@ dependencies = [
 [[package]]
 name = "derivre"
 version = "0.1.0"
-source = "git+https://github.com/microsoft/derivre?rev=02ee497e6e404a0b402b4f68a9abf599d22ed2ed#02ee497e6e404a0b402b4f68a9abf599d22ed2ed"
+source = "git+https://github.com/microsoft/derivre?rev=a629ecc9dfbd9297bc3a35a5f2028f4bfce91060#a629ecc9dfbd9297bc3a35a5f2028f4bfce91060"
 dependencies = [
  "ahash 0.8.11",
  "anyhow",
  "bytemuck",
  "bytemuck_derive",
- "hashbrown 0.14.5",
+ "hashbrown 0.15.2",
  "regex-syntax 0.8.5",
 ]
 
@@ -5030,6 +5030,7 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash",
+ "serde",
 ]
 
 [[package]]
@@ -6374,17 +6375,17 @@ checksum = "4ee93343901ab17bd981295f2cf0026d4ad018c7c31ba84549a4ddbb47a45104"
 
 [[package]]
 name = "llguidance"
-version = "0.4.1"
-source = "git+https://github.com/microsoft/llguidance?rev=cfef3df97372a7b84d74976ff41cc9cb78bca6cc#cfef3df97372a7b84d74976ff41cc9cb78bca6cc"
+version = "0.6.0"
+source = "git+https://github.com/ahirner/llguidance#95df6211584552fc9bbc855209e901255c1d3b55"
 dependencies = [
  "anyhow",
  "cbindgen",
  "derivre",
+ "hashbrown 0.15.2",
  "indexmap 2.7.0",
  "instant",
  "referencing",
  "regex-syntax 0.8.5",
- "rustc-hash 2.1.0",
  "serde",
  "serde_json",
  "toktrie",
@@ -6807,7 +6808,7 @@ dependencies = [
 [[package]]
 name = "mistralrs"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2978e4039af71007588478be60aa076e2a21437d#2978e4039af71007588478be60aa076e2a21437d"
+source = "git+https://github.com/EricLBuehler/mistral.rs?rev=fc6537105480325c4ca4d241e99275665b0545f8#fc6537105480325c4ca4d241e99275665b0545f8"
 dependencies = [
  "anyhow",
  "candle-core 0.8.0",
@@ -6828,7 +6829,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-core"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2978e4039af71007588478be60aa076e2a21437d#2978e4039af71007588478be60aa076e2a21437d"
+source = "git+https://github.com/EricLBuehler/mistral.rs?rev=fc6537105480325c4ca4d241e99275665b0545f8#fc6537105480325c4ca4d241e99275665b0545f8"
 dependencies = [
  "akin",
  "anyhow",
@@ -6865,6 +6866,7 @@ dependencies = [
  "mistralrs-paged-attn",
  "mistralrs-quant",
  "mistralrs-vision",
+ "objc",
  "once_cell",
  "radix_trie",
  "rand 0.8.5",
@@ -6891,7 +6893,6 @@ dependencies = [
  "tqdm",
  "tracing",
  "tracing-subscriber",
- "ureq",
  "uuid 1.11.0",
  "variantly",
  "vob",
@@ -6900,7 +6901,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-paged-attn"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2978e4039af71007588478be60aa076e2a21437d#2978e4039af71007588478be60aa076e2a21437d"
+source = "git+https://github.com/EricLBuehler/mistral.rs?rev=fc6537105480325c4ca4d241e99275665b0545f8#fc6537105480325c4ca4d241e99275665b0545f8"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.6",
@@ -6912,7 +6913,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-quant"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2978e4039af71007588478be60aa076e2a21437d#2978e4039af71007588478be60aa076e2a21437d"
+source = "git+https://github.com/EricLBuehler/mistral.rs?rev=fc6537105480325c4ca4d241e99275665b0545f8#fc6537105480325c4ca4d241e99275665b0545f8"
 dependencies = [
  "bindgen_cuda 0.1.5",
  "byteorder",
@@ -6933,7 +6934,7 @@ dependencies = [
 [[package]]
 name = "mistralrs-vision"
 version = "0.3.4"
-source = "git+https://github.com/spiceai/mistral.rs?rev=2978e4039af71007588478be60aa076e2a21437d#2978e4039af71007588478be60aa076e2a21437d"
+source = "git+https://github.com/EricLBuehler/mistral.rs?rev=fc6537105480325c4ca4d241e99275665b0545f8#fc6537105480325c4ca4d241e99275665b0545f8"
 dependencies = [
  "candle-core 0.8.0",
  "image 0.25.5",
@@ -8576,7 +8577,7 @@ checksum = "22505a5c94da8e3b7c2996394d1c933236c4d743e81a410bcca4e6989fc066a4"
 dependencies = [
  "bytes",
  "heck 0.5.0",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "log",
  "multimap",
  "once_cell",
@@ -8609,7 +8610,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "81bddcdb20abf9501610992b6759a4c888aef7d1a7247ef75e2404275ac24af1"
 dependencies = [
  "anyhow",
- "itertools 0.12.1",
+ "itertools 0.10.5",
  "proc-macro2",
  "quote",
  "syn 2.0.90",
@@ -11385,12 +11386,12 @@ dependencies = [
 [[package]]
 name = "toktrie"
 version = "0.1.0"
-source = "git+https://github.com/microsoft/llguidance?rev=cfef3df97372a7b84d74976ff41cc9cb78bca6cc#cfef3df97372a7b84d74976ff41cc9cb78bca6cc"
+source = "git+https://github.com/ahirner/llguidance#95df6211584552fc9bbc855209e901255c1d3b55"
 dependencies = [
  "anyhow",
  "bytemuck",
  "bytemuck_derive",
- "rustc-hash 2.1.0",
+ "hashbrown 0.15.2",
  "serde",
  "serde_json",
 ]

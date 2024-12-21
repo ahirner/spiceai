@@ -37,7 +37,7 @@ exclude = [".github/"]
 homepage = "https://spice.ai"
 license = "Apache-2.0"
 repository = "https://github.com/spiceai/spiceai"
-rust-version = "1.83"
+rust-version = "1.82"
 version = "1.0.0-rc.2"
 
 [workspace.dependencies]
@@ -165,3 +165,7 @@ dotenvy = { git = "https://github.com/spiceai/dotenvy.git", rev = "e5cef1871b080
 
 # Required until next release with opentelemetry 0.26 support: https://github.com/open-telemetry/opentelemetry-rust/pull/2183
 opentelemetry-prometheus = { git = "https://github.com/open-telemetry/opentelemetry-rust.git", rev = "e91138351a689cd21923c15eb48f5fbc95ded807" }
+
+[patch."https://github.com/microsoft/llguidance"]
+llguidance = { git = "https://github.com/ahirner/llguidance", version = "0.6.0"}
+toktrie = { git = "https://github.com/ahirner/llguidance", package = "toktrie"}
