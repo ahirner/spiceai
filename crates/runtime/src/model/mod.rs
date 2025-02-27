@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,7 +23,9 @@ use std::sync::Arc;
 mod chat;
 mod embed;
 mod eval;
+mod metrics;
 mod tool_use;
+mod wrapper;
 
 pub use chat::{try_to_chat_model, LLMModelStore};
 pub use embed::{try_to_embedding, EmbeddingModelStore};
@@ -34,7 +36,7 @@ pub use eval::{
         EVAL_RESULTS_TABLE_REFERENCE, EVAL_RESULTS_TABLE_SCHEMA, EVAL_RESULTS_TABLE_TIME_COLUMN,
     },
     runs::{
-        sql_query_for, start_tracing_eval_run, EVAL_RUNS_TABLE_PRIMARY_KEY,
+        sql_query_for, start_tracing_eval_run, EvalRunResponse, EVAL_RUNS_TABLE_PRIMARY_KEY,
         EVAL_RUNS_TABLE_REFERENCE, EVAL_RUNS_TABLE_SCHEMA, EVAL_RUNS_TABLE_TIME_COLUMN,
     },
     scorer::{builtin_scorer, EvalScorerRegistry, Scorer},

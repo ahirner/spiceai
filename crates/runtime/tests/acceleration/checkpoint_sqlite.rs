@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -81,7 +81,7 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
             // Wait for the checkpoint to be created
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             drop(rt);
-            runtime::dataaccelerator::clear_registry().await;
+            runtime::dataaccelerator::unregister_all().await;
             runtime::dataaccelerator::register_all().await;
 
             let conn_pool = SqliteConnectionPool::new(

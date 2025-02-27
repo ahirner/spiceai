@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,7 +29,7 @@ use crate::datafusion::DataFusion;
 use crate::DataConnector;
 use crate::{component::dataset::Dataset, parameters::ParameterSpec};
 
-use super::{ConnectorComponent, DataConnectorFactory, DataConnectorParams};
+use super::{ConnectorComponent, ConnectorParams, DataConnectorFactory};
 
 pub const LOCALPOD_DATACONNECTOR: &str = "localpod";
 
@@ -49,9 +49,13 @@ impl LocalPodFactory {
 }
 
 impl DataConnectorFactory for LocalPodFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             Err(Box::new(super::DataConnectorError::Internal {

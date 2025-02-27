@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,12 +17,39 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status, timing::TimeMeasurement, Runtime,
+    get_params_with_secrets, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status,
+    timing::TimeMeasurement, Runtime,
 };
 use app::App;
 use model_components::model::Model;
 use opentelemetry::KeyValue;
-use spicepod::component::model::{Model as SpicepodModel, ModelType};
+use snafu::prelude::*;
+use spicepod::component::model::{Model as SpicepodModel, ModelSource, ModelType};
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Failed to load LLM: {name}.\n{source}"))]
+    FailedToLoadLLM {
+        name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to load runnable model: {name}.\n{source}"))]
+    FailedToLoadRunnableModel {
+        name: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "Failed to load model {name} from spicepod.\nUnable to determine model type. Verify the model source and try again.\nFor details, visit https://spiceai.org/docs/components/models",
+    ))]
+    UnableToDetermineModelType { name: String },
+
+    #[snafu(display(
+        "Model {name} includes a non-existent path: {path}.\nVerify the model configuration and ensure all paths are correct.\nFor details, visit https://spiceai.org/docs/components/models",
+    ))]
+    ReferencedPathDoesNotExist { name: String, path: String },
+}
 
 impl Runtime {
     pub(crate) async fn load_models(&self) {
@@ -74,21 +101,33 @@ impl Runtime {
                 }
             })
             .collect::<HashMap<_, _>>();
-        let params = self.get_params_with_secrets(&p).await;
+        let params = get_params_with_secrets(self.secrets(), &p).await;
+
+        if matches!(source, Some(ModelSource::File)) {
+            // Verify all referenced local files exist before attempting to load the model and determine its type.
+            // Otherwise, we will fail to determine the model type and the error will be confusing.
+            if let Err(err) = verify_local_files_exist(m) {
+                metrics::models::LOAD_ERROR.add(1, &[]);
+                self.status
+                    .update_model(&model.name, status::ComponentStatus::Error);
+                tracing::warn!("{err}");
+                return;
+            }
+        }
 
         let model_type = m.model_type();
         tracing::trace!("Model type for {} is {:#?}", m.name, model_type.clone());
-        let result: Result<(), String> = match model_type {
+        let result: Result<(), Error> = match model_type {
             Some(ModelType::Llm) => match self.load_llm(m.clone(), params).await {
                 Ok(l) => {
                     let mut llm_map = self.llms.write().await;
                     llm_map.insert(m.name.clone(), l);
                     Ok(())
                 }
-                Err(e) => Err(format!(
-                    "Unable to load LLM from spicepod {}, error: {}",
-                    m.name, e,
-                )),
+                Err(e) => Err(Error::FailedToLoadLLM {
+                    name: m.name.clone(),
+                    source: Box::new(e),
+                }),
             },
             Some(ModelType::Ml) => match Model::load(m.clone(), params).await {
                 Ok(in_m) => {
@@ -96,15 +135,14 @@ impl Runtime {
                     model_map.insert(m.name.clone(), in_m);
                     Ok(())
                 }
-                Err(e) => Err(format!(
-                    "Unable to load runnable model from spicepod {}, error: {}",
-                    m.name, e,
-                )),
+                Err(e) => Err(Error::FailedToLoadRunnableModel {
+                    name: m.name.clone(),
+                    source: Box::new(e),
+                }),
             },
-            None => Err(format!(
-                "Unable to load model {} from spicepod. Unable to determine model type.",
-                m.name,
-            )),
+            None => Err(Error::UnableToDetermineModelType {
+                name: m.name.clone(),
+            }),
         };
         match result {
             Ok(()) => {
@@ -123,7 +161,7 @@ impl Runtime {
                 metrics::models::LOAD_ERROR.add(1, &[]);
                 self.status
                     .update_model(&model.name, status::ComponentStatus::Error);
-                tracing::warn!(e);
+                tracing::warn!("{e}");
             }
         }
     }
@@ -181,4 +219,16 @@ impl Runtime {
             }
         }
     }
+}
+
+fn verify_local_files_exist(m: &SpicepodModel) -> Result<(), Error> {
+    for f in m.get_all_files() {
+        if !std::path::Path::new(&f.path).exists() {
+            return Err(Error::ReferencedPathDoesNotExist {
+                name: m.name.clone(),
+                path: f.path.clone(),
+            });
+        };
+    }
+    Ok(())
 }

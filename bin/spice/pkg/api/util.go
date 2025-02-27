@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -93,6 +93,14 @@ func GetData[T interface{}](rtcontext *context.RuntimeContext, path string) ([]T
 	result, err := doRuntimeApiRequest[[]T](rtcontext, GET, path, nil)
 	if err != nil {
 		return nil, err
+	}
+	return result, nil
+}
+
+func GetDataSingle[T interface{}](rtcontext *context.RuntimeContext, path string) (T, error) {
+	result, err := doRuntimeApiRequest[T](rtcontext, GET, path, nil)
+	if err != nil {
+		return *new(T), err
 	}
 	return result, nil
 }

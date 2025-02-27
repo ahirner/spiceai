@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct TopSamplesParams {
     #[serde(rename = "dataset")]
     /// The SQL dataset to sample data from.

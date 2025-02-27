@@ -44,24 +44,27 @@ tiktoken-rs = "0.6.0"
 mistralrs = { git = "https://github.com/EricLBuehler/mistral.rs", rev = "fc6537105480325c4ca4d241e99275665b0545f8", optional = true }
 mistralrs-core = { git = "https://github.com/EricLBuehler/mistral.rs", rev = "fc6537105480325c4ca4d241e99275665b0545f8", optional = true, package = "mistralrs-core" }
 rand = "0.8.5"
-tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "b59b7b62860e75abea9b222de6100b4d1b1fac92", features = [
+tei_backend = { package = "text-embeddings-backend", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "a23f1aec8d53008a642cb632199d58d26fe88ae4", features = [
     "candle",
 ] }
-tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "b59b7b62860e75abea9b222de6100b4d1b1fac92" }
-tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "b59b7b62860e75abea9b222de6100b4d1b1fac92" }
-tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "b59b7b62860e75abea9b222de6100b4d1b1fac92" }
+tei_backend_core = { package = "text-embeddings-backend-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "a23f1aec8d53008a642cb632199d58d26fe88ae4" }
+tei_candle = { package = "text-embeddings-backend-candle", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "a23f1aec8d53008a642cb632199d58d26fe88ae4" }
+tei_core = { package = "text-embeddings-core", git = "https://github.com/spiceai/text-embeddings-inference.git", rev = "a23f1aec8d53008a642cb632199d58d26fe88ae4" }
 
+cudarc = { version = "0.12.2", optional = true, features = [
+    "cuda-version-from-build-system",
+] }
 either = "1.13.0"
-indexmap = "2.7.0"
-tempfile = "3.13.0"
+indexmap.workspace = true
+tempfile.workspace = true
+
 
 [dev-dependencies]
 anyhow = "1.0.86"
 dotenvy.workspace = true
 insta.workspace = true
 jsonpath-rust = "0.7.3"
-lazy_static.workspace = true
-paste = "1.0.15"
+paste.workspace = true
 tracing-opentelemetry.workspace = true
 tracing-subscriber.workspace = true
 
@@ -70,13 +73,15 @@ cuda = [
     "tei_backend/cuda",
     "tei_candle/cuda",
     "mistralrs-core/cuda",
+    "mistralrs-core/flash-attn",
     "mistralrs/cuda",
+    "mistralrs/flash-attn",
+    "dep:cudarc",
+    "cudarc/cuda-version-from-build-system",
 ]
-default = ["mistralrs"]
 metal = [
     "tei_backend/metal",
     "tei_candle/metal",
     "mistralrs-core/metal",
     "mistralrs/metal",
 ]
-mistralrs = ["dep:mistralrs", "dep:mistralrs-core"]

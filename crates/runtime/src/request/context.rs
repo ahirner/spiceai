@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,20 +17,23 @@ limitations under the License.
 use std::{
     future::Future,
     marker::PhantomData,
-    sync::{atomic::AtomicU8, Arc, LazyLock},
+    sync::{atomic::AtomicU8, Arc, LazyLock, OnceLock},
 };
 
 use app::App;
 use http::HeaderMap;
 use opentelemetry::KeyValue;
+use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
 
-use super::{baggage, Protocol, UserAgent};
+use super::{baggage, CacheControl, Protocol, UserAgent};
 
 pub struct RequestContext {
     // Use an AtomicU8 to allow updating the protocol without locking
     protocol: AtomicU8,
+    cache_control: CacheControl,
     dimensions: Vec<KeyValue>,
+    auth_principal: OnceLock<AuthPrincipalRef>,
 }
 
 tokio::task_local! {
@@ -99,6 +102,27 @@ impl RequestContext {
         REQUEST_CONTEXT.scope(self, f).await
     }
 
+    /// Retries the provided future from the closure `r` times until it fails or succeeds.
+    pub async fn scope_retry<F, Fut, T, E>(self: Arc<Self>, r: u16, f: F) -> Fut::Output
+    where
+        F: Fn() -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        let mut try_count = 0;
+        loop {
+            let fut = f();
+            match REQUEST_CONTEXT.scope(Arc::clone(&self), fut).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    try_count += 1;
+                    if try_count >= r {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
     #[must_use]
     pub fn to_dimensions(&self) -> Vec<KeyValue> {
         let mut dimensions = vec![KeyValue::new("protocol", self.protocol().as_str())];
@@ -115,10 +139,32 @@ impl RequestContext {
         self.protocol
             .store(protocol as u8, std::sync::atomic::Ordering::Relaxed);
     }
+
+    #[must_use]
+    pub fn cache_control(&self) -> CacheControl {
+        self.cache_control
+    }
+}
+
+impl AuthRequestContext for RequestContext {
+    fn set_auth_principal(
+        &self,
+        auth_principal: AuthPrincipalRef,
+    ) -> Result<(), super::GenericError> {
+        self.auth_principal
+            .set(auth_principal)
+            .map_err(|_| "Failed to set auth principal".into())
+    }
+
+    #[must_use]
+    fn auth_principal(&self) -> Option<&AuthPrincipalRef> {
+        self.auth_principal.get()
+    }
 }
 
 pub struct RequestContextBuilder {
     protocol: Protocol,
+    cache_control: CacheControl,
     app: Option<Arc<App>>,
     user_agent: UserAgent,
     baggage: Vec<KeyValue>,
@@ -129,6 +175,7 @@ impl RequestContextBuilder {
     pub fn new(protocol: Protocol) -> Self {
         Self {
             protocol,
+            cache_control: CacheControl::Cache,
             app: None,
             user_agent: UserAgent::Absent,
             baggage: vec![],
@@ -153,6 +200,7 @@ impl RequestContextBuilder {
             UserAgentCollection::Full => UserAgent::from_headers(headers),
             UserAgentCollection::Disabled => UserAgent::Absent,
         };
+        self.cache_control = CacheControl::from_headers(headers);
         self.baggage.extend(baggage::from_headers(headers));
         self
     }
@@ -160,6 +208,12 @@ impl RequestContextBuilder {
     #[must_use]
     pub fn with_user_agent(mut self, user_agent: UserAgent) -> Self {
         self.user_agent = user_agent;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cache_control(mut self, cache_control: CacheControl) -> Self {
+        self.cache_control = cache_control;
         self
     }
 
@@ -213,7 +267,9 @@ impl RequestContextBuilder {
 
         RequestContext {
             protocol: AtomicU8::new(self.protocol as u8),
+            cache_control: self.cache_control,
             dimensions,
+            auth_principal: OnceLock::new(),
         }
     }
 }

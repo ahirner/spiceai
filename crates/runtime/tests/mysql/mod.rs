@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,6 +24,8 @@ use crate::init_tracing;
 use crate::utils::test_request_context;
 
 pub mod common;
+
+mod federation;
 
 use super::*;
 use app::AppBuilder;

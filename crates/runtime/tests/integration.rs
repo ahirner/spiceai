@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,14 +34,20 @@ mod catalog;
 mod cors;
 #[cfg(all(feature = "delta_lake", feature = "databricks"))]
 mod databricks_delta;
+#[cfg(all(feature = "delta_lake", feature = "databricks"))]
+mod databricks_delta_catalog;
+#[cfg(all(feature = "spark", feature = "databricks"))]
+mod databricks_spark;
+#[cfg(all(feature = "spark", feature = "databricks"))]
+mod databricks_spark_catalog;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;
 #[cfg(feature = "duckdb")]
 mod duckdb;
 mod endpoint_auth;
-mod federation;
 mod file;
+mod flight;
 mod github;
 mod graphql;
 #[cfg(feature = "mssql")]
@@ -56,6 +62,11 @@ mod refresh_retry;
 mod refresh_sql;
 mod results_cache;
 mod s3;
+#[cfg(feature = "snowflake")]
+mod snowflake;
+#[cfg(feature = "spark")]
+mod spark;
+mod spiceai;
 #[cfg(feature = "sqlite")]
 mod sqlite;
 mod tls;

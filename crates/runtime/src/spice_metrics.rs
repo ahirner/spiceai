@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,10 +20,7 @@ use std::time::Duration;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use datafusion::sql::TableReference;
-use opentelemetry::metrics::MetricsError;
-use opentelemetry_sdk::metrics::data::Temporality;
-use opentelemetry_sdk::metrics::reader::TemporalitySelector;
-use opentelemetry_sdk::metrics::InstrumentKind;
+use opentelemetry_sdk::metrics::MetricError;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
@@ -56,15 +53,9 @@ impl SpiceMetricsExporter {
     }
 }
 
-impl TemporalitySelector for SpiceMetricsExporter {
-    fn temporality(&self, _kind: InstrumentKind) -> Temporality {
-        Temporality::Cumulative
-    }
-}
-
 #[async_trait]
 impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
-    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricsError> {
+    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricError> {
         let data_update = DataUpdate {
             schema: metrics.schema(),
             data: vec![metrics],
@@ -74,14 +65,14 @@ impl otel_arrow::ArrowExporter for SpiceMetricsExporter {
         self.datafusion
             .write_data(&get_metrics_table_reference(), data_update)
             .await
-            .map_err(|e| MetricsError::Other(e.to_string()))
+            .map_err(|e| MetricError::Other(e.to_string()))
     }
 
-    async fn force_flush(&self) -> Result<(), MetricsError> {
+    async fn force_flush(&self) -> Result<(), MetricError> {
         Ok(())
     }
 
-    fn shutdown(&self) -> Result<(), MetricsError> {
+    fn shutdown(&self) -> Result<(), MetricError> {
         Ok(())
     }
 }
@@ -92,6 +83,8 @@ pub async fn register_metrics_table(datafusion: &Arc<DataFusion>) -> Result<(), 
     let retention = Retention::new(
         Some("time_unix_nano".to_string()),
         Some(TimeFormat::Timestamptz),
+        None,
+        None,
         Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
         Some(Duration::from_secs(300)),  // run retention every 5 minutes
         true,

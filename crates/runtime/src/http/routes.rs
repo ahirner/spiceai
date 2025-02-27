@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,6 +15,12 @@ limitations under the License.
 */
 
 use crate::embeddings::vector_search;
+
+#[cfg(feature = "openapi")]
+use crate::http::v1::{
+    datasets::{DatasetFilter, DatasetQueryParams},
+    Format,
+};
 use crate::request::Protocol;
 use crate::Runtime;
 use crate::{config, request::RequestContext};
@@ -26,6 +32,13 @@ use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+#[cfg(feature = "openapi")]
+use utoipa::OpenApi;
+
+#[cfg(feature = "dev")]
+use utoipa_swagger_ui::SwaggerUi;
+
+use super::{metrics, v1};
 use axum::{
     body::Body,
     extract::MatchedPath,
@@ -39,7 +52,45 @@ use runtime_auth::layer::http::AuthLayer;
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
-use super::{metrics, v1};
+#[cfg(feature = "openapi")]
+#[derive(OpenApi)]
+#[openapi(
+    servers(
+        (url = "http://localhost:8090", description = "Local development server. Configure with `--http`."),
+    ),
+    security(
+        ("api_key" = [])
+    ),
+    paths(
+        // Order here will be preserved in sidebar at https://spiceai.org/docs/api/http/runtime.
+        v1::query::post,
+        v1::datasets::get,
+        v1::datasets::acceleration,
+        v1::datasets::refresh,
+        v1::catalogs::get,
+        v1::iceberg::get_config,
+        v1::iceberg::get_namespaces,
+        v1::iceberg::head_namespace,
+        v1::ready::get,
+        v1::status::get,
+        v1::spicepods::get,
+        v1::embeddings::post,
+        v1::search::post,
+        v1::chat::post,
+        v1::models::get,
+        v1::nsql::post,
+        v1::eval::list,
+        v1::eval::post,
+        v1::inference::get,
+        v1::inference::post,
+        v1::tools::list,
+        v1::tools::post,
+        v1::packages::generate,
+    ),
+
+    components(schemas(DatasetQueryParams, DatasetFilter, Format)) // These schemas, for some reason, weren't getting picked up.
+)]
+pub struct ApiDoc;
 
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
@@ -53,7 +104,6 @@ pub(crate) fn routes(
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/datasets", get(v1::datasets::get))
-        .route("/v1/datasets/sample", post(v1::datasets::sample))
         .route(
             "/v1/datasets/:name/acceleration/refresh",
             post(v1::datasets::refresh),
@@ -65,6 +115,31 @@ pub(crate) fn routes(
         .route("/v1/spicepods", get(v1::spicepods::get))
         .route("/v1/packages/generate", post(v1::packages::generate));
 
+    let iceberg_router = Router::new()
+        .route("/v1/config", get(v1::iceberg::get_config))
+        .route("/v1/namespaces", get(v1::iceberg::get_namespaces))
+        .route(
+            "/v1/namespaces/:namespace",
+            get(v1::iceberg::get_namespace).head(v1::iceberg::head_namespace),
+        )
+        .route(
+            "/v1/namespaces/:namespace/tables",
+            get(v1::iceberg::list_tables),
+        )
+        .route(
+            "/v1/namespaces/:namespace/tables/:table",
+            get(v1::iceberg::tables::get).head(v1::iceberg::tables::head),
+        );
+
+    authenticated_router = authenticated_router.merge(iceberg_router);
+
+    // Enable Swagger UI & OpenAPI JSON for dev.
+    #[cfg(feature = "dev")]
+    {
+        authenticated_router = authenticated_router
+            .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", ApiDoc::openapi()));
+    }
+
     if cfg!(feature = "models") {
         authenticated_router = authenticated_router
             .route("/v1/models", get(v1::models::get))
@@ -75,10 +150,11 @@ pub(crate) fn routes(
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route("/v1/search", post(v1::search::post))
             .route("/v1/tools", get(v1::tools::list))
-            .route("/v1/tools/:name", post(v1::tools::post))
+            .route("/v1/tools/*name", post(v1::tools::post))
             // Deprecated, use /v1/evals/:name instead
             .route("/v1/tool/:name", post(v1::tools::post))
             .route("/v1/evals/:name", post(v1::eval::post))
+            .route("/v1/evals/", get(v1::eval::list))
             .layer(Extension(Arc::clone(&rt.llms)))
             .layer(Extension(Arc::clone(&rt.models)))
             .layer(Extension(Arc::clone(&rt.eval_scorers)))

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,13 +26,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::metrics;
 
+/// Represents the status of a component (e.g. dataset, model, etc).
 #[derive(Debug, PartialEq, Eq, Copy, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum ComponentStatus {
-    Initializing = 1,
-    Ready = 2,
-    Disabled = 3,
-    Error = 4,
-    Refreshing = 5,
+    /// The component is initializing and not yet ready
+    Initializing,
+
+    /// The component is ready to accept connections
+    Ready,
+
+    /// The component is disabled and not running
+    Disabled,
+
+    /// An error occurred in the component
+    Error,
+
+    /// The component is in the process of refreshing its state
+    Refreshing,
 }
 
 impl Display for ComponentStatus {
@@ -171,5 +182,24 @@ impl RuntimeStatus {
             Err(poisoned) => poisoned.into_inner(),
         };
         statuses.clone()
+    }
+
+    /// Returns the status of all registered models.
+    ///
+    /// Keys are the `model_name`, not the format from [`RuntimeStatus::get_all_statuses`] (i.e. `model:<model_name>`).
+    #[must_use]
+    pub fn get_model_statuses(&self) -> HashMap<String, ComponentStatus> {
+        let statuses = match self.statuses.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        statuses
+            .iter()
+            .filter_map(|(k, v)| {
+                k.strip_prefix("model:")
+                    .map(|model_name| (model_name.to_string(), *v))
+            })
+            .collect()
     }
 }

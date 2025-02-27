@@ -7,10 +7,23 @@ on:
       - release-*
       - feature-*
     paths-ignore:
+      - '**/*.md'
       - 'docs/**'
       - 'README.md'
+      - 'Makefile'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/**'
       - 'version.txt'
+      - '.schema/**'
+      - '.vscode/**'
+      - 'deploy/**'
+      - 'install/**'
+      - 'media/**'
+      - 'monitoring/**'
       - 'acknowledgements.md'
+      - 'Dockerfile*'
 
   workflow_dispatch:
 
@@ -24,7 +37,7 @@ jobs:
     name: make install*
     runs-on: spiceai-runners
     env:
-      GOVER: 1.22.0
+      GOVER: 1.23.4
 
     steps:
       - uses: actions/checkout@v4

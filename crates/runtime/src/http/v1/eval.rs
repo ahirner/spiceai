@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,17 +33,63 @@ use crate::{
     Runtime,
 };
 
+#[cfg(feature = "openapi")]
+use crate::model::EvalRunResponse;
+
 use super::{sql_to_http_response, ArrowFormat};
 
+/// Input parameters to start an evaluation run for a given model.
 #[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub(crate) struct RunEval {
     pub model: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub(crate) struct ModelResponse {}
-
+/// Run Eval
+///
+/// Evaluate a model against a eval spice specification
+#[cfg_attr(feature = "openapi", utoipa::path(
+    post,
+    path = "/v1/evals/{name}",
+    operation_id = "post_eval",
+    tag = "Evaluations",
+    params(
+        ("Accept" = String, Header, description = "The format of the response, one of 'application/json' (default), 'text/csv' or 'text/plain'."),
+    ),
+    params(
+        ("name" = String, Path, description = "Name of the evaluation to run")
+    ),
+    request_body(
+        description = "Parameters to run the evaluation",
+        content((RunEval = "application/json", example = json!({ "model": "example_model" })))
+    ),
+    responses(
+        (status = 200, description = "Evaluation run successfully", content((
+            EvalRunResponse = "application/json", example = json!({
+                    "primary_key": "eval_12345",
+                    "time_column": "2024-12-19T12:34:56Z",
+                    "dataset": "my_dataset",
+                    "model": "example_model",
+                    "status": "completed",
+                    "error_message": null,
+                    "scorers": ["scorer1", "scorer2"],
+                    "metrics": {
+                        "scorer1/accuracy": 0.95,
+                        "scorer2/accuracy": 0.93
+                    }
+                })
+            ),
+            ("text/csv", example = "primary_key,time_column,dataset,model,status,error_message,scorers,metrics\n\
+                          eval_12345,2024-12-19T12:34:56Z,my_dataset,example_model,completed,,\"[\"\"scorer1\"\", \"\"scorer2\"\"]\",\"{\"\"scorer1/accuracy\"\":0.95, \"\"scorer2/accuracy\"\":0.93}\""
+            ),
+            ("text/plain", example = r#"+-------------+---------------------+-----------+---------------+-----------+----------------+------------------+---------------------------------------+
+            | primary_key | time_column         | dataset   | model         | status    | error_message  |      scorers     | metrics                               |
+            +-------------+---------------------+-----------+---------------+-----------+----------------+------------------+---------------------------------------+
+            | eval_12345  | 2024-12-19T12:34:56Z| my_dataset| example_model | completed |                | scorer1, scorer2 | {"accuracy": 0.95, "precision": 0.93} |
+            +-------------+---------------------+-----------+---------------+-----------+----------------+------------------+---------------------------------------+"#)
+        )),
+    )
+))]
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
     Extension(df): Extension<Arc<DataFusion>>,
@@ -55,10 +101,6 @@ pub(crate) async fn post(
 ) -> Response {
     let model = req.model;
 
-    if !llms.read().await.contains_key(&model) {
-        return (StatusCode::NOT_FOUND, format!("model '{model}' not found")).into_response();
-    };
-
     let evals = rt.evals.read().await;
     let Some(eval) = evals.iter().find(|e| e.name == eval_name) else {
         return (
@@ -66,6 +108,10 @@ pub(crate) async fn post(
             format!("eval '{eval_name}' not found"),
         )
             .into_response();
+    };
+
+    if !llms.read().await.contains_key(&model) {
+        return (StatusCode::NOT_FOUND, format!("model '{model}' not found")).into_response();
     };
 
     if !df
@@ -98,4 +144,48 @@ pub(crate) async fn post(
         }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")).into_response(),
     }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+struct ListEvalElement {
+    pub name: String,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub dataset: String,
+    pub scorers: Vec<String>,
+}
+
+/// List Evals
+///
+/// Return all evals available to run in the runtime.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    get,
+    path = "/v1/evals",
+    tag = "Evaluations",
+    responses(
+        (status = 200, description = "All evals available in the Spice runtime", body = [ListEvalElement],
+            example = json!([{
+                "name": "knows_math",
+                "description": "Questions from first year, undergraduate math exams",
+                "dataset": "math_exams",
+                "scorers": ["match", "professor_logical_consistency"]
+            }])
+        )
+    )
+))]
+pub(crate) async fn list(Extension(rt): Extension<Arc<Runtime>>) -> Response {
+    let evals_lock = rt.evals.read().await;
+    let evals: Vec<_> = evals_lock
+        .iter()
+        .map(|e| ListEvalElement {
+            name: e.name.clone(),
+            description: e.description.clone(),
+            dataset: e.dataset.clone(),
+            scorers: e.scorers.clone(),
+        })
+        .collect();
+
+    (StatusCode::OK, Json(evals)).into_response()
 }

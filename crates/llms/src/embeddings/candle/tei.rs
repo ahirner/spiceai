@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -121,8 +121,8 @@ impl TeiEmbed {
             .map(|pp| {
                 let p = pool_from_str(pp);
                 if p.is_none() {
-                    return Err(Error::FailedToCreateEmbedding {
-                        source: format!("Invalid pooling mode: {pp}").into(),
+                    return Err(Error::InvalidPoolingMode {
+                        value: pp.to_string(),
                     });
                 }
                 Ok(p)

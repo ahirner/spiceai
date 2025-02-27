@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -68,11 +68,7 @@ impl Runtime {
                         metrics::embeddings::LOAD_ERROR.add(1, &[]);
                         self.status
                             .update_embedding(&in_embed.name, status::ComponentStatus::Error);
-                        tracing::warn!(
-                            "Unable to load embedding from spicepod {}, error: {}",
-                            in_embed.name,
-                            e,
-                        );
+                        tracing::warn!("Failed to load embedding {}.\nError: {}\nVerify configuration and try again.\nFor details, visit https://spiceai.org/docs/components/embeddings", in_embed.name, e);
                     }
                 }
             }
@@ -91,7 +87,7 @@ impl Runtime {
             .boxed()
             .context(UnableToInitializeEmbeddingModelSnafu)?;
 
-        TaskEmbed::new(l)
+        TaskEmbed::new(in_embed.name.as_str(), l)
             .await
             .boxed()
             .context(UnableToInitializeEmbeddingModelSnafu)

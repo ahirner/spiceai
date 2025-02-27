@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,7 +26,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
     Parameters,
 };
 
@@ -101,9 +101,13 @@ const PARAMETERS: &[ParameterSpec] = &[
 ];
 
 impl DataConnectorFactory for DeltaLakeFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let delta = DeltaLake::new(params.parameters);

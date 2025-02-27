@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::borrow::Cow;
 use std::error::Error;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -33,14 +34,15 @@ use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{provider_as_source, MemTable};
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::{LogicalPlanBuilder, UNNAMED_TABLE};
-use flight_client::TonicStatusError;
+use flight_client::{TonicStatusError, MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE};
 use futures::{StreamExt, TryStreamExt};
 use llms::chat::LlmRuntime;
 use prost::Message;
 use reqwest::Client;
 use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
 use rustyline::history::FileHistory;
-use rustyline::{ConditionalEventHandler, KeyEvent};
+use rustyline::{Completer, ConditionalEventHandler, Helper, Hinter, KeyEvent, Validator};
 use rustyline::{Editor, EventHandler, Modifiers};
 use serde_json::json;
 use tonic::metadata::errors::InvalidMetadataValue;
@@ -48,6 +50,7 @@ use tonic::metadata::{Ascii, AsciiMetadataKey, MetadataValue};
 use tonic::transport::{Channel, ClientTlsConfig};
 use tonic::{Code, IntoRequest, Status};
 
+pub mod cache_control;
 mod config;
 
 #[derive(Parser, Debug)]
@@ -83,6 +86,16 @@ pub struct ReplConfig {
 
     #[arg(long, value_name = "USER_AGENT", help_heading = "SQL REPL")]
     pub user_agent: Option<String>,
+
+    /// Control whether the results cache is used for queries.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = cache_control::CacheControl::Cache,
+        value_name = "CACHE_CONTROL",
+        help_heading = "SQL REPL"
+    )]
+    pub cache_control: cache_control::CacheControl,
 }
 
 const NQL_LINE_PREFIX: &str = "nql ";
@@ -109,6 +122,7 @@ async fn send_nsql_request(
 }
 
 const SPECIAL_COMMANDS: [&str; 6] = [".exit", "exit", "quit", "q", ".error", "help"];
+const PROMPT_COLOR: Colour = Colour::Fixed(8);
 
 #[derive(Clone)]
 struct KeyEventHandler;
@@ -132,6 +146,23 @@ impl ConditionalEventHandler for KeyEventHandler {
                 None
             }
         })
+    }
+}
+
+#[derive(Completer, Helper, Hinter, Validator)]
+struct EditorHelper;
+
+impl Highlighter for EditorHelper {
+    fn highlight_prompt<'b, 's: 'b, 'p: 'b>(
+        &'s self,
+        prompt: &'p str,
+        default: bool,
+    ) -> Cow<'b, str> {
+        if default {
+            PROMPT_COLOR.paint(prompt).to_string().into()
+        } else {
+            Cow::Borrowed(prompt)
+        }
     }
 }
 
@@ -175,10 +206,16 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
 
     // The encoder/decoder size is limited to 500MB.
     let client = FlightServiceClient::new(channel)
-        .max_decoding_message_size(500 * 1024 * 1024)
-        .max_encoding_message_size(500 * 1024 * 1024);
+        .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+        .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
 
-    let mut rl: Editor<(), FileHistory> = Editor::new()?;
+    #[cfg(target_os = "windows")]
+    // Ensure ANSI support on Windows is enabled for proper color display.
+    let _ = ansi_term::enable_ansi_support();
+
+    let mut rl = Editor::<EditorHelper, FileHistory>::new()?;
+    rl.set_helper(Some(EditorHelper));
+
     let key_handler = Box::new(KeyEventHandler {});
     rl.bind_sequence(KeyEvent::ctrl('C'), EventHandler::Conditional(key_handler));
     rl.bind_sequence(KeyEvent::ctrl('D'), rustyline::Cmd::EndOfFile);
@@ -190,11 +227,12 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
     println!("show tables; -- list available tables");
 
     let mut last_error: Option<Status> = None;
-    let prompt_color = Colour::Fixed(8);
 
     'outer: loop {
         let mut first_line = true;
-        let mut prompt = prompt_color.paint("sql> ").to_string();
+        // When using the Editor, prompt coloring is applied automatically by the Highlighter. Manual colorizing for
+        // the prompt should not be used, as it does not work on Windows: https://github.com/kkawakam/rustyline/issues/836
+        let mut prompt = "sql> ".to_string();
         let mut line = String::new();
         loop {
             let line_result = rl.readline(&prompt);
@@ -227,7 +265,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             }
 
             if first_line {
-                prompt = prompt_color.paint("  -> ").to_string();
+                prompt = "  -> ".to_string();
                 first_line = false;
             }
         }
@@ -252,13 +290,13 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
                 println!("Available commands:\n");
                 println!(
                     "{} Exit the REPL",
-                    prompt_color.paint(".exit, exit, quit, q:")
+                    PROMPT_COLOR.paint(".exit, exit, quit, q:")
                 );
                 println!(
                     "{} Show details of the last error",
-                    prompt_color.paint(".error:")
+                    PROMPT_COLOR.paint(".error:")
                 );
-                println!("{} Show this help message", prompt_color.paint("help:"));
+                println!("{} Show this help message", PROMPT_COLOR.paint("help:"));
                 println!("\nOther lines will be interpreted as SQL");
                 continue;
             }
@@ -285,6 +323,7 @@ pub async fn run(repl_config: ReplConfig) -> Result<(), Box<dyn std::error::Erro
             line,
             repl_config.api_key.as_ref(),
             &user_agent,
+            repl_config.cache_control,
         )
         .await
         {
@@ -321,6 +360,7 @@ pub async fn get_records(
     line: &str,
     api_key: Option<&String>,
     user_agent: &str,
+    cache_control: cache_control::CacheControl,
 ) -> Result<(Vec<RecordBatch>, usize, bool), FlightError> {
     let sql_command = CommandStatementQuery {
         query: line.to_string(),
@@ -341,6 +381,13 @@ pub async fn get_records(
         return Err(FlightError::Tonic(Status::internal("No ticket")));
     };
     let mut request = add_api_key(ticket.into_request(), api_key);
+
+    if cache_control == cache_control::CacheControl::NoCache {
+        request
+            .metadata_mut()
+            .insert("cache-control", MetadataValue::from_static("no-cache"));
+    }
+
     let user_agent_key = AsciiMetadataKey::from_str("User-Agent")
         .map_err(|e| FlightError::ExternalError(e.into()))?;
     let user_agent_value = user_agent
@@ -354,7 +401,7 @@ pub async fn get_records(
     let response = client.do_get(request).await?;
     let from_cache = response
         .metadata()
-        .get("x-cache")
+        .get("results-cache-status")
         .and_then(|value| value.to_str().ok())
         .is_some_and(|s| s.to_lowercase().starts_with("hit"));
 

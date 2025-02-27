@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -47,6 +47,11 @@ static DOCUMENT_PARSER_FACTORY_REGISTRY: LazyLock<
 pub async fn register_all() {
     register_parser_factory("docx", Arc::new(docx::DocxParserFactory {})).await;
     register_parser_factory("pdf", Arc::new(pdf::PdfParserFactory {})).await;
+}
+
+pub async fn unregister_all() {
+    let mut registry = DOCUMENT_PARSER_FACTORY_REGISTRY.lock().await;
+    registry.clear();
 }
 
 pub async fn get_parser_factory(ext: &str) -> Option<Arc<dyn DocumentParserFactory>> {

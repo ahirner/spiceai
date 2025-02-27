@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use super::ConnectorComponent;
+use super::ConnectorParams;
 use super::DataConnector;
 use super::DataConnectorFactory;
-use super::DataConnectorParams;
 use super::ParameterSpec;
 use async_trait::async_trait;
 use data_components::snowflake::SnowflakeTableFactory;
@@ -76,9 +76,13 @@ const PARAMETERS: &[ParameterSpec] = &[
 ];
 
 impl DataConnectorFactory for SnowflakeFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<

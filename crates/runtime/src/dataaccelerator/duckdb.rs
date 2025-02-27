@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ use crate::{
         acceleration::{Engine, Mode},
         Dataset,
     },
+    datafusion::dialect::new_duckdb_dialect,
     make_spice_data_directory,
     parameters::ParameterSpec,
     spice_data_base_path, Runtime,
@@ -84,7 +85,8 @@ impl DuckDBAccelerator {
     pub fn new() -> Self {
         Self {
             // DuckDB accelerator uses params.duckdb_file for file connection
-            duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite),
+            duckdb_factory: DuckDBTableProviderFactory::new(AccessMode::ReadWrite)
+                .with_dialect(new_duckdb_dialect()),
         }
     }
 
@@ -249,23 +251,24 @@ impl DataAccelerator for DuckDBAccelerator {
                     let datasets =
                         Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
                     let self_path = self.file_path(this_dataset)?;
-                    let attach_databases = datasets
-                        .iter()
-                        .filter_map(|other_dataset| {
-                            if other_dataset.acceleration.as_ref().map_or(false, |a| {
-                                a.engine == Engine::DuckDB && a.mode == Mode::File
-                            }) {
-                                if **other_dataset == *this_dataset {
-                                    None
+                    let attach_databases =
+                        datasets
+                            .iter()
+                            .filter_map(|other_dataset| {
+                                if other_dataset.acceleration.as_ref().is_some_and(|a| {
+                                    a.engine == Engine::DuckDB && a.mode == Mode::File
+                                }) {
+                                    if **other_dataset == *this_dataset {
+                                        None
+                                    } else {
+                                        let other_path = self.file_path(other_dataset);
+                                        other_path.ok().filter(|p| p != &self_path)
+                                    }
                                 } else {
-                                    let other_path = self.file_path(other_dataset);
-                                    other_path.ok().filter(|p| p != &self_path)
+                                    None
                                 }
-                            } else {
-                                None
-                            }
-                        })
-                        .collect::<Vec<_>>();
+                            })
+                            .collect::<Vec<_>>();
 
                     if !attach_databases.is_empty() {
                         cmd.options

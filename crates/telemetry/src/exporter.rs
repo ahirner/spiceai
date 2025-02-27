@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,8 +19,7 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use flight_client::{Credentials, FlightClient};
-use opentelemetry::metrics::MetricsError;
-use opentelemetry_sdk::metrics::{data::Temporality, reader::TemporalitySelector, InstrumentKind};
+use opentelemetry_sdk::metrics::MetricError;
 
 #[derive(Debug, Clone)]
 pub struct AnonymousTelemetryExporter {
@@ -28,6 +27,7 @@ pub struct AnonymousTelemetryExporter {
 }
 
 impl AnonymousTelemetryExporter {
+    #[allow(dead_code)]
     pub async fn new(url: Arc<str>) -> Self {
         let flight_client = match FlightClient::try_new(url, Credentials::anonymous(), None).await {
             Ok(client) => Some(client),
@@ -40,15 +40,9 @@ impl AnonymousTelemetryExporter {
     }
 }
 
-impl TemporalitySelector for AnonymousTelemetryExporter {
-    fn temporality(&self, _kind: InstrumentKind) -> Temporality {
-        Temporality::Cumulative
-    }
-}
-
 #[async_trait]
 impl otel_arrow::ArrowExporter for AnonymousTelemetryExporter {
-    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricsError> {
+    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricError> {
         let Some(mut flight_client) = self.flight_client.clone() else {
             return Ok(());
         };
@@ -60,11 +54,11 @@ impl otel_arrow::ArrowExporter for AnonymousTelemetryExporter {
         Ok(())
     }
 
-    async fn force_flush(&self) -> Result<(), MetricsError> {
+    async fn force_flush(&self) -> Result<(), MetricError> {
         Ok(())
     }
 
-    fn shutdown(&self) -> Result<(), MetricsError> {
+    fn shutdown(&self) -> Result<(), MetricError> {
         Ok(())
     }
 }

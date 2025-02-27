@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -95,7 +95,7 @@ impl EmbeddingConnector {
             if !self.embedding_models.read().await.contains_key(model) {
                 return Err(DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "EmbeddingConnector".to_string(),
-                    message: format!("The dataset is configured with an embedding model '{model}' to embed column '{column}', but the model '{model}' is not defined in Spicepod (as an 'embeddings').\nFor details, visit: https://docs.spiceai.org/components/embeddings"),
+                    message: format!("The dataset is configured with an embedding model '{model}' to embed column '{column}', but the model '{model}' is not defined in Spicepod (as an 'embeddings') or failed to load.\nFor details, visit: https://spiceai.org/docs/components/embeddings"),
                     connector_component: dataset.into()
                 });
             }
@@ -119,15 +119,21 @@ impl EmbeddingConnector {
             })
             .collect::<HashMap<_, _>>();
 
-        Ok(Arc::new(
-            EmbeddingTable::new(
-                inner_table_provider,
-                embed_columns,
-                Arc::clone(&self.embedding_models),
-                embed_chunker_config,
-            )
-            .await,
-        ) as Arc<dyn TableProvider>)
+        let embedding_table = EmbeddingTable::try_new(
+            inner_table_provider,
+            embed_columns,
+            Arc::clone(&self.embedding_models),
+            embed_chunker_config,
+        )
+        .await
+        .map_err(|e| DataConnectorError::InvalidConfiguration {
+            dataconnector: dataset.source().to_string(),
+            message: e.to_string(),
+            connector_component: dataset.into(),
+            source: Box::new(e),
+        })?;
+
+        Ok(Arc::new(embedding_table) as Arc<dyn TableProvider>)
     }
 }
 

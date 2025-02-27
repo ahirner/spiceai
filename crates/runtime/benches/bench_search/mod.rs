@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -51,7 +51,7 @@ impl Display for SearchBenchmarkResultBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            r#"configuration: {},
+            "configuration: {},
   status: {},
   run_id: {},
   commit_sha: {},
@@ -62,7 +62,7 @@ impl Display for SearchBenchmarkResultBuilder {
   rps: {:.2},
   mean_response_time: {:.2} ms,
   p95_response_time: {:.2} ms,
-  score: {:.2}"#,
+  score: {:.2}",
             self.config_name,
             self.status,
             self.run_id,

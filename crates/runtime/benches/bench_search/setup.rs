@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,12 +21,15 @@ use datafusion::sql::TableReference;
 use futures::TryStreamExt;
 use runtime::{dataupdate::DataUpdate, Runtime};
 
-use crate::utils::{get_branch_name, get_commit_sha, init_tracing};
+use crate::{
+    utils::{get_branch_name, get_commit_sha, init_tracing},
+    SearchBenchmarkConfiguration,
+};
 
 use app::AppBuilder;
 use spicepod::component::{
     dataset::{acceleration::Acceleration, replication::Replication, Dataset, Mode},
-    embeddings::Embeddings,
+    embeddings::{EmbeddingChunkConfig, Embeddings},
     runtime::ResultsCache,
 };
 
@@ -41,20 +44,23 @@ pub(crate) struct Query {
 pub(crate) type QueryRelevance = HashMap<String, HashMap<String, i32>>;
 
 pub(crate) async fn setup_benchmark(
-    configuration_name: &str,
-    test_dataset: &str,
-    embeddings_model: &str,
-    acceleration: Option<&Acceleration>,
+    config: &SearchBenchmarkConfiguration,
     upload_results_dataset: Option<&String>,
 ) -> Result<(Runtime, SearchBenchmarkResultBuilder), String> {
     init_tracing(Some(
-        "runtime=Debug,task_history=WARN,runtime::embeddings=WARN,INFO",
+        "runtime=DEBUG,task_history=WARN,runtime::embeddings=WARN,INFO",
     ));
 
     let mut benchmark_result =
-        SearchBenchmarkResultBuilder::new(get_commit_sha(), get_branch_name(), configuration_name);
+        SearchBenchmarkResultBuilder::new(get_commit_sha(), get_branch_name(), config.name);
 
-    let app_builder = build_bench_app(test_dataset, embeddings_model, acceleration).await?;
+    let app_builder = build_bench_app(
+        config.test_dataset,
+        config.embeddings_model,
+        config.acceleration.as_ref(),
+        config.chunking.as_ref(),
+    )
+    .await?;
 
     let app = match upload_results_dataset {
         Some(dataset_path) => app_builder
@@ -148,15 +154,17 @@ fn extract_queries_from_batches(records: &[RecordBatch]) -> Result<Vec<Query>, S
                 .column_by_name("id")
                 .ok_or_else(|| "Missing 'id' column".to_string())?
                 .as_any()
-                .downcast_ref::<arrow::array::StringViewArray>()
-                .ok_or_else(|| "Failed to downcast 'id' column to StringViewArray".to_string())?;
+                .downcast_ref::<arrow::array::LargeStringArray>()
+                .ok_or_else(|| "Failed to downcast 'id' column to LargeStringArray".to_string())?;
 
             let text_column = batch
                 .column_by_name("text")
                 .ok_or_else(|| "Missing 'text' column".to_string())?
                 .as_any()
-                .downcast_ref::<arrow::array::StringViewArray>()
-                .ok_or_else(|| "Failed to downcast 'text' column to StringViewArray".to_string())?;
+                .downcast_ref::<arrow::array::LargeStringArray>()
+                .ok_or_else(|| {
+                    "Failed to downcast 'text' column to LargeStringArray".to_string()
+                })?;
 
             let queries = (0..batch.num_rows())
                 .map(|i| {
@@ -184,16 +192,18 @@ fn extract_query_relevance_from_batches(records: &[RecordBatch]) -> Result<Query
             .column_by_name("query-id")
             .ok_or_else(|| "Missing 'query-id' column".to_string())?
             .as_any()
-            .downcast_ref::<arrow::array::StringViewArray>()
-            .ok_or_else(|| "Failed to downcast 'query-id' column to StringViewArray".to_string())?;
+            .downcast_ref::<arrow::array::LargeStringArray>()
+            .ok_or_else(|| {
+                "Failed to downcast 'query-id' column to LargeStringArray".to_string()
+            })?;
 
         let corpus_id_column = batch
             .column_by_name("corpus-id")
             .ok_or_else(|| "Missing 'corpus-id' column".to_string())?
             .as_any()
-            .downcast_ref::<arrow::array::StringViewArray>()
+            .downcast_ref::<arrow::array::LargeStringArray>()
             .ok_or_else(|| {
-                "Failed to downcast 'corpus-id' column to StringViewArray".to_string()
+                "Failed to downcast 'corpus-id' column to LargeStringArray".to_string()
             })?;
 
         let score_column = batch
@@ -223,6 +233,7 @@ async fn build_bench_app(
     test_dataset: &str,
     embeddings_model: &str,
     acceleration: Option<&Acceleration>,
+    chunking: Option<&EmbeddingChunkConfig>,
 ) -> Result<AppBuilder, String> {
     let app_builder = AppBuilder::new("vector_search_benchmark_test")
         .with_results_cache(ResultsCache {
@@ -233,17 +244,25 @@ async fn build_bench_app(
         })
         .with_embedding(create_embeddings_model(embeddings_model));
 
-    add_benchmark_dataset(app_builder, test_dataset, acceleration.cloned()).await
+    add_benchmark_dataset(
+        app_builder,
+        test_dataset,
+        acceleration.cloned(),
+        chunking.cloned(),
+    )
+    .await
 }
 
 async fn add_benchmark_dataset(
     app_builder: AppBuilder,
     dataset: &str,
     acceleration: Option<Acceleration>,
+    chunking: Option<EmbeddingChunkConfig>,
 ) -> Result<AppBuilder, String> {
     match dataset.to_lowercase().as_str() {
         "quoraretrieval" => {
-            super::datasets::add_mtep_quora_retrieval_dataset(app_builder, acceleration).await
+            super::datasets::add_mtep_quora_retrieval_dataset(app_builder, acceleration, chunking)
+                .await
         }
         _ => Err(format!("Unknown benchmark dataset: {dataset}")),
     }

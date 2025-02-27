@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,13 +21,23 @@ import (
 )
 
 const (
-	DotSpice               = ".spice"
-	SpicePodsDirectoryName = "spicepods"
+	DotSpice                  = ".spice"
+	SpicePodsDirectoryName    = "spicepods"
+	SpiceUpgradeReloadEnv     = "SPICE_CLI_RESTARTED_AFTER_UPGRADE"
+	SpiceCliCleanupMarkerFile = "cleanup.marker"
 )
 
 var (
 	SpiceRuntimeFilename string
 	SpiceCliFilename     string
+)
+
+type SpiceInstallPath int
+
+const (
+	StandardInstall SpiceInstallPath = iota
+	BrewInstall
+	OtherInstall
 )
 
 func init() {

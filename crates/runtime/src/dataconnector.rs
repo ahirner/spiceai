@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,28 +15,34 @@ limitations under the License.
 */
 
 use crate::accelerated_table::AcceleratedTable;
+use crate::catalogconnector::CATALOG_CONNECTOR_FACTORY_REGISTRY;
 use crate::component::catalog::Catalog;
 use crate::component::dataset::acceleration::RefreshMode;
 use crate::component::dataset::Dataset;
 use crate::datafusion::error::find_datafusion_root;
 use crate::federated_table::FederatedTable;
+use crate::get_params_with_secrets;
 use crate::parameters::ParameterSpec;
 use crate::parameters::Parameters;
 use crate::secrets::Secrets;
-use crate::Runtime;
+use arrow_schema::SchemaRef;
+use arrow_tools::schema::schema_meta_get_computed_columns;
 use async_trait::async_trait;
 use data_components::cdc::ChangesStream;
-use datafusion::catalog::CatalogProvider;
+use datafusion::common::tree_node::Transformed;
+use datafusion::common::tree_node::TreeNode;
+use datafusion::common::Column;
 use datafusion::dataframe::DataFrame;
 use datafusion::datasource::{DefaultTableSource, TableProvider};
 use datafusion::error::DataFusionError;
+use datafusion::error::Result as DataFusionResult;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::SendableRecordBatchStream;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::TableReference;
-use datafusion_table_providers::InvalidTypeAction;
-use secrecy::SecretString;
+use datafusion_table_providers::UnsupportedTypeAction;
 use snafu::prelude::*;
 use std::any::Any;
 use std::collections::HashMap;
@@ -62,6 +68,8 @@ pub mod delta_lake;
 pub mod dremio;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+#[cfg(feature = "dynamodb")]
+pub mod dynamodb;
 pub mod file;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
@@ -80,6 +88,8 @@ pub mod mysql;
 pub mod odbc;
 pub const ODBC_DATACONNECTOR: &str = "odbc"; // const needs to be accessible when ODBC isn't built
 
+#[cfg(feature = "imap")]
+pub mod imap;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod s3;
@@ -93,8 +103,6 @@ pub mod snowflake;
 #[cfg(feature = "spark")]
 pub mod spark;
 pub mod spiceai;
-#[cfg(feature = "delta_lake")]
-pub mod unity_catalog;
 
 #[derive(Debug, Snafu)]
 pub enum DataConnectorError {
@@ -163,6 +171,13 @@ pub enum DataConnectorError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{source}"))]
+    InvalidConfigurationSourceOnly {
+        dataconnector: String,
+        connector_component: ConnectorComponent,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display("Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{message}"))]
     InvalidConfigurationNoSource {
         dataconnector: String,
@@ -170,7 +185,7 @@ pub enum DataConnectorError {
         message: String,
     },
 
-    #[snafu(display("Cannot setup the {connector_component} ({dataconnector}).\nThe connector '{dataconnector}' is not a valid connector.\nFor details, visit: https://docs.spiceai.org/components/data-connectors"))]
+    #[snafu(display("Cannot setup the {connector_component} ({dataconnector}).\nThe connector '{dataconnector}' is not a valid connector.\nFor details, visit: https://spiceai.org/docs/components/data-connectors"))]
     InvalidConnectorType {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -202,7 +217,7 @@ pub enum DataConnectorError {
         table_name: String,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nAn unknown Data Connector Error occurred: {source}\nPlease report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nAn unknown Data Connector Error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     InternalWithSource {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -220,14 +235,14 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nInvalid type action is not supported for the {dataconnector} Data Connector.\nRemove the parameter from your dataset configuration."
+        "Failed to load the {connector_component} ({dataconnector}).\nUnsupported type action is not enabled for the {dataconnector} Data Connector.\nRemove the parameter from your dataset configuration."
     ))]
-    UnsupportedInvalidTypeAction {
+    UnsupportedTypeAction {
         dataconnector: String,
         connector_component: ConnectorComponent,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nThe field '{field_name}' has an unsupported data type: {data_type}.\nSkip loading this field by setting the `invalid_type_action` parameter to `ignore` or `warn` in the dataset configuration.\nFor details, visit: https://docs.spiceai.org/reference/spicepod/datasets#invalid_type_action"))]
+    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\nThe field '{field_name}' has an unsupported data type: {data_type}.\nSkip loading this field by setting the `unsupported_type_action` parameter to `ignore` or `warn` in the dataset configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#unsupported_type_action"))]
     UnsupportedDataType {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -235,7 +250,7 @@ pub enum DataConnectorError {
         field_name: String,
     },
 
-    #[snafu(display("Failed to initialize the {connector_component} (ODBC).\nThe runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    #[snafu(display("Failed to initialize the {connector_component} (ODBC).\nThe runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
     OdbcNotInstalled {
         connector_component: ConnectorComponent,
     },
@@ -267,7 +282,7 @@ pub async fn register_connector_factory(
 /// `None` if the connector for `name` is not registered, otherwise a `Result` containing the result of calling the constructor to create a `DataConnector`.
 pub async fn create_new_connector(
     name: &str,
-    params: DataConnectorParams,
+    params: ConnectorParams,
 ) -> Option<AnyErrorResult<Arc<dyn DataConnector>>> {
     let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
 
@@ -275,8 +290,8 @@ pub async fn create_new_connector(
 
     let factory = connector_factory?;
 
-    if params.invalid_type_action.is_some() && !factory.supports_invalid_type_action() {
-        return Some(Err(DataConnectorError::UnsupportedInvalidTypeAction {
+    if params.unsupported_type_action.is_some() && !factory.supports_unsupported_type_action() {
+        return Some(Err(DataConnectorError::UnsupportedTypeAction {
             dataconnector: name.to_string(),
             connector_component: params.component.clone(),
         }
@@ -302,6 +317,8 @@ pub async fn register_all() {
     register_connector_factory("abfs", abfs::AzureBlobFSFactory::new_arc()).await;
     #[cfg(feature = "ftp")]
     register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
+    #[cfg(feature = "imap")]
+    register_connector_factory("imap", imap::ImapFactory::new_arc()).await;
     register_connector_factory("http", https::HttpsFactory::new_arc()).await;
     register_connector_factory("https", https::HttpsFactory::new_arc()).await;
     register_connector_factory("github", github::GithubFactory::new_arc()).await;
@@ -330,22 +347,24 @@ pub async fn register_all() {
     register_connector_factory("snowflake", snowflake::SnowflakeFactory::new_arc()).await;
     #[cfg(feature = "debezium")]
     register_connector_factory("debezium", debezium::DebeziumFactory::new_arc()).await;
-    #[cfg(feature = "delta_lake")]
-    register_connector_factory(
-        "unity_catalog",
-        unity_catalog::UnityCatalogFactory::new_arc(),
-    )
-    .await;
     register_connector_factory("localpod", localpod::LocalPodFactory::new_arc()).await;
+    #[cfg(feature = "dynamodb")]
+    register_connector_factory("dynamodb", dynamodb::DynamoDBFactory::new_arc()).await;
 }
 
+pub async fn unregister_all() {
+    let mut registry = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+    registry.clear();
+}
 pub trait DataConnectorFactory: Send + Sync {
+    fn as_any(&self) -> &dyn Any;
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>>;
 
-    fn supports_invalid_type_action(&self) -> bool {
+    fn supports_unsupported_type_action(&self) -> bool {
         false
     }
 
@@ -414,15 +433,6 @@ pub trait DataConnector: Send + Sync {
         None
     }
 
-    /// Returns a DataFusion `CatalogProvider` which can automatically populate tables from a remote catalog.
-    async fn catalog_provider(
-        self: Arc<Self>,
-        _runtime: &Runtime,
-        _catalog: &Catalog,
-    ) -> Option<DataConnectorResult<Arc<dyn CatalogProvider>>> {
-        None
-    }
-
     /// A hook that is called when an accelerated table is registered to the
     /// DataFusion context for this data connector.
     ///
@@ -456,7 +466,19 @@ pub async fn get_data(
 
             DataFrame::new(ctx.state(), logical_plan)
         }
-        Some(sql) => ctx.sql(&sql).await.map_err(find_datafusion_root)?,
+        Some(sql) => {
+            let session = ctx.state();
+            let mut plan = session
+                .create_logical_plan(&sql)
+                .await
+                .map_err(find_datafusion_root)?;
+
+            // If the refresh SQL defines a subset of columns to fetch, computed columns such as embeddings
+            // are not included automatically, so we verify their presence and add them manually if needed.
+            plan = include_computed_columns(plan, &table_provider.schema())?;
+
+            DataFrame::new(session, plan)
+        }
     };
 
     for filter in filters {
@@ -505,19 +527,18 @@ impl std::fmt::Display for ConnectorComponent {
     }
 }
 
-pub struct DataConnectorParams {
+pub struct ConnectorParams {
     pub(crate) parameters: Parameters,
-    pub(crate) metadata: HashMap<String, String>,
-    pub(crate) invalid_type_action: Option<InvalidTypeAction>,
+    pub(crate) unsupported_type_action: Option<UnsupportedTypeAction>,
     pub(crate) component: ConnectorComponent,
 }
 
-pub struct DataConnectorParamsBuilder {
+pub struct ConnectorParamsBuilder {
     connector: Arc<str>,
     component: ConnectorComponent,
 }
 
-impl DataConnectorParamsBuilder {
+impl ConnectorParamsBuilder {
     #[must_use]
     pub fn new(connector: Arc<str>, component: ConnectorComponent) -> Self {
         Self {
@@ -526,69 +547,181 @@ impl DataConnectorParamsBuilder {
         }
     }
 
-    pub async fn with_runtime(
+    pub async fn build(
         &self,
-        runtime: &Runtime,
-    ) -> Result<DataConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
-        match &self.component {
+        secrets: Arc<RwLock<Secrets>>,
+    ) -> Result<ConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
+        let name = self.connector.to_string();
+        let mut unsupported_type_action = None;
+        let (params, prefix, parameters) = match &self.component {
             ConnectorComponent::Catalog(catalog) => {
-                let secrets = runtime.secrets();
-                let params = runtime.get_params_with_secrets(&catalog.params).await;
-                let params = self.without_runtime(params, secrets).await?;
+                let guard = CATALOG_CONNECTOR_FACTORY_REGISTRY.lock().await;
+                let connector_factory = guard.get(&name);
 
-                Ok(params)
+                let factory =
+                    connector_factory.ok_or_else(|| DataConnectorError::InvalidConnectorType {
+                        dataconnector: name.clone(),
+                        connector_component: self.component.clone(),
+                    })?;
+
+                (
+                    get_params_with_secrets(Arc::clone(&secrets), &catalog.params).await,
+                    factory.prefix(),
+                    factory.parameters(),
+                )
             }
             ConnectorComponent::Dataset(dataset) => {
-                let secrets = runtime.secrets();
-                let params = runtime.get_params_with_secrets(&dataset.params).await;
-                let mut params = self.without_runtime(params, secrets).await?;
-                params.metadata.clone_from(&dataset.metadata);
-                params.invalid_type_action = dataset.invalid_type_action.map(Into::into);
+                let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
+                let connector_factory = guard.get(&name);
 
-                Ok(params)
+                unsupported_type_action = dataset.unsupported_type_action;
+
+                let factory = connector_factory.ok_or_else(|| {
+                    if name == ODBC_DATACONNECTOR {
+                        DataConnectorError::OdbcNotInstalled {
+                            connector_component: self.component.clone(),
+                        }
+                    } else {
+                        DataConnectorError::InvalidConnectorType {
+                            dataconnector: name.clone(),
+                            connector_component: self.component.clone(),
+                        }
+                    }
+                })?;
+
+                let params = get_params_with_secrets(Arc::clone(&secrets), &dataset.params).await;
+
+                (params, factory.prefix(), factory.parameters())
             }
-        }
-    }
-
-    pub async fn without_runtime(
-        &self,
-        params: HashMap<String, SecretString>,
-        secrets: Arc<RwLock<Secrets>>,
-    ) -> Result<DataConnectorParams, Box<dyn std::error::Error + Send + Sync>> {
-        let name = self.connector.to_string();
-        let guard = DATA_CONNECTOR_FACTORY_REGISTRY.lock().await;
-
-        let connector_factory = guard.get(&name);
-
-        let factory = connector_factory.ok_or_else(|| {
-            if name == ODBC_DATACONNECTOR {
-                DataConnectorError::OdbcNotInstalled {
-                    connector_component: self.component.clone(),
-                }
-            } else {
-                DataConnectorError::InvalidConnectorType {
-                    dataconnector: name.clone(),
-                    connector_component: self.component.clone(),
-                }
-            }
-        });
-
-        let factory = factory?;
+        };
 
         let parameters = Parameters::try_new(
             &format!("connector {name}"),
             params.into_iter().collect(),
-            factory.prefix(),
+            prefix,
             secrets,
-            factory.parameters(),
+            parameters,
         )
         .await?;
 
-        Ok(DataConnectorParams {
+        Ok(ConnectorParams {
             parameters,
-            metadata: HashMap::new(),
-            invalid_type_action: None,
+            unsupported_type_action: unsupported_type_action.map(UnsupportedTypeAction::from),
             component: self.component.clone(),
         })
+    }
+}
+
+/// Ensures that the associated computed columns (e.g., embeddings) are included
+/// in the `LogicalPlan::Projection` node.
+/// If any required computed columns are missing, they are automatically added to the projection.
+fn include_computed_columns(
+    plan: LogicalPlan,
+    source_table_schema: &SchemaRef,
+) -> DataFusionResult<LogicalPlan> {
+    let plan = plan
+        .transform_down(|plan| {
+            match plan {
+                LogicalPlan::Projection(mut proj) => {
+                    for (idx, col) in proj.schema.columns().iter().enumerate() {
+                        if let Some(computed_columns) = schema_meta_get_computed_columns(
+                            source_table_schema.as_ref(),
+                            col.name(),
+                        ) {
+                            for computed_column in computed_columns {
+                                if !proj
+                                    .schema
+                                    .has_column_with_unqualified_name(computed_column.name())
+                                {
+                                    proj.expr.push(Expr::Column(Column::new(
+                                        proj.schema.qualified_field(idx).0.cloned(),
+                                        computed_column.name().to_string(),
+                                    )));
+                                }
+                            }
+                        }
+                    }
+                    // The Transformed flag is not used, so we always specify it as transformed for simplicity.
+                    Ok(Transformed::yes(LogicalPlan::Projection(proj)))
+                }
+                _ => Ok(Transformed::no(plan)),
+            }
+        })?
+        .data;
+
+    Ok(plan)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::component::dataset::UnsupportedTypeAction as DatasetUnsupportedTypeAction;
+
+    #[tokio::test]
+    async fn test_connector_params_builder_unsupported_type_action() {
+        // Register a test connector factory
+        struct TestConnectorFactory;
+        impl DataConnectorFactory for TestConnectorFactory {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            fn create(
+                &self,
+                _params: ConnectorParams,
+            ) -> Pin<Box<dyn Future<Output = NewDataConnectorResult> + Send>> {
+                Box::pin(async { Ok(Arc::new(TestConnector) as Arc<dyn DataConnector>) })
+            }
+
+            fn prefix(&self) -> &'static str {
+                "test"
+            }
+
+            fn parameters(&self) -> &'static [ParameterSpec] {
+                &[]
+            }
+
+            fn supports_unsupported_type_action(&self) -> bool {
+                true
+            }
+        }
+
+        struct TestConnector;
+        #[async_trait]
+        impl DataConnector for TestConnector {
+            fn as_any(&self) -> &dyn Any {
+                self
+            }
+
+            async fn read_provider(
+                &self,
+                _dataset: &Dataset,
+            ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+                unimplemented!()
+            }
+        }
+
+        register_connector_factory("test", Arc::new(TestConnectorFactory)).await;
+
+        // Create a test dataset with unsupported_type_action
+        let mut dataset = Dataset::try_new("test:test_dataset".to_string(), "test_dataset")
+            .expect("failed to create dataset");
+        dataset.unsupported_type_action = Some(DatasetUnsupportedTypeAction::Ignore);
+
+        let secrets = Arc::new(RwLock::new(Secrets::default()));
+        let builder = ConnectorParamsBuilder::new(
+            "test".into(),
+            ConnectorComponent::Dataset(Arc::new(dataset)),
+        );
+
+        let result = builder.build(secrets).await;
+        assert!(result.is_ok());
+
+        let params = result.expect("failed to build connector params");
+        assert_eq!(
+            params.unsupported_type_action,
+            Some(UnsupportedTypeAction::Ignore),
+            "Unsupported type action should be properly set in connector params"
+        );
     }
 }

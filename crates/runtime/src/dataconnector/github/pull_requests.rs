@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -56,7 +56,7 @@ impl GraphQLContext for PullRequestTableArgs {
     fn inject_parameters(
         &self,
         filters: &[FilterPushdownResult],
-        query: &mut GraphQLQuery<'_>,
+        query: &mut GraphQLQuery,
     ) -> Result<(), datafusion::error::DataFusionError> {
         if self.query_mode == GitHubQueryMode::Auto {
             return Ok(());

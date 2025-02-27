@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,8 +28,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorParams, ParameterSpec, Parameters,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec, Parameters,
 };
 
 #[derive(Debug, Snafu)]
@@ -92,9 +92,13 @@ impl SparkFactory {
 const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("remote").secret().required()];
 
 impl DataConnectorFactory for SparkFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match Spark::new(params.parameters).await {

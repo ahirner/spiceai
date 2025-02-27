@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::util::pretty::pretty_format_batches;
+use arrow::{array::StringArray, util::pretty::pretty_format_batches};
 use async_openai::types::EmbeddingInput;
 use futures::TryStreamExt;
 use rand::Rng;
 use reqwest::{header::HeaderMap, Client};
-use runtime::{config::Config, Runtime};
+use runtime::{config::Config, get_params_with_secrets, Runtime};
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::{
@@ -33,7 +33,9 @@ use std::{
 };
 
 use serde_json::{json, Value};
+mod embedding;
 mod hf;
+mod local;
 mod openai;
 
 mod nsql {
@@ -90,12 +92,11 @@ mod nsql {
         let response = http_post(
             format!("{base_url}/v1/sql").as_str(),
             format!(
-                r#"SELECT task, input
+                "SELECT task, input
                         FROM runtime.task_history
                         WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
                         AND start_time > '{}'
-                        ORDER BY start_time, task;
-                    "#,
+                        ORDER BY start_time, task;",
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
             )
             .as_str(),
@@ -188,7 +189,11 @@ fn get_taxi_trips_dataset() -> Dataset {
     dataset
 }
 
-fn get_tpcds_dataset(ds_name: &str, spice_name: Option<&str>) -> Dataset {
+fn get_tpcds_dataset(
+    ds_name: &str,
+    spice_name: Option<&str>,
+    refresh_sql: Option<&str>,
+) -> Dataset {
     let mut dataset = Dataset::new(
         format!("s3://spiceai-public-datasets/tpcds/{ds_name}/"),
         spice_name.unwrap_or(ds_name),
@@ -203,22 +208,26 @@ fn get_tpcds_dataset(ds_name: &str, spice_name: Option<&str>) -> Dataset {
     ));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        refresh_sql: Some(format!(
-            "SELECT * FROM {} LIMIT 20",
-            spice_name.unwrap_or(ds_name)
-        )),
+        refresh_sql: Some(
+            refresh_sql
+                .unwrap_or(&format!(
+                    "SELECT * FROM {} LIMIT 20",
+                    spice_name.unwrap_or(ds_name)
+                ))
+                .to_string(),
+        ),
         ..Default::default()
     });
     dataset
 }
 
 /// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
-/// values(such as scores and durations) with placeholders.
+/// values such as duration with placeholder.
 fn normalize_search_response(mut json: Value) -> String {
     if let Some(matches) = json.get_mut("matches").and_then(|m| m.as_array_mut()) {
         for m in matches {
-            if let Some(score) = m.get_mut("score") {
-                *score = json!("score_val");
+            if let Some(obj) = m.as_object_mut() {
+                obj.remove("score");
             }
         }
     }
@@ -350,7 +359,7 @@ async fn send_embeddings_request(
     }
 
     if let Some(u) = user {
-        request_body["user"] = json!(u);
+        request_body["user"] = Value::String(u.to_string());
     }
 
     if let Some(d) = dimensions {
@@ -444,7 +453,35 @@ async fn sql_to_display(
     pretty_format_batches(&data).map(|d| format!("{d}")).boxed()
 }
 
-async fn get_params_with_secrets(
+#[allow(clippy::expect_used)]
+async fn sql_to_single_json_value(rt: &Arc<Runtime>, query: &str) -> Value {
+    let data = rt
+        .datafusion()
+        .query_builder(query)
+        .build()
+        .run()
+        .await
+        .boxed()
+        .expect("Failed to collect data")
+        .data
+        .try_collect::<Vec<_>>()
+        .await
+        .boxed()
+        .expect("Failed to collect data");
+    assert_eq!(data.len(), 1);
+    assert_eq!(data[0].columns().len(), 1);
+    serde_json::from_str(
+        data[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("column is a StringArray")
+            .value(0),
+    )
+    .expect("value is a JSON string")
+}
+
+async fn get_params_with_secrets_value(
     params: &HashMap<String, Value>,
     rt: &Runtime,
 ) -> HashMap<String, SecretString> {
@@ -460,5 +497,5 @@ async fn get_params_with_secrets(
         })
         .collect::<HashMap<_, _>>();
 
-    rt.get_params_with_secrets(&params).await
+    get_params_with_secrets(rt.secrets(), &params).await
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,21 +15,22 @@ limitations under the License.
 */
 
 use super::ConnectorComponent;
+use super::ConnectorParams;
 use super::DataConnector;
 use super::DataConnectorFactory;
-use super::DataConnectorParams;
 use super::ParameterSpec;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::DataConnectorError;
 use async_trait::async_trait;
 use data_components::flight::FlightFactory;
-use data_components::Read;
 use data_components::ReadWrite;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::ast::TimezoneInfo;
+use datafusion::sql::sqlparser::ast::WindowFrameBound;
 use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
+use datafusion_federation::table_reference::parse_multi_part_table_reference;
 use flight_client::Credentials;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
@@ -41,7 +42,7 @@ use std::sync::Arc;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/dremio#configuration"))]
+    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/dremio#configuration"))]
     MissingParameter { parameter: String },
 
     #[snafu(display("Failed to connect to endpoint '{endpoint}'.\nVerify the endpoint is valid/online, and try again.\n{source}"))]
@@ -82,6 +83,20 @@ impl Dialect for DremioDialect {
     ) -> datafusion::sql::sqlparser::ast::DataType {
         datafusion::sql::sqlparser::ast::DataType::Timestamp(None, TimezoneInfo::None)
     }
+
+    fn window_func_support_window_frame(
+        &self,
+        func_name: &str,
+        start_bound: &WindowFrameBound,
+        end_bound: &WindowFrameBound,
+    ) -> bool {
+        !((matches!(func_name, "rank" | "row_number" | "dense_rank")
+            && matches!(start_bound, WindowFrameBound::Preceding(None))
+            && matches!(end_bound, WindowFrameBound::CurrentRow))
+            || (matches!(func_name, "sum")
+                && matches!(start_bound, WindowFrameBound::Preceding(None))
+                && matches!(end_bound, WindowFrameBound::Following(None))))
+    }
 }
 
 #[derive(Default, Copy, Clone)]
@@ -106,9 +121,13 @@ const PARAMETERS: &[ParameterSpec] = &[
 ];
 
 impl DataConnectorFactory for DremioFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let endpoint: Arc<str> = params
@@ -144,7 +163,7 @@ impl DataConnectorFactory for DremioFactory {
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
             let flight_factory =
-                FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}));
+                FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}), true);
             Ok(Arc::new(Dremio { flight_factory }) as Arc<dyn DataConnector>)
         })
     }
@@ -168,12 +187,9 @@ impl DataConnector for Dremio {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        match Read::table_provider(
-            &self.flight_factory,
-            dataset.path().into(),
-            dataset.schema(),
-        )
-        .await
+        let table_reference = parse_multi_part_table_reference(dataset.path());
+        match FlightFactory::table_provider(&self.flight_factory, table_reference, dataset.schema())
+            .await
         {
             Ok(provider) => Ok(provider),
             Err(e) => {

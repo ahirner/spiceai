@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,10 @@ limitations under the License.
 
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{
+    datasource::TableProvider,
+    sql::{unparser::dialect, TableReference},
+};
 use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool,
     sql_provider_datafusion::{self, SqlTable},
@@ -51,6 +54,12 @@ impl SnowflakeTableFactory {
     }
 }
 
+fn snowflake_dialect() -> dialect::CustomDialect {
+    dialect::CustomDialectBuilder::new()
+        .with_identifier_quote_style('"')
+        .build()
+}
+
 #[async_trait]
 impl Read for SnowflakeTableFactory {
     async fn table_provider(
@@ -58,19 +67,19 @@ impl Read for SnowflakeTableFactory {
         table_reference: TableReference,
         schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        let dialect = Arc::new(snowflake_dialect());
+
         let pool = Arc::clone(&self.pool);
         let table_provider = match schema {
-            Some(schema) => Arc::new(SqlTable::new_with_schema(
-                "snowflake",
-                &pool,
-                schema,
-                table_reference,
-                None,
-            )),
+            Some(schema) => Arc::new(
+                SqlTable::new_with_schema("snowflake", &pool, schema, table_reference, None)
+                    .with_dialect(dialect),
+            ),
             None => Arc::new(
                 SqlTable::new("snowflake", &pool, table_reference, None)
                     .await
-                    .context(UnableToConstructSQLTableSnafu)?,
+                    .context(UnableToConstructSQLTableSnafu)?
+                    .with_dialect(dialect),
             ),
         };
 

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -167,6 +167,7 @@ fn create_completion_message(
         tool_calls: Some(tool_calls),
         refusal: None,
         function_call: None,
+        audio: None,
         role: match role {
             MessageRole::User => Role::User,
             MessageRole::Assistant => Role::Assistant,
@@ -185,6 +186,9 @@ impl TryFrom<ChatCompletionRequestMessage> for MessageParam {
             )),
             ChatCompletionRequestMessage::Function(_) => Err(OpenAIError::InvalidArgument(
                 "Function message not supported".to_string(),
+            )),
+            ChatCompletionRequestMessage::Developer(_) => Err(OpenAIError::InvalidArgument(
+                "Developer message not supported".to_string(),
             )),
             ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
                 content: ChatCompletionRequestToolMessageContent::Text(text),
@@ -228,6 +232,9 @@ impl TryFrom<ChatCompletionRequestMessage> for MessageParam {
                         ) => Ok(ContentBlock::Text(TextBlockParam::new(text.clone()))),
                         ChatCompletionRequestUserMessageContentPart::ImageUrl(_) => Err(
                             OpenAIError::InvalidArgument("Image URL not supported".to_string()),
+                        ),
+                        ChatCompletionRequestUserMessageContentPart::InputAudio(_) => Err(
+                            OpenAIError::InvalidArgument("Input Audio not supported".to_string()),
                         ),
                     })
                     .collect::<Result<Vec<_>, OpenAIError>>()?;

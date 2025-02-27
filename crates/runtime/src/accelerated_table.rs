@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -105,7 +105,7 @@ pub enum Error {
     #[snafu(display("Failed to write data into accelerated table.\n{source}"))]
     FailedToWriteData { source: DataFusionError },
 
-    #[snafu(display("The accelerated table does not support delete operations.\nUse a different acceleration engine which supports delete operations.\nFor details, visit: https://docs.spiceai.org/components/data-accelerators"))]
+    #[snafu(display("The accelerated table does not support delete operations.\nUse a different acceleration engine which supports delete operations.\nFor details, visit: https://spiceai.org/docs/components/data-accelerators"))]
     AcceleratedTableDoesntSupportDelete {},
 
     #[snafu(display("Expected the schema to have field '{field_name}', but it did not.\nSpice found the schema: {schema}\nIs the primary key configuration correct?"))]
@@ -134,10 +134,10 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, Snafu)]
 pub enum AcceleratedTableBuilderError {
-    #[snafu(display("A changes stream is required when `refresh_mode` is set to `changes`.\nFor details, visit: https://docs.spiceai.org/features/cdc"))]
+    #[snafu(display("A changes stream is required when `refresh_mode` is set to `changes`.\nFor details, visit: https://spiceai.org/docs/features/cdc"))]
     ExpectedChangesStream,
 
-    #[snafu(display("An append stream is required when `refresh_mode` is set to `append` without a `time_column`.\nFor details, visit: https://docs.spiceai.org/components/data-accelerators/data-refresh#append"))]
+    #[snafu(display("An append stream is required when `refresh_mode` is set to `append` without a `time_column`.\nFor details, visit: https://spiceai.org/docs/components/data-accelerators/data-refresh#append"))]
     AppendStreamRequired,
 
     #[snafu(display("A synchronized accelerated table requires full refresh mode.\nSet `refresh_mode` to 'full', and try again."))]
@@ -205,6 +205,7 @@ pub struct Builder {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
     federated: Arc<FederatedTable>,
+    federated_source: String,
     accelerator: Arc<dyn TableProvider>,
     refresh: refresh::Refresh,
     retention: Option<Retention>,
@@ -224,6 +225,7 @@ impl Builder {
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<FederatedTable>,
+        federated_source: String,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
     ) -> Self {
@@ -231,6 +233,7 @@ impl Builder {
             runtime_status,
             dataset_name,
             federated,
+            federated_source,
             accelerator,
             refresh,
             retention: None,
@@ -398,6 +401,7 @@ impl Builder {
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
+            Some(self.federated_source),
             Arc::clone(&refresh_params),
             Arc::clone(&self.accelerator),
         );
@@ -458,6 +462,7 @@ impl AcceleratedTable {
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<FederatedTable>,
+        federated_source: String,
         accelerator: Arc<dyn TableProvider>,
         refresh: refresh::Refresh,
     ) -> Builder {
@@ -465,6 +470,7 @@ impl AcceleratedTable {
             runtime_status,
             dataset_name,
             federated,
+            federated_source,
             accelerator,
             refresh,
         )
@@ -548,6 +554,15 @@ impl AcceleratedTable {
         let field = schema
             .column_with_name(time_column.as_str())
             .map(|(_, f)| f);
+        let partition_field =
+            retention
+                .time_partition_column
+                .as_ref()
+                .and_then(|time_partition_column| {
+                    schema
+                        .column_with_name(time_partition_column.as_str())
+                        .map(|(_, f)| f)
+                });
 
         let mut interval_timer = tokio::time::interval(retention.check_interval);
 
@@ -555,6 +570,9 @@ impl AcceleratedTable {
             field.cloned(),
             Some(time_column.clone()),
             retention.time_format,
+            partition_field.cloned(),
+            retention.time_partition_column.clone(),
+            retention.time_partition_format,
         ) else {
             tracing::error!("[retention] Failed to get the expression time format for {time_column}, check schema and time format");
             return;
@@ -760,6 +778,8 @@ impl TableProvider for AcceleratedTable {
 pub struct Retention {
     pub(crate) time_column: String,
     pub(crate) time_format: Option<TimeFormat>,
+    pub(crate) time_partition_column: Option<String>,
+    pub(crate) time_partition_format: Option<TimeFormat>,
     pub(crate) period: Duration,
     pub(crate) check_interval: Duration,
 }
@@ -769,6 +789,8 @@ impl Retention {
     pub fn new(
         time_column: Option<String>,
         time_format: Option<TimeFormat>,
+        time_partition_column: Option<String>,
+        time_partition_format: Option<TimeFormat>,
         retention_period: Option<Duration>,
         retention_check_interval: Option<Duration>,
         retention_check_enabled: bool,
@@ -782,6 +804,8 @@ impl Retention {
             Some(Self {
                 time_column,
                 time_format,
+                time_partition_column,
+                time_partition_format,
                 period,
                 check_interval,
             })

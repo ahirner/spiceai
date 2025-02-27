@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -40,6 +40,9 @@ use tonic::IntoRequest;
 use tonic::IntoStreamingRequest;
 
 pub mod tls;
+
+pub const MAX_ENCODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
+pub const MAX_DECODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct TonicStatusError(tonic::Status);
@@ -221,8 +224,8 @@ impl FlightClient {
 
         Ok(FlightClient {
             flight_client: FlightServiceClient::new(flight_channel)
-                .max_encoding_message_size(100 * 1024 * 1024)
-                .max_decoding_message_size(100 * 1024 * 1024),
+                .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+                .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
             credentials,
             url,
             metadata,
@@ -289,7 +292,7 @@ impl FlightClient {
     /// # Errors
     ///
     /// Returns an error if the schema inference fails.
-    pub async fn get_query_schema<'a>(&self, sql: Cow<'a, str>) -> Result<Schema> {
+    pub async fn get_query_schema(&self, sql: Cow<'_, str>) -> Result<Schema> {
         let token = self.authenticate_basic_token().await?;
 
         let descriptor = FlightDescriptor::new_cmd(sql.into_owned());
