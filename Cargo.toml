@@ -182,7 +182,3 @@ iceberg-catalog-rest = { git = "https://github.com/spiceai/iceberg-rust.git", re
 iceberg-datafusion = { git = "https://github.com/spiceai/iceberg-rust.git", rev = "3597335f0238cc9bb8fbf5a5287a080020549f48" }
 
 cudarc = { git = "https://github.com/EricLBuehler/cudarc", rev = "f6e5bf51153d40e34eb1262b98895ac1235b6422" }
-
-#[patch."https://github.com/microsoft/llguidance"]
-#llguidance = { git = "https://github.com/ahirner/llguidance", version = "0.6.0"}
-#toktrie = { git = "https://github.com/ahirner/llguidance", package = "toktrie"}
