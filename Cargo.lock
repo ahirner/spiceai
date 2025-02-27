@@ -1975,21 +1975,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40e38929add23cdf8a366df9b0e088953150724bcbe5fc330b0d8eb3b328eec8"
 
 [[package]]
-name = "buildstructor"
-version = "0.5.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3907aac66c65520545ae3cb3c195306e20d5ed5c90bfbb992e061cf12a104d0"
-dependencies = [
- "lazy_static",
- "proc-macro2",
- "quote",
- "str_inflector",
- "syn 2.0.98",
- "thiserror 1.0.69",
- "try_match",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2136,15 +2121,17 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.8.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=c0c2b23#c0c2b2309c9b03eec518f131bd6f3893af75aece"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=8d3ea29#8d3ea29db6b4a9523a796e92feb541fe167be0d4"
 dependencies = [
  "byteorder",
- "candle-kernels 0.8.0 (git+https://github.com/EricLBuehler/candle.git?rev=c0c2b23)",
- "cudarc 0.12.2",
+ "candle-kernels 0.8.0",
+ "candle-metal-kernels 0.8.0",
+ "cudarc 0.13.7",
  "float8",
  "gemm",
  "half",
  "memmap2",
+ "metal 0.27.0",
  "num-traits",
  "num_cpus",
  "rand 0.8.5",
@@ -2152,8 +2139,6 @@ dependencies = [
  "rayon",
  "safetensors",
  "thiserror 1.0.69",
- "ug",
- "ug-cuda",
  "yoke",
  "zip 1.1.4",
 ]
@@ -2199,11 +2184,11 @@ dependencies = [
 [[package]]
 name = "candle-flash-attn"
 version = "0.8.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=c0c2b23#c0c2b2309c9b03eec518f131bd6f3893af75aece"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=8d3ea29#8d3ea29db6b4a9523a796e92feb541fe167be0d4"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.5",
- "candle-core 0.8.0 (git+https://github.com/EricLBuehler/candle.git?rev=c0c2b23)",
+ "candle-core 0.8.0",
  "half",
 ]
 
@@ -2231,15 +2216,7 @@ dependencies = [
 [[package]]
 name = "candle-kernels"
 version = "0.8.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=521e33c#521e33ccd1ba77b2140c16e21bde7fe95b012e1a"
-dependencies = [
- "bindgen_cuda 0.1.5",
-]
-
-[[package]]
-name = "candle-kernels"
-version = "0.8.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=c0c2b23#c0c2b2309c9b03eec518f131bd6f3893af75aece"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=8d3ea29#8d3ea29db6b4a9523a796e92feb541fe167be0d4"
 dependencies = [
  "bindgen_cuda 0.1.5",
 ]
@@ -2268,7 +2245,7 @@ dependencies = [
 [[package]]
 name = "candle-metal-kernels"
 version = "0.8.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=521e33c#521e33ccd1ba77b2140c16e21bde7fe95b012e1a"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=8d3ea29#8d3ea29db6b4a9523a796e92feb541fe167be0d4"
 dependencies = [
  "metal 0.27.0",
  "once_cell",
@@ -2291,9 +2268,9 @@ dependencies = [
 [[package]]
 name = "candle-nn"
 version = "0.8.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=521e33c#521e33ccd1ba77b2140c16e21bde7fe95b012e1a"
+source = "git+https://github.com/EricLBuehler/candle.git?rev=8d3ea29#8d3ea29db6b4a9523a796e92feb541fe167be0d4"
 dependencies = [
- "candle-core 0.8.0 (git+https://github.com/EricLBuehler/candle.git?rev=521e33c)",
+ "candle-core 0.8.0",
  "candle-metal-kernels 0.8.0",
  "half",
  "metal 0.27.0",
@@ -3905,6 +3882,12 @@ dependencies = [
  "socket2",
  "windows-sys 0.48.0",
 ]
+
+[[package]]
+name = "doctest-file"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aac81fa3e28d21450aa4d2ac065992ba96a1d7303efbce51a95f4fd175b67562"
 
 [[package]]
 name = "document_parse"
@@ -6184,6 +6167,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
 
 [[package]]
+name = "interprocess"
+version = "2.2.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "894148491d817cb36b6f778017b8ac46b17408d522dd90f539d677ea938362eb"
+dependencies = [
+ "doctest-file",
+ "libc",
+ "recvmsg",
+ "widestring",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "ipconfig"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7245,11 +7241,11 @@ dependencies = [
 
 [[package]]
 name = "mistralrs"
-version = "0.3.4"
-source = "git+https://github.com/EricLBuehler/mistral.rs?rev=fc6537105480325c4ca4d241e99275665b0545f8#fc6537105480325c4ca4d241e99275665b0545f8"
+version = "0.4.0"
+source = "git+https://github.com/EricLBuehler/mistral.rs#e2f9648cbb6e4b8a6ac1d9e44df5900210fa5862"
 dependencies = [
  "anyhow",
- "candle-core 0.8.0 (git+https://github.com/EricLBuehler/candle.git?rev=521e33c)",
+ "candle-core 0.8.0",
  "candle-nn 0.8.0",
  "clap",
  "either",
@@ -7266,8 +7262,8 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-core"
-version = "0.3.4"
-source = "git+https://github.com/EricLBuehler/mistral.rs?rev=fc6537105480325c4ca4d241e99275665b0545f8#fc6537105480325c4ca4d241e99275665b0545f8"
+version = "0.4.0"
+source = "git+https://github.com/EricLBuehler/mistral.rs#e2f9648cbb6e4b8a6ac1d9e44df5900210fa5862"
 dependencies = [
  "akin",
  "anyhow",
@@ -7275,10 +7271,9 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "bindgen_cuda 0.1.5",
- "buildstructor",
  "bytemuck",
  "bytemuck_derive",
- "candle-core 0.8.0 (git+https://github.com/EricLBuehler/candle.git?rev=521e33c)",
+ "candle-core 0.8.0",
  "candle-flash-attn",
  "candle-hf-hub",
  "candle-nn 0.8.0",
@@ -7297,9 +7292,11 @@ dependencies = [
  "image 0.25.5",
  "indexmap 2.7.1",
  "indicatif",
+ "interprocess",
  "itertools 0.13.0",
  "llguidance",
  "lrtable",
+ "metal 0.27.0",
  "minijinja",
  "minijinja-contrib",
  "mistralrs-paged-attn",
@@ -7318,6 +7315,7 @@ dependencies = [
  "safetensors",
  "schemars",
  "serde",
+ "serde-big-array",
  "serde_json",
  "serde_plain",
  "serde_yaml",
@@ -7339,43 +7337,51 @@ dependencies = [
 
 [[package]]
 name = "mistralrs-paged-attn"
-version = "0.3.4"
-source = "git+https://github.com/EricLBuehler/mistral.rs?rev=fc6537105480325c4ca4d241e99275665b0545f8#fc6537105480325c4ca4d241e99275665b0545f8"
+version = "0.4.0"
+source = "git+https://github.com/EricLBuehler/mistral.rs#e2f9648cbb6e4b8a6ac1d9e44df5900210fa5862"
 dependencies = [
  "anyhow",
  "bindgen_cuda 0.1.6",
- "candle-core 0.8.0 (git+https://github.com/EricLBuehler/candle.git?rev=521e33c)",
+ "candle-core 0.8.0",
  "float8",
  "half",
+ "metal 0.27.0",
+ "once_cell",
+ "thiserror 1.0.69",
 ]
 
 [[package]]
 name = "mistralrs-quant"
-version = "0.3.4"
-source = "git+https://github.com/EricLBuehler/mistral.rs?rev=fc6537105480325c4ca4d241e99275665b0545f8#fc6537105480325c4ca4d241e99275665b0545f8"
+version = "0.4.0"
+source = "git+https://github.com/EricLBuehler/mistral.rs#e2f9648cbb6e4b8a6ac1d9e44df5900210fa5862"
 dependencies = [
  "bindgen_cuda 0.1.5",
  "byteorder",
- "candle-core 0.8.0 (git+https://github.com/EricLBuehler/candle.git?rev=521e33c)",
+ "candle-core 0.8.0",
  "candle-nn 0.8.0",
  "float8",
  "half",
  "lazy_static",
+ "memmap2",
+ "metal 0.27.0",
  "once_cell",
  "paste",
  "rayon",
+ "regex",
+ "safetensors",
  "serde",
  "serde_json",
  "thiserror 1.0.69",
  "tracing",
+ "yoke",
 ]
 
 [[package]]
 name = "mistralrs-vision"
-version = "0.3.4"
-source = "git+https://github.com/EricLBuehler/mistral.rs?rev=fc6537105480325c4ca4d241e99275665b0545f8#fc6537105480325c4ca4d241e99275665b0545f8"
+version = "0.4.0"
+source = "git+https://github.com/EricLBuehler/mistral.rs#e2f9648cbb6e4b8a6ac1d9e44df5900210fa5862"
 dependencies = [
- "candle-core 0.8.0 (git+https://github.com/EricLBuehler/candle.git?rev=521e33c)",
+ "candle-core 0.8.0",
  "image 0.25.5",
 ]
 
@@ -9674,6 +9680,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "03251193000f4bd3b042892be858ee50e8b3719f2b08e5833ac4353724632430"
 
 [[package]]
+name = "recvmsg"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d3edd4d5d42c92f0a659926464d4cce56b562761267ecf0f469d85b7de384175"
+
+[[package]]
 name = "redox_syscall"
 version = "0.2.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -10797,6 +10809,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-big-array"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "11fc7cc2c76d73e0f27ee52abbd64eec84d46f370c88371120433196934e4b7f"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "serde-value"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11413,16 +11434,6 @@ name = "static_assertions_next"
 version = "1.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7beae5182595e9a8b683fa98c4317f956c9a2dec3b9716990d20023cc60c766"
-
-[[package]]
-name = "str_inflector"
-version = "0.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec0b848d5a7695b33ad1be00f84a3c079fe85c9278a325ff9159e6c99cef4ef7"
-dependencies = [
- "lazy_static",
- "regex",
-]
 
 [[package]]
 name = "strength_reduce"
@@ -12762,26 +12773,6 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
-
-[[package]]
-name = "try_match"
-version = "0.4.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b065c869a3f832418e279aa4c1d7088f9d5d323bde15a60a08e20c2cd4549082"
-dependencies = [
- "try_match_inner",
-]
-
-[[package]]
-name = "try_match_inner"
-version = "0.5.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9c81686f7ab4065ccac3df7a910c4249f8c0f3fb70421d6ddec19b9311f63f9"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.98",
-]
 
 [[package]]
 name = "tungstenite"
