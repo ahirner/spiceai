@@ -2136,34 +2136,6 @@ dependencies = [
 [[package]]
 name = "candle-core"
 version = "0.8.0"
-source = "git+https://github.com/EricLBuehler/candle.git?rev=521e33c#521e33ccd1ba77b2140c16e21bde7fe95b012e1a"
-dependencies = [
- "byteorder",
- "candle-kernels 0.8.0 (git+https://github.com/EricLBuehler/candle.git?rev=521e33c)",
- "candle-metal-kernels 0.8.0",
- "cudarc 0.12.2",
- "float8",
- "gemm",
- "half",
- "memmap2",
- "metal 0.27.0",
- "num-traits",
- "num_cpus",
- "rand 0.8.5",
- "rand_distr",
- "rayon",
- "safetensors",
- "thiserror 1.0.69",
- "ug",
- "ug-cuda",
- "ug-metal",
- "yoke",
- "zip 1.1.4",
-]
-
-[[package]]
-name = "candle-core"
-version = "0.8.0"
 source = "git+https://github.com/EricLBuehler/candle.git?rev=c0c2b23#c0c2b2309c9b03eec518f131bd6f3893af75aece"
 dependencies = [
  "byteorder",
