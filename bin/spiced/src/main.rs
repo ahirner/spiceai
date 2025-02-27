@@ -19,8 +19,8 @@ use opentelemetry::global;
 use rustls::crypto::{self, CryptoProvider};
 use tokio::runtime::Runtime;
 
-#[global_allocator]
-static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+// #[global_allocator]
+// static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 fn main() {
     let args = spiced::Args::parse();
