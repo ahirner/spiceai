@@ -285,8 +285,7 @@ async fn huggingface(
         });
     };
 
-    let model_type = params.get("model_type").expose().ok();
-    let hf_token = params.get("token").ok();
+    let _ = params;
 
     // For GGUF models, we require user specify via `.files[].path`
     let gguf_path = component
@@ -310,9 +309,9 @@ async fn huggingface(
         );
     }
 
-    let chat_template_literal = params.get("chat_template").expose().ok();
-
-    llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token, chat_template_literal).await
+    Err(LlmError::UnknownModelSource {
+        from: "mistral: (purposefully unsupported create_hf_model)".to_string(),
+    })
 }
 
 async fn databricks(
@@ -528,22 +527,11 @@ async fn file(
         });
     }
 
-    let tokenizer_path = component.find_any_file_path(ModelFileType::Tokenizer);
-    let tokenizer_config_path = component.find_any_file_path(ModelFileType::TokenizerConfig);
-    let config_path = component.find_any_file_path(ModelFileType::Config);
-    let generation_config = component.find_any_file_path(ModelFileType::GenerationConfig);
+    let _ = params;
 
-    let chat_template_literal = params.get("chat_template").expose().ok();
-
-    llms::chat::create_local_model(
-        model_weights.as_slice(),
-        config_path.as_deref(),
-        tokenizer_path.as_deref(),
-        tokenizer_config_path.as_deref(),
-        generation_config.as_deref(),
-        chat_template_literal,
-    )
-    .await
+    Err(LlmError::UnknownModelSource {
+        from: "mistral: (purposefully unsupported create_local_model)".to_string(),
+    })
 }
 
 // Get OpenAI compatible request parameter overrides.
