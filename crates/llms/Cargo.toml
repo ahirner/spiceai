@@ -73,7 +73,7 @@ cuda = [
     #"mistralrs-core/cuda",
     #"mistralrs/cuda",
 ]
-default = ["mistralrs"]
+default = []
 metal = [
     "tei_backend/metal",
     "tei_candle/metal",
