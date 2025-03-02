@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -105,7 +105,7 @@ impl OptimizerRule for BytesProcessedOptimizerRule {
     }
 
     /// A human readable name for this optimizer rule
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "bytes_processed_optimizer_rule"
     }
 }
@@ -135,7 +135,7 @@ impl Debug for BytesProcessedNode {
 }
 
 impl UserDefinedLogicalNodeCore for BytesProcessedNode {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "BytesProcessedNode"
     }
 
@@ -233,7 +233,7 @@ impl DisplayAs for BytesProcessedExec {
 }
 
 impl ExecutionPlan for BytesProcessedExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "BytesProcessedExec"
     }
 
@@ -277,7 +277,7 @@ impl ExecutionPlan for BytesProcessedExec {
         let Some(request_context) = context.session_config().get_extension::<RequestContext>()
         else {
             // This should never happen if all queries are run through the query builder, so if it does its a bug we need to catch in development.
-            panic!("The request context was not provided to BytesProcessedExec, please file a bug at https://github.com/spiceai/spiceai/issues")
+            panic!("The request context was not provided to BytesProcessedExec, report a bug at https://github.com/spiceai/spiceai/issues")
         };
 
         let bytes_processed_stream = stream! {

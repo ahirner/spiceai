@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,17 +29,20 @@ use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::{Action, ActionType, Criteria, IpcMessage, PollInfo, SchemaResult};
 use arrow_ipc::writer::IpcWriteOptions;
 use bytes::Bytes;
+use cache::QueryResultsCacheStatus;
 use datafusion::error::DataFusionError;
 use datafusion::sql::sqlparser::parser::ParserError;
 use datafusion::sql::TableReference;
 use futures::stream::{self, BoxStream, StreamExt};
 use futures::{Stream, TryStreamExt};
+use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
-use middleware::RequestContextLayer;
+use middleware::{RequestContextLayer, WriteRateLimitLayer};
 use runtime_auth::{layer::flight::BasicAuthLayer, FlightBasicAuth};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
 use std::collections::HashMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 use tokio::sync::broadcast::Sender;
 use tokio::sync::RwLock;
@@ -174,7 +177,13 @@ impl Service {
     async fn sql_to_flight_stream(
         datafusion: Arc<DataFusion>,
         sql: &str,
-    ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, Option<bool>), Status> {
+    ) -> Result<
+        (
+            BoxStream<'static, Result<FlightData, Status>>,
+            QueryResultsCacheStatus,
+        ),
+        Status,
+    > {
         let query = QueryBuilder::new(sql, Arc::clone(&datafusion)).build();
 
         let query_result = query.run().await.map_err(handle_query_error)?;
@@ -221,7 +230,7 @@ impl Service {
 
         let flights_stream = stream::once(async { Ok(schema_flight_data) }).chain(batches_stream);
 
-        Ok((flights_stream.boxed(), query_result.from_cache))
+        Ok((flights_stream.boxed(), query_result.results_cache_status))
     }
 }
 
@@ -311,6 +320,7 @@ pub async fn start(
     df: Arc<DataFusion>,
     tls_config: Option<Arc<TlsConfig>>,
     endpoint_auth: EndpointAuth,
+    rate_limits: Arc<RateLimits>,
 ) -> Result<()> {
     let service = Service {
         datafusion: Arc::clone(&df),
@@ -339,12 +349,43 @@ pub async fn start(
         .into_inner();
 
     server
-        .layer(auth_layer)
         .layer(RequestContextLayer::new(app))
+        .layer(WriteRateLimitLayer::new(RateLimiter::direct(
+            rate_limits.flight_write_limit,
+        )))
+        .layer(auth_layer)
         .add_service(svc)
         .serve(bind_address)
         .await
         .context(UnableToStartFlightServerSnafu)?;
 
     Ok(())
+}
+
+pub struct RateLimits {
+    pub flight_write_limit: Quota,
+}
+
+impl RateLimits {
+    #[must_use]
+    pub fn new() -> Self {
+        RateLimits::default()
+    }
+
+    #[must_use]
+    pub fn with_flight_write_limit(mut self, rate_limit: Quota) -> Self {
+        self.flight_write_limit = rate_limit;
+        self
+    }
+}
+
+impl Default for RateLimits {
+    fn default() -> Self {
+        Self {
+            // Allow 100 Flight DoPut requests every 60 seconds by default
+            flight_write_limit: Quota::per_minute(NonZeroU32::new(100).unwrap_or_else(|| {
+                unreachable!("100 is non-zero and should always successfully convert to NonZeroU32")
+            })),
+        }
+    }
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -42,7 +42,7 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
             let port: usize = get_random_port();
             let running_container = common::start_postgres_docker_container(port).await?;
 
-            let pool = common::get_postgres_connection_pool(port).await?;
+            let pool = common::get_postgres_connection_pool(port, None).await?;
 
             let status = status::RuntimeStatus::new();
             let df = get_test_datafusion(Arc::clone(&status));
@@ -89,7 +89,7 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
             // Wait for the checkpoint to be created
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             drop(rt);
-            runtime::dataaccelerator::clear_registry().await;
+            runtime::dataaccelerator::unregister_all().await;
             runtime::dataaccelerator::register_all().await;
 
             let db_conn = pool.connect().await.expect("connection can be established");

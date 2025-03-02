@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,7 +27,7 @@ use app::spicepod::component::runtime::{Runtime as SpicepodRuntime, TelemetryCon
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser};
 use flightrepl::ReplConfig;
-use opentelemetry::global;
+use opentelemetry::{global, KeyValue};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::runtime::Tokio;
 use opentelemetry_sdk::Resource;
@@ -41,6 +41,8 @@ use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
+#[cfg(feature = "tpc-extension")]
+use tpc_extension::TpcExtensionFactory;
 use tracing::subscriber;
 
 #[path = "tracing.rs"]
@@ -169,27 +171,29 @@ pub async fn run(args: Args) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 
     let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
-    let app: Option<Arc<App>> = match AppBuilder::build_from_filesystem_path(current_dir.clone())
-        .context(UnableToConstructSpiceAppSnafu)
-    {
+    let app: Option<Arc<App>> = match AppBuilder::build_from_filesystem_path(current_dir.clone()) {
         Ok(mut app) => {
             app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
             Some(Arc::new(app))
         }
         Err(e) => {
             in_tracing_context(|| {
-                tracing::error!("{e}");
+                tracing::warn!("{e}");
             });
             None
         }
     };
-
     let mut extension_factories: Vec<Box<dyn ExtensionFactory>> = vec![];
 
     if let Some(app) = &app {
         if let Some(manifest) = app.extensions.get("spice_cloud") {
             let spice_extension_factory = SpiceExtensionFactory::new(manifest.clone());
             extension_factories.push(Box::new(spice_extension_factory));
+        }
+        #[cfg(feature = "tpc-extension")]
+        if let Some(manifest) = app.extensions.get("tpc") {
+            let tpc_extension_factory = TpcExtensionFactory::new(manifest.clone());
+            extension_factories.push(Box::new(tpc_extension_factory));
         }
     }
 
@@ -246,6 +250,7 @@ pub async fn run(args: Args) -> Result<()> {
         Some(app) => EndpointAuth::new(rt.secrets(), app).await,
         None => EndpointAuth::no_auth(),
     };
+
     let server_thread = tokio::spawn(async move {
         Box::pin(Arc::new(cloned_rt).start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
@@ -257,12 +262,16 @@ pub async fn run(args: Args) -> Result<()> {
         },
     }
 
-    match server_thread.await {
+    let result = match server_thread.await {
         Ok(ok) => ok.context(UnableToStartServersSnafu),
         Err(_) => Err(Error::GenericError {
             reason: "Unable to start spiced".into(),
         }),
-    }
+    };
+
+    rt.close().await;
+
+    result
 }
 
 fn init_metrics(
@@ -305,9 +314,23 @@ async fn start_anonymous_telemetry(
     let explicitly_disabled = args.telemetry_enabled == Some(false)
         || spicepod_telemetry_config.is_some_and(|c| !c.enabled);
 
+    let telemetry_properties = match spicepod_telemetry_config {
+        Some(config) => config
+            .properties
+            .clone()
+            .into_iter()
+            .map(|(k, v)| KeyValue::new(k, v))
+            .collect(),
+        None => Vec::new(),
+    };
+
     if !explicitly_disabled {
         #[cfg(feature = "anonymous_telemetry")]
-        telemetry::anonymous::start(spicepod_name.map_or_else(|| "unknown", String::as_str)).await;
+        telemetry::anonymous::start(
+            spicepod_name.map_or_else(|| "unknown", String::as_str),
+            telemetry_properties,
+        )
+        .await;
     }
 }
 

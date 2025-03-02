@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -78,7 +78,7 @@ mod test {
     #[test]
     fn test_get_user_agent() {
         let matching_regex = regex::Regex::new(
-            r"flightrepl/\d+\.\d+\.\d+(-beta|-stable|-rc)?(\.\d+)? \((Linux|Windows|Darwin)/[\d\w\.\-\_]+ (x86_64|aarch64|i386)\)",
+            r"flightrepl/\d+\.\d+\.\d+(-beta|-stable|-rc|-unstable)?(\.\d+)? \((Linux|Windows|Darwin)/[\d\w\.\-\_]+ (x86_64|aarch64|i386)\)",
         )
         .expect("regex should be constructed");
 

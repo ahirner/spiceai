@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -60,13 +60,13 @@ impl Default for PostgresAccelerator {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::accelerator("host"),
-    ParameterSpec::accelerator("port"),
-    ParameterSpec::accelerator("db"),
-    ParameterSpec::accelerator("user").secret(),
-    ParameterSpec::accelerator("pass").secret(),
-    ParameterSpec::accelerator("sslmode"),
-    ParameterSpec::accelerator("sslrootcert"),
+    ParameterSpec::component("host"),
+    ParameterSpec::component("port"),
+    ParameterSpec::component("db"),
+    ParameterSpec::component("user").secret(),
+    ParameterSpec::component("pass").secret(),
+    ParameterSpec::component("sslmode"),
+    ParameterSpec::component("sslrootcert"),
     ParameterSpec::runtime("file_watcher"),
     ParameterSpec::runtime("connection_pool_size")
         .description("The maximum number of connections created in the connection pool")

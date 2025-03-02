@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,9 +24,9 @@ use arrow::array::{
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use arrow_buffer::{BufferBuilder, NullBufferBuilder, OffsetBuffer};
-use opentelemetry::metrics::MetricsError;
-use opentelemetry::InstrumentationLibrary;
+use opentelemetry::InstrumentationScope;
 use opentelemetry_sdk::metrics::data::{Gauge, Histogram, Metric, ResourceMetrics, Sum};
+use opentelemetry_sdk::metrics::MetricError;
 use opentelemetry_sdk::Resource;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,16 +78,25 @@ impl DataNumberBuilder {
         }
     }
 
-    fn finish(&mut self) -> StructArray {
+    fn finish(&mut self) -> Option<StructArray> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.int_builder.finish()),
             Arc::new(self.double_builder.finish()),
         ];
-        StructArray::new(
+        match StructArray::try_new(
             number_fields().into(),
             arrays,
             self.null_buffer_builder.finish(),
-        )
+        ) {
+            Ok(array) => Some(array),
+            Err(e) => {
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert number: {e}")
+                } else {
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -133,7 +142,7 @@ impl DataHistogramBuilder {
         }
     }
 
-    fn finish(&mut self) -> StructArray {
+    fn finish(&mut self) -> Option<StructArray> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.count_builder.finish()),
             Arc::new(self.sum_builder.finish()),
@@ -142,11 +151,20 @@ impl DataHistogramBuilder {
             Arc::new(self.min_builder.finish()),
             Arc::new(self.max_builder.finish()),
         ];
-        StructArray::new(
+        match StructArray::try_new(
             histogram_data_fields().into(),
             arrays,
             self.null_buffer_builder.finish(),
-        )
+        ) {
+            Ok(array) => Some(array),
+            Err(e) => {
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert histogram data: {e}")
+                } else {
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -171,17 +189,26 @@ impl ResourceBuilder {
         self.null_buffer_builder.append(is_valid);
     }
 
-    fn finish(&mut self) -> StructArray {
+    fn finish(&mut self) -> Option<StructArray> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.schema_url_builder.finish()),
-            Arc::new(self.attributes_builder.finish()),
+            Arc::new(self.attributes_builder.finish()?),
             Arc::new(self.dropped_attributes_count_builder.finish()),
         ];
-        StructArray::new(
+        match StructArray::try_new(
             resource_fields().into(),
             arrays,
             self.null_buffer_builder.finish(),
-        )
+        ) {
+            Ok(array) => Some(array),
+            Err(e) => {
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert resource: {e}")
+                } else {
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -208,18 +235,27 @@ impl ScopeBuilder {
         self.null_buffer_builder.append(is_valid);
     }
 
-    fn finish(&mut self) -> StructArray {
+    fn finish(&mut self) -> Option<StructArray> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.name_builder.finish()),
             Arc::new(self.version_builder.finish()),
-            Arc::new(self.attributes_builder.finish()),
+            Arc::new(self.attributes_builder.finish()?),
             Arc::new(self.dropped_attributes_count_builder.finish()),
         ];
-        StructArray::new(
+        match StructArray::try_new(
             scope_fields().into(),
             arrays,
             self.null_buffer_builder.finish(),
-        )
+        ) {
+            Ok(array) => Some(array),
+            Err(e) => {
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert scope: {e}")
+                } else {
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -269,7 +305,7 @@ impl AttributesBuilder {
         self.list_null_buffer_builder.append(is_valid);
     }
 
-    fn finish(&mut self) -> ListArray {
+    fn finish(&mut self) -> Option<ListArray> {
         let arrays: Vec<ArrayRef> = vec![
             Arc::new(self.key_builder.finish()),
             Arc::new(self.type_builder.finish()),
@@ -280,23 +316,41 @@ impl AttributesBuilder {
             Arc::new(self.bytes_builder.finish()),
             Arc::new(self.ser_builder.finish()),
         ];
-        let values = StructArray::new(
+        let values = match StructArray::try_new(
             attribute_struct_fields().into(),
             arrays,
             self.null_buffer_builder.finish(),
-        );
+        ) {
+            Ok(array) => array,
+            Err(e) => {
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert attributes: {e}")
+                } else {
+                    return None;
+                }
+            }
+        };
 
         let offsets = self.list_offsets_builder.finish();
         // Safety: Safe by construction
         let offsets = unsafe { OffsetBuffer::new_unchecked(offsets.into()) };
         self.list_offsets_builder.append(0);
 
-        ListArray::new(
+        match ListArray::try_new(
             Arc::new(attribute_list_field()),
             offsets,
             Arc::new(values),
             self.list_null_buffer_builder.finish(),
-        )
+        ) {
+            Ok(array) => Some(array),
+            Err(e) => {
+                if cfg!(feature = "dev") {
+                    panic!("Could not convert attributes: {e}")
+                } else {
+                    None
+                }
+            }
+        }
     }
 }
 
@@ -338,18 +392,36 @@ impl OtelToArrowConverter {
     pub fn convert(
         &mut self,
         resource_metrics: &ResourceMetrics,
-    ) -> Result<RecordBatch, MetricsError> {
+    ) -> Result<RecordBatch, MetricError> {
         for scope_metrics in &resource_metrics.scope_metrics {
             for metric in &scope_metrics.metrics {
                 self.process_metric(metric, &resource_metrics.resource, &scope_metrics.scope)?;
             }
         }
 
+        let Some(resource) = self.resource_builder.finish() else {
+            return Err(MetricError::Other("Could not convert resource".into()));
+        };
+        let Some(scope) = self.scope_builder.finish() else {
+            return Err(MetricError::Other("Could not convert scope".into()));
+        };
+        let Some(attributes) = self.attributes_builder.finish() else {
+            return Err(MetricError::Other("Could not convert attributes".into()));
+        };
+        let Some(data_number) = self.data_number_builder.finish() else {
+            return Err(MetricError::Other("Could not convert data number".into()));
+        };
+        let Some(data_histogram) = self.data_histogram_builder.finish() else {
+            return Err(MetricError::Other(
+                "Could not convert data histogram".into(),
+            ));
+        };
+
         let arrays: Vec<Arc<dyn Array>> = vec![
             Arc::new(self.time_unix_nano_builder.finish()),
             Arc::new(self.start_time_unix_nano_builder.finish()),
-            Arc::new(self.resource_builder.finish()),
-            Arc::new(self.scope_builder.finish()),
+            Arc::new(resource),
+            Arc::new(scope),
             Arc::new(self.schema_url_builder.finish()),
             Arc::new(self.metric_type_builder.finish()),
             Arc::new(self.name_builder.finish()),
@@ -358,21 +430,21 @@ impl OtelToArrowConverter {
             Arc::new(self.aggregation_temporality_builder.finish()),
             Arc::new(self.is_monotonic_builder.finish()),
             Arc::new(self.flags_builder.finish()),
-            Arc::new(self.attributes_builder.finish()),
-            Arc::new(self.data_number_builder.finish()),
-            Arc::new(self.data_histogram_builder.finish()),
+            Arc::new(attributes),
+            Arc::new(data_number),
+            Arc::new(data_histogram),
         ];
 
         RecordBatch::try_new(crate::schema::schema(), arrays)
-            .map_err(|e| MetricsError::Other(e.to_string()))
+            .map_err(|e| MetricError::Other(e.to_string()))
     }
 
     fn process_metric(
         &mut self,
         metric: &Metric,
         resource: &Resource,
-        instrument_scope: &InstrumentationLibrary,
-    ) -> Result<(), MetricsError> {
+        instrument_scope: &InstrumentationScope,
+    ) -> Result<(), MetricError> {
         let data = metric.data.as_any();
 
         // This is unfortunately the only way to downcast a generic trait object
@@ -395,7 +467,7 @@ impl OtelToArrowConverter {
         } else if let Some(gauge) = data.downcast_ref::<Gauge<f64>>() {
             self.process_gauge(gauge, metric, resource, instrument_scope);
         } else {
-            return Err(MetricsError::Other("Unsupported metric type".into()));
+            return Err(MetricError::Other("Unsupported metric type".into()));
         }
 
         Ok(())
@@ -406,7 +478,7 @@ impl OtelToArrowConverter {
         sum: &Sum<T>,
         metric: &Metric,
         resource: &Resource,
-        instrument_scope: &InstrumentationLibrary,
+        instrument_scope: &InstrumentationScope,
     ) {
         for data_point in &sum.data_points {
             self.time_unix_nano_builder
@@ -442,7 +514,7 @@ impl OtelToArrowConverter {
         gauge: &Gauge<T>,
         metric: &Metric,
         resource: &Resource,
-        instrument_scope: &InstrumentationLibrary,
+        instrument_scope: &InstrumentationScope,
     ) {
         for data_point in &gauge.data_points {
             self.time_unix_nano_builder
@@ -477,7 +549,7 @@ impl OtelToArrowConverter {
         histogram: &Histogram<T>,
         metric: &Metric,
         resource: &Resource,
-        instrument_scope: &InstrumentationLibrary,
+        instrument_scope: &InstrumentationScope,
     ) {
         for data_point in &histogram.data_points {
             self.time_unix_nano_builder
@@ -551,10 +623,7 @@ impl OtelToArrowConverter {
 
         let attributes: Vec<opentelemetry::KeyValue> = resource
             .iter()
-            .map(|(key, value)| opentelemetry::KeyValue {
-                key: key.clone(),
-                value: value.clone(),
-            })
+            .map(|(key, value)| opentelemetry::KeyValue::new(key.clone(), value.clone()))
             .collect();
         Self::add_attributes_to_builder(&mut self.resource_builder.attributes_builder, &attributes);
 
@@ -565,16 +634,16 @@ impl OtelToArrowConverter {
         self.resource_builder.append(true);
     }
 
-    fn add_scope(&mut self, scope: &InstrumentationLibrary) {
-        self.scope_builder.name_builder.append_value(&scope.name);
+    fn add_scope(&mut self, scope: &InstrumentationScope) {
+        self.scope_builder.name_builder.append_value(scope.name());
 
         self.scope_builder
             .version_builder
-            .append_option(scope.version.as_ref());
+            .append_option(scope.version());
 
         Self::add_attributes_to_builder(
             &mut self.scope_builder.attributes_builder,
-            &scope.attributes,
+            scope.attributes().cloned().collect::<Vec<_>>().as_slice(),
         );
 
         self.scope_builder
@@ -583,8 +652,7 @@ impl OtelToArrowConverter {
 
         self.scope_builder.append(true);
 
-        self.schema_url_builder
-            .append_option(scope.schema_url.as_ref());
+        self.schema_url_builder.append_option(scope.schema_url());
     }
 
     fn add_attributes_to_builder(
@@ -648,6 +716,18 @@ impl OtelToArrowConverter {
                     builder.bool_builder.append_null();
                     // TODO: serialize the value to bytes
                     builder.bytes_builder.append_value([]);
+                    builder.ser_builder.append_null();
+                }
+                _ => {
+                    // We don't recognize this value type, so append nulls
+                    builder
+                        .type_builder
+                        .append_value(crate::schema::AttributeValueType::Unknown.to_u8());
+                    builder.str_builder.append_null();
+                    builder.int_builder.append_null();
+                    builder.double_builder.append_null();
+                    builder.bool_builder.append_null();
+                    builder.bytes_builder.append_null();
                     builder.ser_builder.append_null();
                 }
             }

@@ -41,7 +41,7 @@ getSystemInfo() {
 }
 
 verifySupported() {
-    local supported=(linux-x86_64 linux-aarch64 darwin-aarch64 darwin-x86_64)
+    local supported=(linux-x86_64 linux-aarch64 darwin-aarch64)
     local current_osarch="${OS}-${ARCH}"
 
     for osarch in "${supported[@]}"; do
@@ -50,7 +50,7 @@ verifySupported() {
         fi
     done
 
-    echo "No prebuilt binary for ${current_osarch}"
+    echo "${current_osarch} does not have a pre-built binary. For supported architectures, visit https://spiceai.org/docs/reference/system_requirements#operating-systems-and-architectures"
     exit 1
 }
 
@@ -169,7 +169,7 @@ fail_trap() {
     result=$?
     if [ "$result" != "0" ]; then
         echo "Failed to install Spice Runtime"
-        echo "For support, see https://docs.spiceai.org"
+        echo "For support, see https://spiceai.org/docs"
     fi
     cleanup
     exit $result
@@ -182,7 +182,7 @@ cleanup() {
 }
 
 installCompleted() {
-    echo -e "\nTo get started with Spice.ai, visit https://docs.spiceai.org"
+    echo -e "\nTo get started with Spice.ai, visit https://spiceai.org/docs"
 }
 
 # -----------------------------------------------------------------------------

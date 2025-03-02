@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -37,17 +37,17 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use super::{DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec, Parameters};
+use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec, Parameters};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Invalid value for 'debezium_transport': {transport}.\nSupported values: 'kafka'\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium#parameters"))]
+    #[snafu(display("Invalid value for 'debezium_transport': {transport}.\nSupported values: 'kafka'\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"))]
     InvalidTransport { transport: String },
 
-    #[snafu(display("Invalid value for 'debezium_message_format': {format}.\nSupported values: 'json'\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium#parameters"))]
+    #[snafu(display("Invalid value for 'debezium_message_format': {format}.\nSupported values: 'json'\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"))]
     InvalidMessageFormat { format: String },
 
-    #[snafu(display("Missing required parameter: 'debezium_kafka_bootstrap_servers'. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium#parameters"))]
+    #[snafu(display("Missing required parameter: 'debezium_kafka_bootstrap_servers'. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"))]
     MissingKafkaBootstrapServers,
 
     #[snafu(display("{source}"))]
@@ -154,11 +154,11 @@ impl DebeziumFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("transport")
+    ParameterSpec::component("transport")
         .required()
         .default("kafka")
         .description("The message broker transport to use. The default is kafka."),
-    ParameterSpec::connector("message_format")
+    ParameterSpec::component("message_format")
         .required()
         .default("json")
         .description("The message format to use. The default is json."),
@@ -191,9 +191,13 @@ const PARAMETERS: &[ParameterSpec] = &[
 ];
 
 impl DataConnectorFactory for DebeziumFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let debezium = Debezium::new(params.parameters)?;
@@ -228,7 +232,7 @@ impl DataConnector for Debezium {
             dataset.is_accelerated(),
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
-                message: "The Debezium data connector only works with accelerated datasets.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium",
+                message: "The Debezium data connector only works with accelerated datasets.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );
@@ -240,7 +244,7 @@ impl DataConnector for Debezium {
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
                 message:
-                    "The Debezium data connector only works with non-Arrow acceleration engines.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium",
+                    "The Debezium data connector only works with non-Arrow acceleration engines.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );
@@ -248,7 +252,7 @@ impl DataConnector for Debezium {
             self.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes,
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
-                message: "The Debezium data connector only works with 'changes' refresh mode.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/debezium",
+                message: "The Debezium data connector only works with 'changes' refresh mode.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,8 +26,8 @@ use datafusion::datasource::TableProvider;
 use futures::Future;
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorParams, ParameterSpec,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec,
 };
 
 /// A connector that wraps a [`MemTable`] initialised without data, that can be
@@ -60,9 +60,13 @@ impl MemoryConnectorFactory {
 }
 
 impl DataConnectorFactory for MemoryConnectorFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        _params: DataConnectorParams,
+        _params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move { Ok(Arc::new(MemoryConnector::default()) as Arc<dyn DataConnector>) })
     }

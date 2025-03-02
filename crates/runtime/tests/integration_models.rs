@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ limitations under the License.
 
 #![allow(clippy::large_futures)]
 
+use opentelemetry::InstrumentationScope;
 use opentelemetry_sdk::{runtime::TokioCurrentThread, trace::TracerProvider};
 use runtime::{task_history::otel_exporter::TaskHistoryExporter, Runtime};
 use spicepod::component::runtime::TaskHistoryCapturedOutput;
@@ -30,7 +31,7 @@ fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
         (_, Some(log)) => EnvFilter::new(log),
         (Some(level), None) => EnvFilter::new(level),
-        _ => EnvFilter::new("runtime=TRACE,llms=TRACE,model_components=TRACE,INFO"),
+        _ => EnvFilter::new("runtime=TRACE,llms=TRACE,model_components=TRACE,task_history=WARN,runtime::embeddings=INFO,INFO"),
     };
 
     let subscriber = tracing_subscriber::FmtSubscriber::builder()
@@ -60,9 +61,10 @@ fn init_tracing_with_task_history(
         .with_batch_exporter(task_history_exporter, TokioCurrentThread)
         .build();
 
-    let tracer = opentelemetry::trace::TracerProvider::tracer_builder(&provider, "task_history")
+    let scope = InstrumentationScope::builder("task_history")
         .with_version(env!("CARGO_PKG_VERSION"))
         .build();
+    let tracer = opentelemetry::trace::TracerProvider::tracer_with_scope(&provider, scope);
 
     let task_history_layer = tracing_opentelemetry::layer()
         .with_tracer(tracer)

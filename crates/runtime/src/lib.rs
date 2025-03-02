@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,25 +30,29 @@ use config::Config;
 use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
+use flight::RateLimits;
+#[cfg(feature = "openapi")]
+pub use http::ApiDoc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
+
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
 use secrets::{ParamStr, Secrets};
 use snafu::prelude::*;
 use spicepod::component::eval::Eval;
+use status::ComponentStatus;
 use tls::TlsConfig;
-use tokio::sync::oneshot::error::RecvError;
-use tokio::sync::RwLock;
-use tools::catalog::SpiceToolCatalog;
-use tools::SpiceModelTool;
-use tools::Tooling;
+use tokio::sync::{oneshot::error::RecvError, RwLock};
+use tools::factory::default_available_catalogs;
+use tools::{catalog::SpiceToolCatalog, Tooling};
 pub use util::shutdown_signal;
 
 use crate::extension::Extension;
 pub mod accelerated_table;
 pub mod auth;
 mod builder;
+pub mod catalogconnector;
 pub mod component;
 pub mod config;
 pub mod dataaccelerator;
@@ -60,7 +64,7 @@ pub mod embeddings;
 pub mod execution_plan;
 pub mod extension;
 pub mod federated_table;
-mod flight;
+pub mod flight;
 mod http;
 mod init;
 pub mod internal_table;
@@ -120,6 +124,11 @@ pub enum Error {
     },
 
     #[snafu(display("{source}"))]
+    UnableToInitializeCatalogConnector {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("{source}"))]
     UnableToInitializeLlm {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -134,10 +143,13 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unknown data connector: {data_connector}"))]
+    #[snafu(display("Unknown data connector: {data_connector}.\nSpecify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"))]
     UnknownDataConnector { data_connector: String },
 
-    #[snafu(display("The runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    #[snafu(display("Unknown catalog connector: {catalog_connector}.\nSpecify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"))]
+    UnknownCatalogConnector { catalog_connector: String },
+
+    #[snafu(display("The runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
     OdbcNotInstalled,
 
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
@@ -281,6 +293,7 @@ pub struct Runtime {
     datasets_health_monitor: Option<Arc<DatasetsHealthMonitor>>,
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
+    rate_limits: Arc<RateLimits>,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
@@ -392,6 +405,7 @@ impl Runtime {
             Arc::clone(&self.df),
             tls_config.clone(),
             endpoint_auth.clone(),
+            Arc::clone(&self.rate_limits),
         ));
         let open_telemetry_server_future = tokio::spawn(opentelemetry::start(
             config.open_telemetry_bind_address,
@@ -458,11 +472,61 @@ impl Runtime {
         }
     }
 
+    /// Updates all of the component statuses to `Initializing`.
+    pub async fn set_components_initializing(&self) {
+        let app_lock = self.app.read().await;
+        let Some(app) = app_lock.as_ref() else {
+            return;
+        };
+
+        let valid_datasets = Self::get_valid_datasets(app, LogErrors(false));
+        for ds in &valid_datasets {
+            self.status
+                .update_dataset(&ds.name, ComponentStatus::Initializing);
+        }
+
+        if cfg!(feature = "models") {
+            for embedding in &app.embeddings {
+                self.status
+                    .update_embedding(&embedding.name, ComponentStatus::Initializing);
+            }
+
+            for model in &app.models {
+                self.status
+                    .update_model(&model.name, ComponentStatus::Initializing);
+            }
+
+            for tool in &app.tools {
+                self.status
+                    .update_tool(&tool.name, ComponentStatus::Initializing);
+            }
+
+            for tool_catalog in default_available_catalogs() {
+                self.status
+                    .update_tool_catalog(tool_catalog.name(), ComponentStatus::Initializing);
+            }
+        }
+
+        let valid_catalogs = Self::get_valid_catalogs(app, LogErrors(false));
+        for catalog in valid_catalogs {
+            self.status
+                .update_catalog(&catalog.name, ComponentStatus::Initializing);
+        }
+
+        let valid_views = Self::get_valid_views(app, LogErrors(false));
+        for view in valid_views {
+            self.status
+                .update_view(&view.name, ComponentStatus::Initializing);
+        }
+    }
+
     /// Will load all of the components of the Runtime, including `secret_stores`, `catalogs`, `datasets`, `models`, and `embeddings`.
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
     pub async fn load_components(&self) {
+        self.set_components_initializing().await;
+
         self.start_extensions().await;
 
         // Must be loaded before datasets
@@ -520,7 +584,10 @@ impl Runtime {
                 #[cfg(feature = "models")]
                 {
                     self_clone.load_eval_scorer().await;
-                    if let Err(err) = self_clone.load_eval_tables().await {
+                    let an_eval_exists = app_lock.as_ref().is_some_and(|app| !app.evals.is_empty());
+                    if !an_eval_exists {
+                        tracing::trace!("No eval spice components defined. Therefore not loading eval tables into database.");
+                    } else if let Err(err) = self_clone.load_eval_tables().await {
                         tracing::warn!("Creating internal eval run table: {err}");
                     }
                 }
@@ -542,12 +609,14 @@ impl Runtime {
         }
     }
 
-    pub async fn get_params_with_secrets(
-        &self,
-        params: &HashMap<String, String>,
-    ) -> HashMap<String, SecretString> {
-        let shared_secrets = Arc::clone(&self.secrets);
-        get_params_with_secrets(shared_secrets, params).await
+    // Closes and deallocates all resources (including the static registries)
+    pub async fn close(self) {
+        dataconnector::unregister_all().await;
+        catalogconnector::unregister_all().await;
+        dataaccelerator::unregister_all().await;
+        tools::factory::unregister_all_factories().await;
+        document_parse::unregister_all().await;
+        self.df.shutdown().await;
     }
 }
 

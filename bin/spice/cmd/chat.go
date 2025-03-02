@@ -1,3 +1,19 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package cmd
 
 import (
@@ -9,6 +25,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/manifoldco/promptui"
 	"github.com/peterh/liner"
@@ -31,9 +48,14 @@ type Message struct {
 }
 
 type ChatRequestBody struct {
-	Messages []Message `json:"messages"`
-	Model    string    `json:"model"`
-	Stream   bool      `json:"stream"`
+	Messages      []Message      `json:"messages"`
+	Model         string         `json:"model"`
+	Stream        bool           `json:"stream"`
+	StreamOptions *StreamOptions `json:"stream_options"`
+}
+
+type StreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type Delta struct {
@@ -51,13 +73,19 @@ type Choice struct {
 }
 
 type ChatCompletion struct {
-	ID                string      `json:"id"`
-	Choices           []Choice    `json:"choices"`
-	Created           int64       `json:"created"`
-	Model             string      `json:"model"`
-	SystemFingerprint string      `json:"system_fingerprint"`
-	Object            string      `json:"object"`
-	Usage             interface{} `json:"usage"`
+	ID                string   `json:"id"`
+	Choices           []Choice `json:"choices"`
+	Created           int64    `json:"created"`
+	Model             string   `json:"model"`
+	SystemFingerprint string   `json:"system_fingerprint"`
+	Object            string   `json:"object"`
+	Usage             *Usage   `json:"usage"`
+}
+
+type Usage struct {
+	CompletionTokens int `json:"completion_tokens"`
+	PromptTokens     int `json:"prompt_tokens"`
+	TotalTokens      int `json:"total_tokens"`
 }
 
 type OpenAIError struct {
@@ -99,7 +127,9 @@ spice chat --model <model> --cloud
 			rtcontext.SetUserAgentClient("chat")
 		}
 
-		rtcontext.RequireModelsFlavor(cmd)
+		if !cloud {
+			rtcontext.RequireModelsFlavor(cmd)
+		}
 
 		model, err := cmd.Flags().GetString(modelKeyFlag)
 		if err != nil {
@@ -107,26 +137,35 @@ spice chat --model <model> --cloud
 			os.Exit(1)
 		}
 		if model == "" {
-			models, err := api.GetData[api.Model](rtcontext, "/v1/models?status=true")
+			models, err := api.GetDataSingle[api.ModelResponse](rtcontext, "/v1/models?status=true")
 			if err != nil {
 				slog.Error("could not list models", "error", err)
 				os.Exit(1)
 			}
-			if len(models) == 0 {
+
+			if len(models.Data) == 0 {
 				slog.Error("No models found")
 				os.Exit(1)
 			}
 
-			modelsSelection := []string{}
-			selectedModel := models[0].Name
-			if len(models) > 1 {
-				for _, model := range models {
-					modelsSelection = append(modelsSelection, model.Name)
+			availableModels := []string{}
+			for _, model := range models.Data {
+				if model.Status == "Ready" {
+					availableModels = append(availableModels, model.Id)
 				}
+			}
+
+			if len(availableModels) == 0 {
+				slog.Error("No models are ready")
+				os.Exit(1)
+			}
+
+			selectedModel := availableModels[0]
+			if len(availableModels) > 1 {
 
 				prompt := promptui.Select{
 					Label:        "Select model",
-					Items:        modelsSelection,
+					Items:        availableModels,
 					HideSelected: true,
 				}
 
@@ -173,11 +212,14 @@ spice chat --model <model> --cloud
 			}()
 
 			body := &ChatRequestBody{
-				Messages: messages,
-				Model:    model,
-				Stream:   true,
+				Messages:      messages,
+				Model:         model,
+				Stream:        true,
+				StreamOptions: &StreamOptions{IncludeUsage: true},
 			}
-
+			var timeAtCompletion time.Time
+			var timeAtFirstToken time.Time
+			startTime := time.Now()
 			response, err := sendChatRequest(rtcontext, body)
 			if err != nil {
 				slog.Error("failed to send chat request to spiced", "error", err)
@@ -187,10 +229,15 @@ spice chat --model <model> --cloud
 			scanner := bufio.NewScanner(response.Body)
 			var responseMessage = ""
 
+			/// Usage for the entire stream, and related timing.
+			var usage Usage
 			doneLoading := false
 
 			for scanner.Scan() {
 				chunk := scanner.Text()
+				if timeAtFirstToken.IsZero() {
+					timeAtFirstToken = time.Now()
+				}
 
 				errorEvent, err := maybeErrorEvent(chunk, scanner)
 
@@ -221,6 +268,11 @@ spice chat --model <model> --cloud
 					doneLoading = true
 				}
 
+				if chatResponse.Usage != nil {
+					usage = *chatResponse.Usage
+					timeAtCompletion = time.Now()
+				}
+
 				if len(chatResponse.Choices) == 0 {
 					continue
 				}
@@ -242,9 +294,39 @@ spice chat --model <model> --cloud
 			if responseMessage != "" {
 				messages = append(messages, Message{Role: "assistant", Content: responseMessage})
 			}
-			cmd.Print("\n\n")
+			if usage != (Usage{}) {
+				cmd.Printf("\n\n%s\n\n", generateUsageMessage(
+					&usage,
+					timeAtFirstToken.Sub(startTime).Abs(),
+					timeAtCompletion.Sub(timeAtFirstToken).Abs(),
+				))
+			} else {
+				cmd.Print("\n\n")
+			}
 		}
 	},
+}
+
+// `generateUsageMessage` generates a boxed summary of the usage statistics.
+//
+// ```shell
+// Time: 3.36s (first token 0.45s). Tokens: 1652. Prompt: 1475. Completion: 177 (292.25/s).
+// ```
+// If no usage data provided:
+// ```shell
+// Time: 3.36s (first token 0.45s).
+// ```
+func generateUsageMessage(u *Usage, timeToFirst time.Duration, streamDuration time.Duration) string {
+	totalTime := (streamDuration + timeToFirst)
+	times := fmt.Sprintf("Time: %.2fs (first token %.2fs).", totalTime.Seconds(), timeToFirst.Seconds())
+	if u == nil {
+		return times
+	}
+
+	tps := float64(u.CompletionTokens) / (streamDuration.Seconds())
+	return fmt.Sprintf(
+		"%s Tokens: %d. Prompt: %d. Completion: %d (%.2f/s).", times, u.TotalTokens, u.PromptTokens, u.CompletionTokens, tps,
+	)
 }
 
 func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (*http.Response, error) {
@@ -296,7 +378,6 @@ func init() {
 	chatCmd.Flags().String(modelKeyFlag, "", "Model to chat with")
 	chatCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for chat (default: http://localhost:8090)")
 	chatCmd.Flags().String(userAgentKeyFlag, "", "User agent to use in all requests")
-	chatCmd.Flags().String("api-key", "", "The API key to use for authentication")
 
 	RootCmd.AddCommand(chatCmd)
 }

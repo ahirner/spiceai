@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,9 +17,9 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    metrics, status,
-    tools::{self, factory::default_available_catalogs},
-    Runtime, SpiceModelTool, SpiceToolCatalog, UnableToInitializeLlmToolSnafu,
+    get_params_with_secrets, metrics, status,
+    tools::{self, factory::default_available_catalogs, Tooling},
+    Runtime, SpiceToolCatalog, UnableToInitializeLlmToolSnafu,
 };
 use opentelemetry::KeyValue;
 use secrecy::SecretString;
@@ -32,6 +32,7 @@ impl Runtime {
         let app_lock = self.app.read().await;
         if let Some(app) = app_lock.as_ref() {
             for tool in &app.tools {
+                tracing::debug!("Loading tool [{}] from {}...", tool.name, tool.from);
                 self.load_tool(tool).await;
             }
         }
@@ -43,7 +44,7 @@ impl Runtime {
         for ctlg in default_available_catalogs() {
             self.insert_tool_catalog(&ctlg).await;
             for tool in ctlg.all().await {
-                self.insert_tool(&tool).await;
+                self.insert_tool(tool.into()).await;
             }
         }
     }
@@ -59,11 +60,11 @@ impl Runtime {
             .update_tool_catalog(&name, status::ComponentStatus::Ready);
     }
 
-    async fn insert_tool(&self, t: &Arc<dyn SpiceModelTool>) {
+    async fn insert_tool(&self, t: Tooling) {
         let name = t.name().to_string();
         let mut tools_map = self.tools.write().await;
 
-        tools_map.insert(name.clone(), Arc::clone(t).into());
+        tools_map.insert(name.clone(), t);
         tracing::debug!("Tool {} ready to use", name.clone());
         metrics::tools::COUNT.add(1, &[KeyValue::new("tool", name.clone())]);
         self.status
@@ -74,19 +75,19 @@ impl Runtime {
         self.status
             .update_tool(&tool.name, status::ComponentStatus::Initializing);
         let params_with_secrets: HashMap<String, SecretString> =
-            self.get_params_with_secrets(&tool.params).await;
+            get_params_with_secrets(self.secrets(), &tool.params).await;
 
         match tools::factory::forge(tool, params_with_secrets)
             .await
             .context(UnableToInitializeLlmToolSnafu)
         {
-            Ok(t) => self.insert_tool(&t).await,
+            Ok(t) => self.insert_tool(t).await,
             Err(e) => {
                 metrics::tools::LOAD_ERROR.add(1, &[]);
                 self.status
                     .update_tool(&tool.name, status::ComponentStatus::Error);
                 tracing::warn!(
-                    "Unable to load tool from spicepod {}, error: {}",
+                    "Unable to load tool '{}' from spicepod. Error: {}",
                     tool.name,
                     e,
                 );

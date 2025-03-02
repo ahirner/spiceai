@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -128,6 +128,8 @@ pub struct TelemetryConfig {
     pub enabled: bool,
     #[serde(default)]
     pub user_agent_collection: UserAgentCollection,
+    #[serde(default)]
+    pub properties: HashMap<String, String>,
 }
 
 impl Default for TelemetryConfig {
@@ -135,6 +137,7 @@ impl Default for TelemetryConfig {
         Self {
             enabled: true,
             user_agent_collection: UserAgentCollection::default(),
+            properties: HashMap::new(),
         }
     }
 }
@@ -228,7 +231,7 @@ impl TaskHistory {
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Auth {
-    #[serde(rename = "api-key")]
+    #[serde(alias = "api-key")]
     pub api_key: Option<ApiKeyAuth>,
 }
 
@@ -238,7 +241,14 @@ pub struct Auth {
 pub struct ApiKeyAuth {
     #[serde(default = "default_true")]
     pub enabled: bool,
-    pub keys: Vec<String>,
+    pub keys: Vec<ApiKey>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub enum ApiKey {
+    ReadOnly { key: String },
+    ReadWrite { key: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -261,5 +271,130 @@ impl Default for CorsConfig {
             enabled: false,
             allowed_origins: default_allowed_origins(),
         }
+    }
+}
+
+impl ApiKey {
+    #[must_use]
+    pub fn parse_str(input: &str) -> Self {
+        if let Some((key, kind)) = input.rsplit_once(':') {
+            match kind {
+                "ro" => ApiKey::ReadOnly {
+                    key: key.to_string(),
+                },
+                "rw" => ApiKey::ReadWrite {
+                    key: key.to_string(),
+                },
+                _ => ApiKey::ReadOnly {
+                    key: input.to_string(),
+                },
+            }
+        } else {
+            // Default to ReadOnly if no suffix is provided
+            ApiKey::ReadOnly {
+                key: input.to_string(),
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ApiKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let input = String::deserialize(deserializer)?;
+
+        Ok(ApiKey::parse_str(&input))
+    }
+}
+
+impl Serialize for ApiKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            ApiKey::ReadOnly { key } => serializer.serialize_str(key),
+            ApiKey::ReadWrite { key } => serializer.serialize_str(&format!("{key}:rw")),
+        }
+    }
+}
+
+impl PartialEq<str> for ApiKey {
+    fn eq(&self, other: &str) -> bool {
+        match self {
+            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => key == other,
+        }
+    }
+}
+
+impl AsRef<str> for ApiKey {
+    fn as_ref(&self) -> &str {
+        match self {
+            ApiKey::ReadOnly { key } | ApiKey::ReadWrite { key } => key.as_str(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_yaml;
+
+    #[test]
+    fn test_deserialize_api_keys() {
+        let yaml = r"
+        api_key:
+            enabled: true
+            keys:
+                - api-key-1
+                - api-key-2:ro
+                - api-key-3:rw
+        ";
+
+        let parsed: Auth = serde_yaml::from_str(yaml).expect("Failed to parse Auth");
+
+        let api_key = parsed.api_key.expect("api_key section exists");
+
+        assert_eq!(
+            api_key.keys[0],
+            ApiKey::ReadOnly {
+                key: "api-key-1".to_string()
+            }
+        );
+        assert_eq!(
+            api_key.keys[1],
+            ApiKey::ReadOnly {
+                key: "api-key-2".to_string()
+            }
+        );
+        assert_eq!(
+            api_key.keys[2],
+            ApiKey::ReadWrite {
+                key: "api-key-3".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn test_deserialize_api_key_alternative_name() {
+        let yaml = r"
+        api-key:
+            enabled: true
+            keys:
+                - api-key-1
+        ";
+
+        let parsed: Auth = serde_yaml::from_str(yaml).expect("Failed to parse Auth");
+
+        let api_key = parsed.api_key.expect("api_key section exists");
+
+        assert_eq!(
+            api_key.keys[0],
+            ApiKey::ReadOnly {
+                key: "api-key-1".to_string()
+            }
+        );
     }
 }

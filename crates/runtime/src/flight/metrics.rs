@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,13 +30,13 @@ use crate::{
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("flight"));
 
 pub(crate) static FLIGHT_REQUESTS: LazyLock<Counter<u64>> =
-    LazyLock::new(|| METER.u64_counter("flight_requests").init());
+    LazyLock::new(|| METER.u64_counter("flight_requests").build());
 
 pub(crate) static FLIGHT_REQUEST_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
     METER
         .f64_histogram("flight_request_duration_ms")
         .with_unit("ms")
-        .init()
+        .build()
 });
 
 pub async fn track_flight_request(method: &str, command: Option<&str>) -> TimeMeasurement {
@@ -57,5 +57,5 @@ pub async fn track_flight_request(method: &str, command: Option<&str>) -> TimeMe
 pub(crate) static DO_EXCHANGE_DATA_UPDATES_SENT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
         .u64_counter("flight_do_exchange_data_updates_sent")
-        .init()
+        .build()
 });

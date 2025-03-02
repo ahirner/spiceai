@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,7 @@ use app::AppBuilder;
 use hf_hub::{api::tokio::ApiBuilder, Repo, RepoType};
 use spicepod::component::{
     dataset::{acceleration::Acceleration, Dataset},
-    embeddings::ColumnEmbeddingConfig,
+    embeddings::{ColumnEmbeddingConfig, EmbeddingChunkConfig},
 };
 
 /// The `QuoraRetrieval` MTEB dataset is a benchmark dataset used for evaluating retrieval models.
@@ -27,6 +27,7 @@ use spicepod::component::{
 pub(crate) async fn add_mtep_quora_retrieval_dataset(
     app_builder: AppBuilder,
     acceleration: Option<Acceleration>,
+    chunking: Option<EmbeddingChunkConfig>,
 ) -> Result<AppBuilder, String> {
     let hf_api = ApiBuilder::new()
         .with_progress(false)
@@ -70,7 +71,7 @@ pub(crate) async fn add_mtep_quora_retrieval_dataset(
         column: "text".to_string(),
         model: "test_model".to_string(),
         primary_keys: Some(vec!["_id".to_string()]),
-        chunking: None,
+        chunking,
     }];
 
     Ok(app_builder

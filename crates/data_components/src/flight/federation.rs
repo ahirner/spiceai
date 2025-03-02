@@ -74,8 +74,12 @@ impl SQLExecutor for FlightTable {
     }
 
     async fn get_table_schema(&self, table_name: &str) -> DataFusionResult<SchemaRef> {
-        FlightTable::get_schema(self.client.clone(), &TableReference::bare(table_name))
+        FlightTable::get_schema(self.client.clone(), TableReference::bare(table_name))
             .await
             .map_err(|e| DataFusionError::Execution(e.to_string()))
+    }
+
+    fn subquery_use_partial_path(&self) -> bool {
+        self.subquery_use_partial_path
     }
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -13,8 +13,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+pub mod accumulate;
 pub mod anthropic;
 pub mod chat;
 pub mod chunking;
+pub mod config;
 pub mod embeddings;
 pub mod openai;
+pub mod perplexity;
+pub mod xai;

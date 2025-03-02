@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -35,7 +35,7 @@ use std::time::Duration;
 use url::Url;
 
 use super::ConnectorComponent;
-use super::DataConnectorParams;
+use super::ConnectorParams;
 use super::{DataConnector, DataConnectorError, DataConnectorFactory, Parameters};
 use crate::parameters::{ParamLookup, ParameterSpec};
 
@@ -63,7 +63,7 @@ pub enum Error {
     UnableToSanitizeConnectionString,
 
     #[snafu(display(
-        "Failed to authenticate with the ClickHouse.\nEnsure that the username and password are correctly configured.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/clickhouse#configuration"
+        "Failed to authenticate with the ClickHouse.\nEnsure that the username and password are correctly configured.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/clickhouse#configuration"
     ))]
     InvalidUsernameOrPasswordError {
         source: clickhouse_rs::errors::Error,
@@ -76,10 +76,10 @@ pub enum Error {
         port: String,
     },
 
-    #[snafu(display("Missing required parameter: '{parameter_name}'. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/clickhouse#configuration"))]
+    #[snafu(display("Missing required parameter: '{parameter_name}'. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/clickhouse#configuration"))]
     MissingRequiredParameterForConnection { parameter_name: String },
 
-    #[snafu(display("An invalid value was provided for the parameter '{parameter_name}'.\nSpecify a value of 'true' or 'false'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/clickhouse#configuration"))]
+    #[snafu(display("An invalid value was provided for the parameter '{parameter_name}'.\nSpecify a value of 'true' or 'false'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/clickhouse#configuration"))]
     InvalidSecureParameterValueError {
         parameter_name: String,
         source: ParseBoolError,
@@ -112,28 +112,32 @@ impl ClickhouseFactory {
 
 const PARAMETERS: &[ParameterSpec] = &[
     // clickhouse_connection_string
-    ParameterSpec::connector("connection_string").secret()
+    ParameterSpec::component("connection_string").secret()
         .description("The connection string to use to connect to the Clickhouse server. This can be used instead of providing individual connection parameters."),
     // clickhouse_pass
-    ParameterSpec::connector("pass").secret().description("The password to use to connect to the Clickhouse server."),
+    ParameterSpec::component("pass").secret().description("The password to use to connect to the Clickhouse server."),
     // clickhouse_user
-    ParameterSpec::connector("user").description("The username to use to connect to the Clickhouse server."),
+    ParameterSpec::component("user").description("The username to use to connect to the Clickhouse server."),
     // clickhouse_host
-    ParameterSpec::connector("host").description("The hostname of the Clickhouse server."),
+    ParameterSpec::component("host").description("The hostname of the Clickhouse server."),
     // clickhouse_tcp_port
-    ParameterSpec::connector("tcp_port").description("The port of the Clickhouse server."),
+    ParameterSpec::component("tcp_port").description("The port of the Clickhouse server."),
     // clickhouse_db
-    ParameterSpec::connector("db").description("The database to use on the Clickhouse server."),
+    ParameterSpec::component("db").description("The database to use on the Clickhouse server."),
     // clickhouse_secure
-    ParameterSpec::connector("secure").description("Whether to use a secure connection to the Clickhouse server."),
+    ParameterSpec::component("secure").description("Whether to use a secure connection to the Clickhouse server."),
     // connection_timeout
-    ParameterSpec::runtime("connection_timeout").description("The connection timeout in milliseconds."),
+    ParameterSpec::runtime("connection_timeout").description("The connection timeout in milliseconds.")
 ];
 
 impl DataConnectorFactory for ClickhouseFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             match get_config_from_params(params.parameters).await {

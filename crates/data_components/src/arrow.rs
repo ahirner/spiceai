@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -55,8 +55,9 @@ impl TableProviderFactory for ArrowFactory {
         cmd: &CreateExternalTable,
     ) -> DataFusionResult<Arc<dyn TableProvider>> {
         let schema: SchemaRef = Arc::new(cmd.schema.as_arrow().clone());
-        let mem_table =
-            MemTable::try_new(schema, vec![])?.with_constraints(cmd.constraints.clone());
+        let mem_table = MemTable::try_new(schema, vec![])?
+            .try_with_constraints(cmd.constraints.clone())
+            .await?;
         let delete_adapter = DeletionTableProviderAdapter::new(Arc::new(mem_table));
         Ok(Arc::new(delete_adapter))
     }

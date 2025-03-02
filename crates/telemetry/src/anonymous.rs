@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,10 +23,8 @@ use crate::exporter::AnonymousTelemetryExporter;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::{
     metrics::{
-        data::{ResourceMetrics, Temporality},
-        exporter::PushMetricsExporter,
-        reader::{MetricReader, TemporalitySelector},
-        InstrumentKind, ManualReader, PeriodicReader, Pipeline, SdkMeterProvider,
+        data::ResourceMetrics, exporter::PushMetricExporter, reader::MetricReader, InstrumentKind,
+        ManualReader, PeriodicReader, Pipeline, SdkMeterProvider, Temporality,
     },
     runtime::Tokio,
     Resource,
@@ -46,7 +44,7 @@ static ENDPOINT: LazyLock<Arc<str>> = LazyLock::new(|| {
         .into()
 });
 
-fn resource(spicepod_name: &str) -> Resource {
+fn resource(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) -> Resource {
     let hostname = hostname::get()
         .unwrap_or_else(|_| "unknown".into())
         .into_encoded_bytes();
@@ -62,17 +60,17 @@ fn resource(spicepod_name: &str) -> Resource {
     spicepod_id_hasher.update(spicepod_name);
     let spicepod_id = format!("{:x}", spicepod_id_hasher.finalize());
 
-    Resource::new(vec![
+    Resource::new(telemetry_properties.into_iter().chain(vec![
         KeyValue::new("service.name", "spiced"), // May be overridden by setting OTEL_SERVICE_NAME env variable
         KeyValue::new("name", "spiced"),
         KeyValue::new("service.version", env!("CARGO_PKG_VERSION")),
         KeyValue::new("service.instance.id", instance_id),
         KeyValue::new("spicepod.id", spicepod_id),
-    ])
+    ]))
 }
 
-pub async fn start(spicepod_name: &str) {
-    let resource = resource(spicepod_name);
+pub async fn start(spicepod_name: &str, telemetry_properties: Vec<KeyValue>) {
+    let resource = resource(spicepod_name, telemetry_properties);
 
     let oss_telemetry_exporter =
         OtelArrowExporter::new(AnonymousTelemetryExporter::new(Arc::clone(&ENDPOINT)).await);
@@ -137,20 +135,18 @@ impl MetricReader for InitialReader {
         self.reader.register_pipeline(pipeline);
     }
 
-    fn collect(&self, rm: &mut ResourceMetrics) -> opentelemetry::metrics::Result<()> {
+    fn collect(&self, rm: &mut ResourceMetrics) -> opentelemetry_sdk::metrics::MetricResult<()> {
         self.reader.collect(rm)
     }
 
-    fn force_flush(&self) -> opentelemetry::metrics::Result<()> {
+    fn force_flush(&self) -> opentelemetry_sdk::metrics::MetricResult<()> {
         self.reader.force_flush()
     }
 
-    fn shutdown(&self) -> opentelemetry::metrics::Result<()> {
+    fn shutdown(&self) -> opentelemetry_sdk::metrics::MetricResult<()> {
         self.reader.shutdown()
     }
-}
 
-impl TemporalitySelector for InitialReader {
     fn temporality(&self, kind: InstrumentKind) -> Temporality {
         self.reader.temporality(kind)
     }

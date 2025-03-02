@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,9 +15,9 @@ limitations under the License.
 */
 
 use super::ConnectorComponent;
+use super::ConnectorParams;
 use super::DataConnector;
 use super::DataConnectorFactory;
-use super::DataConnectorParams;
 use super::ParameterSpec;
 use async_trait::async_trait;
 use data_components::snowflake::SnowflakeTableFactory;
@@ -65,20 +65,24 @@ impl SnowflakeFactory {
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("username").secret(),
-    ParameterSpec::connector("password").secret(),
-    ParameterSpec::connector("private_key_path").secret(),
-    ParameterSpec::connector("private_key_passphrase").secret(),
-    ParameterSpec::connector("account").secret(),
-    ParameterSpec::connector("warehouse").secret(),
-    ParameterSpec::connector("role").secret(),
-    ParameterSpec::connector("auth_type"),
+    ParameterSpec::component("username").secret(),
+    ParameterSpec::component("password").secret(),
+    ParameterSpec::component("private_key_path").secret(),
+    ParameterSpec::component("private_key_passphrase").secret(),
+    ParameterSpec::component("account").secret(),
+    ParameterSpec::component("warehouse").secret(),
+    ParameterSpec::component("role").secret(),
+    ParameterSpec::component("auth_type"),
 ];
 
 impl DataConnectorFactory for SnowflakeFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<

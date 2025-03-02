@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,12 +30,6 @@ use futures::TryStreamExt;
 use tracing_futures::Instrument;
 
 use super::Openai;
-
-pub const MAX_COMPLETION_TOKENS: u16 = 1024_u16; // Avoid accidentally using infinite tokens. Should think about this more.
-
-pub(crate) const GPT3_5_TURBO_INSTRUCT: &str = "gpt-3.5-turbo";
-
-pub const DEFAULT_LLM_MODEL: &str = GPT3_5_TURBO_INSTRUCT;
 
 #[async_trait]
 impl<C: Config + Send + Sync> Chat for Openai<C> {
@@ -72,15 +66,17 @@ impl<C: Config + Send + Sync> Chat for Openai<C> {
             messages: vec![ChatCompletionRequestMessage::User(
                 ChatCompletionRequestUserMessage {
                     name: None,
-                    content: ChatCompletionRequestUserMessageContent::Text("ping.".to_string()),
+                    content: ChatCompletionRequestUserMessageContent::Text(
+                        "Respond with the single letter 'A'. This is a healthcheck.".to_string(),
+                    ),
                 },
             )],
             ..Default::default()
         };
         if self.supports_max_completion_tokens() {
-            req.max_completion_tokens = Some(100);
+            req.max_completion_tokens = Some(150);
         } else {
-            req.max_tokens = Some(100);
+            req.max_tokens = Some(150);
         }
 
         if let Err(e) = self.chat_request(req).instrument(span.clone()).await {

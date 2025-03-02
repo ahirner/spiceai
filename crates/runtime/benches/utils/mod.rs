@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,7 +24,7 @@ pub(crate) fn init_tracing(trace_config: Option<&str>) {
         (_, Some(log)) => EnvFilter::new(log),
         (Some(level), None) => EnvFilter::new(level),
         _ => EnvFilter::new(
-            "datafusion-federation=TRACE,datafusion-federation-sql=TRACE,bench=TRACE,runtime=TRACE,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO,llms=INFO,reqwest_retry::middleware=off,task_history=off,WARN",
+            "datafusion-federation=DEBUG,datafusion-federation-sql=DEBUG,bench=DEBUG,runtime=DEBUG,secrets=INFO,data_components=INFO,cache=INFO,extensions=INFO,spice_cloud=INFO,llms=INFO,reqwest_retry::middleware=off,task_history=off,WARN",
         ),
     };
     let subscriber = tracing_subscriber::FmtSubscriber::builder()

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -37,7 +37,11 @@ pub(crate) static TEST_REQUEST_CONTEXT: LazyLock<Arc<RequestContext>> = LazyLock
 });
 
 pub(crate) async fn runtime_ready_check(rt: &Runtime) {
-    assert!(wait_until_true(Duration::from_secs(30), || async { rt.status().is_ready() }).await);
+    runtime_ready_check_with_timeout(rt, Duration::from_secs(30)).await;
+}
+
+pub(crate) async fn runtime_ready_check_with_timeout(rt: &Runtime, duration: Duration) {
+    assert!(wait_until_true(duration, || async { rt.status().is_ready() }).await);
 }
 
 pub(crate) async fn wait_until_true<F, Fut>(max_wait: Duration, mut f: F) -> bool

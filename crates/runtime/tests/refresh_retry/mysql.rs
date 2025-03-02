@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -116,6 +116,7 @@ async fn create_refresh_task(
             rt.status(),
             table_name.into(),
             Arc::clone(&accelerated_table.get_federated_table()),
+            None,
             accelerated_table.get_accelerator(),
         ),
         accelerated_table.refresh_params().read().await.clone(),

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -24,6 +24,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
+	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 )
 
 var verbosity = util.NewVerbosity()
@@ -31,6 +32,15 @@ var verbosity = util.NewVerbosity()
 var RootCmd = &cobra.Command{
 	Use:   "spice",
 	Short: "Spice.ai CLI",
+
+	PersistentPreRun: func(cmd *cobra.Command, args []string) {
+
+		if cmd.Name() == "version" {
+			// don't duplicate version information in version command
+			return
+		}
+		cmd.Printf("Spice.ai OSS CLI %s\n", version.Version())
+	},
 }
 
 // Execute adds all child commands to the root command.
@@ -47,7 +57,7 @@ func init() {
 	RootCmd.PersistentFlags().CountVarP(&verbosity.VerbosityCount, "verbose", "v", "Verbose logging")
 	RootCmd.PersistentFlags().BoolVar(&verbosity.VeryVerbose, "very-verbose", false, "Very verbose logging")
 	RootCmd.PersistentFlags().BoolP("help", "h", false, "Print this help message")
-
+	RootCmd.PersistentFlags().String("api-key", "", "The API key to use for authentication")
 }
 
 func initConfig() {

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -97,7 +97,7 @@ pub async fn register_all() {
     register_accelerator_engine(Engine::Sqlite, Arc::new(SqliteAccelerator::new())).await;
 }
 
-pub async fn clear_registry() {
+pub async fn unregister_all() {
     let mut registry = DATA_ACCELERATOR_ENGINES.lock().await;
     registry.clear();
 }
@@ -164,9 +164,9 @@ pub trait DataAccelerator: Send + Sync {
             let path = std::path::Path::new(&path);
 
             !path.is_dir()
-                && path.extension().map_or(false, |ext| {
-                    self.valid_file_extensions().iter().any(|&e| e == ext)
-                })
+                && path
+                    .extension()
+                    .is_some_and(|ext| self.valid_file_extensions().iter().any(|&e| e == ext))
         } else {
             false
         }
@@ -333,6 +333,13 @@ pub async fn create_accelerator_table(
             })?;
 
     if let Err(e) = acceleration_settings.validate_indexes(&schema) {
+        InvalidConfigurationSnafu {
+            msg: format!("{e}"),
+        }
+        .fail()?;
+    };
+
+    if let Err(e) = acceleration_settings.validate_primary_key(&schema) {
         InvalidConfigurationSnafu {
             msg: format!("{e}"),
         }

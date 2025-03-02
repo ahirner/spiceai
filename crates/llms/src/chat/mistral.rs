@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -20,22 +20,24 @@ use super::{nsql::SqlGeneration, Chat, Error as ChatError, FailedToRunModelSnafu
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
-        ChatChoiceStream, ChatCompletionNamedToolChoice, ChatCompletionRequestUserMessageArgs,
-        ChatCompletionResponseStream, ChatCompletionStreamResponseDelta, ChatCompletionTool,
-        ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
+        ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionNamedToolChoice,
+        ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
+        ChatCompletionStreamResponseDelta, ChatCompletionTool, ChatCompletionToolChoiceOption,
+        ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
         CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-        CreateChatCompletionStreamResponse, FinishReason, Role, Stop,
+        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role, Stop,
     },
 };
 use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, TryStreamExt};
 use mistralrs::{
-    ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice, Constraint, Device,
-    DeviceMapMetadata, Function, GGMLLoaderBuilder, GGMLSpecificConfig, GGUFLoaderBuilder,
-    GGUFSpecificConfig, LocalModelPaths, MistralRs, MistralRsBuilder, ModelDType, ModelPaths,
-    NormalLoaderBuilder, NormalRequest, Pipeline, Request as MistralRequest, RequestMessage,
-    Response as MistralResponse, SamplingParams, TokenSource, Tool, ToolChoice, ToolType,
+    AutoDeviceMapParams, ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice,
+    Constraint, Device, DeviceMapSetting, Function, GGMLLoaderBuilder, GGMLSpecificConfig,
+    GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs, MistralRsBuilder,
+    ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline,
+    Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams,
+    TokenSource, Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 
 use secrecy::{ExposeSecret, Secret};
@@ -71,6 +73,7 @@ impl MistralLlama {
         config: Option<&Path>,
         tokenizer: Option<&Path>,
         tokenizer_config: Option<&Path>,
+        generation_config: Option<&Path>,
         chat_template_literal: Option<&str>,
     ) -> Result<Self> {
         for weight in model_weights {
@@ -105,7 +108,13 @@ impl MistralLlama {
             }
         }
 
-        let paths = Self::create_paths(model_weights, config, tokenizer, tokenizer_config);
+        let paths = Self::create_paths(
+            model_weights,
+            config,
+            tokenizer,
+            tokenizer_config,
+            generation_config,
+        );
         let model_id = model_weights
             .first()
             .map(|w| w.to_string_lossy().to_string())
@@ -142,6 +151,7 @@ impl MistralLlama {
         config: Option<&Path>,
         tokenizer: Option<&Path>,
         tokenizer_config: Option<&Path>,
+        generation_config: Option<&Path>,
     ) -> Box<dyn ModelPaths> {
         Box::new(LocalModelPaths::new(
             tokenizer.map(Into::into).unwrap_or_default(),
@@ -153,7 +163,7 @@ impl MistralLlama {
             None,
             None,
             None,
-            None,
+            generation_config.map(Into::into),
             None,
             None,
             None,
@@ -180,8 +190,8 @@ impl MistralLlama {
             &paths,
             &ModelDType::Auto,
             device,
-            false,
-            DeviceMapMetadata::dummy(),
+            true,
+            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
             None,
             None,
         )
@@ -233,8 +243,8 @@ impl MistralLlama {
             &paths,
             &ModelDType::Auto,
             device,
-            false,
-            DeviceMapMetadata::dummy(),
+            true,
+            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
             None,
             None,
         )
@@ -261,8 +271,8 @@ impl MistralLlama {
             &paths,
             &ModelDType::Auto,
             device,
-            false,
-            DeviceMapMetadata::dummy(),
+            true,
+            DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
             None,
             None,
         )
@@ -290,40 +300,56 @@ impl MistralLlama {
         model_id: &str,
         arch: Option<&str>,
         hf_token_literal: Option<&Secret<String>>,
+        gguf_filename: Option<PathBuf>,
     ) -> Result<Self> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
 
-        // Hardcoded model architecture can ensure correct loading type.
-        // If not provided, it will be inferred (generally from `.model_type` in a downloaded `config.json`)
-        let loader_type = arch
-            .map(|a| {
-                mistralrs::NormalLoaderType::from_str(a).map_err(|_| ChatError::FailedToLoadModel {
-                    source: format!("Unknown model type: {a}").into(),
+        // Loading the GGUF directly (as if it is a quantized model, although it need not be quantized).
+        let loader: Result<Box<dyn Loader>> = if let Some(gguf) = gguf_filename {
+            Ok(GGUFLoaderBuilder::new(
+                None,
+                None,
+                model_parts[0].to_string(),
+                vec![gguf.to_string_lossy().to_string()],
+                GGUFSpecificConfig::default(),
+            )
+            .build())
+        } else {
+            // Hardcoded model architecture can ensure correct loading type.
+            // If not provided, it will be inferred (generally from `.model_type` in a downloaded `config.json`)
+            let loader_type = arch
+                .map(|a| {
+                    mistralrs::NormalLoaderType::from_str(a)
+                        .map_err(|e| ChatError::UnsupportedModelType { source: e.into() })
                 })
-            })
-            .transpose()?;
+                .transpose()?;
 
-        let builder = NormalLoaderBuilder::new(
-            mistralrs::NormalSpecificConfig::default(),
-            None,
-            None,
-            Some(model_parts[0].to_string()),
-        );
+            let builder = NormalLoaderBuilder::new(
+                mistralrs::NormalSpecificConfig::default(),
+                None,
+                None,
+                Some(model_parts[0].to_string()),
+            );
+
+            builder
+                .build(loader_type)
+                .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })
+        };
+
         let device = Self::get_device();
         let token_source = hf_token_literal.map_or(TokenSource::CacheToken, |secret| {
+            tracing::debug!("A HuggingFace token was specified in parameters. The specified token will be used instead of any system/environment defaults.");
             TokenSource::Literal(secret.expose_secret().clone())
         });
 
-        let pipeline = builder
-            .build(loader_type)
-            .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?
+        let pipeline = loader?
             .load_model_from_hf(
                 model_parts.get(1).map(|&x| x.to_string()),
                 token_source,
                 &ModelDType::Auto,
                 &device,
                 false,
-                DeviceMapMetadata::dummy(),
+                DeviceMapSetting::Auto(AutoDeviceMapParams::default_text()),
                 None,
                 None,
             )
@@ -442,6 +468,7 @@ impl MistralLlama {
                         c.finish_reason = "tool_calls".to_string();
                     }
                 });
+
                 Ok(resp)
             }
             MistralResponse::ModelError(e, _) => Err(OpenAIError::ApiError(ApiError {
@@ -645,29 +672,48 @@ fn chunk_to_openai_stream(
         // mistralrs uses milliseconds, OpenAI uses seconds
         created: (c.created / 1000) as u32,
         service_tier: None,
-        usage: None,
+        usage: c.usage.map(|u| CompletionUsage {
+            prompt_tokens: u.prompt_tokens as u32,
+            completion_tokens: u.completion_tokens as u32,
+            total_tokens: u.total_tokens as u32,
+            prompt_tokens_details: None,
+            completion_tokens_details: None,
+        }),
         choices,
     })
 }
 
-#[allow(deprecated, clippy::cast_possible_truncation)]
+#[allow(
+    deprecated,
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap
+)]
 fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, OpenAIError> {
-    let role: Role = serde_json::from_str(&format!("\"{}\"", &choice.delta.role))
+    let ChunkChoice {
+        index,
+        delta,
+        finish_reason,
+        ..
+    } = choice;
+    let role: Role = serde_json::from_str(&format!("\"{}\"", delta.role))
         .map_err(OpenAIError::JSONDeserialize)?;
 
-    let finish_reason: Option<FinishReason> = choice
-        .finish_reason
+    let finish_reason: Option<FinishReason> = finish_reason
         .as_ref()
         .map(|f| serde_json::from_str(&format!("\"{f}\"")))
         .transpose()
         .map_err(OpenAIError::JSONDeserialize)?;
 
     Ok(ChatChoiceStream {
-        index: choice.index as u32,
+        index: *index as u32,
         delta: ChatCompletionStreamResponseDelta {
-            content: Some(choice.delta.content.clone()),
+            content: delta.content.clone(),
             function_call: None,
-            tool_calls: None,
+            tool_calls: delta.tool_calls.as_ref().map(|t| {
+                t.iter()
+                    .map(|x| parse_tool_call_response(*index as u32, x))
+                    .collect()
+            }),
             role: Some(role),
             refusal: None,
         },
@@ -712,5 +758,20 @@ fn convert_tool(x: &ChatCompletionTool) -> Tool {
                 .clone()
                 .and_then(|p| p.as_object().map(|p| HashMap::from_iter(p.clone()))),
         },
+    }
+}
+
+fn parse_tool_call_response(
+    index: u32,
+    r: &ToolCallResponse,
+) -> ChatCompletionMessageToolCallChunk {
+    ChatCompletionMessageToolCallChunk {
+        id: Some(r.id.clone()),
+        index,
+        r#type: Some(ChatCompletionToolType::Function),
+        function: Some(FunctionCallStream {
+            name: Some(r.function.name.clone()),
+            arguments: Some(r.function.arguments.clone()),
+        }),
     }
 }

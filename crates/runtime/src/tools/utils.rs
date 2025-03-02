@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use crate::Runtime;
 
-use super::{builtin::get_builtin_tools, options::SpiceToolsOptions, SpiceModelTool};
+use super::{options::SpiceToolsOptions, SpiceModelTool, Tooling};
 
 /// Creates the messages that would be sent and received if a language model were to request the `tool`
 /// to be called (via an assistant message), with defined `arg`, and the response from running the
@@ -83,22 +83,39 @@ pub fn parameters<T: JsonSchema + Serialize>() -> Option<Value> {
 
 #[must_use]
 pub async fn get_tools(rt: Arc<Runtime>, opts: &SpiceToolsOptions) -> Vec<Arc<dyn SpiceModelTool>> {
-    match opts {
-        SpiceToolsOptions::Disabled => vec![],
-        SpiceToolsOptions::Auto => get_builtin_tools(),
-        SpiceToolsOptions::Specific(t) => {
-            // TODO check for "categories/groups" of tools: builtin, memory
-            let mut tools = vec![];
-            let all_tools = rt.tools.read().await;
+    let all_tools = rt.tools.read().await;
 
-            for tt in t {
-                if let Some(tool) = all_tools.get(tt) {
-                    tools.extend(tool.tools().await);
+    let mut tools = vec![];
+    let mut missing_tools = vec![];
+
+    for tt in opts.tools_by_name() {
+        if let Some((catalog_name, catalog_tool)) = tt.split_once(':') {
+            if let Some(Tooling::Catalog(catalog)) = all_tools.get(catalog_name) {
+                if let Some(t) = catalog.get(catalog_tool).await {
+                    tools.push(t);
                 } else {
-                    tracing::warn!("Tool {tt} not found in registry");
+                    tracing::warn!("Tool '{catalog_tool}' is not found in '{catalog_name}'.");
+                    missing_tools.push(tt);
                 }
+            } else {
+                missing_tools.push(tt);
             }
-            tools
+        } else if let Some(tool) = all_tools.get(tt) {
+            tools.extend(tool.tools().await);
+        } else {
+            missing_tools.push(tt);
         }
     }
+
+    if !missing_tools.is_empty() {
+        let available_tools = all_tools
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<&str>>()
+            .join(", ");
+
+        tracing::warn!("The following tools were not found in the registry: {}.\nAvailable tools are: {available_tools}.\nFor details, visit https://spiceai.org/docs/features/large-language-models/tools", missing_tools.join(", "));
+    }
+
+    tools
 }

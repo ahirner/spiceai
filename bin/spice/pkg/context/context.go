@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/github"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
+	"github.com/spiceai/spiceai/bin/spice/pkg/version"
 	"golang.org/x/mod/semver"
 )
 
@@ -170,49 +171,56 @@ func (c *RuntimeContext) Version() (string, error) {
 }
 
 func (c *RuntimeContext) RequireModelsFlavor(cmd *cobra.Command) {
-	if c.ModelsFlavorInstalled() {
+	if models, _ := c.ModelsFlavorInstalled(); models {
 		return
 	}
-	slog.Info("This feature requires a runtime version with models enabled. Install (y/n)? ")
+	slog.Info("This feature requires a runtime version with AI capabilities enabled. Install (y/n)? ")
 	var confirm string
 	_, _ = fmt.Scanf("%s", &confirm)
 	if strings.ToLower(strings.TrimSpace(confirm)) != "y" {
-		slog.Warn("Models runtime not installed, exiting...")
+		slog.Warn("AI-enabled runtime not installed, exiting...")
 		os.Exit(0)
 	}
-	slog.Info("Installing models runtime...")
-	err := c.InstallOrUpgradeRuntime("models")
+	slog.Info("Installing AI-enabled runtime...")
+	err := c.InstallMatchingRuntime(constants.FlavorAI, true) // default to using an accelerator for prompted installs
 	if err != nil {
 		slog.Error("installing models runtime", "error", err)
 		os.Exit(1)
 	}
 }
 
-func (c *RuntimeContext) ModelsFlavorInstalled() bool {
+// Return type = (models, accelerated)
+func (c *RuntimeContext) ModelsFlavorInstalled() (models bool, accelerated bool) {
 	version, err := c.Version()
 	if err != nil {
-		return false
+		return false, false
 	}
 
 	// Split the semver string by '+', the part after '+' is the build metadata
 	parts := strings.Split(version, "+")
 	if len(parts) < 2 {
 		// No build metadata present
-		return false
+		return false, false
 	}
 
 	// Split build metadata by '.'
 	buildMetadata := parts[1]
 	metadataParts := strings.Split(buildMetadata, ".")
 
+	models = false
+	accelerated = false
 	// Check if any of the metadata parts is 'models'
 	for _, part := range metadataParts {
 		if part == "models" {
-			return true
+			models = true
+		}
+
+		if part == "cuda" || part == "metal" {
+			accelerated = true
 		}
 	}
 
-	return false
+	return
 }
 
 func (c *RuntimeContext) RuntimeUnavailableError() error {
@@ -227,22 +235,21 @@ func (c *RuntimeContext) IsRuntimeInstallRequired() bool {
 	return errors.Is(err, os.ErrNotExist)
 }
 
-func (c *RuntimeContext) InstallOrUpgradeRuntime(flavor string) error {
+func (c *RuntimeContext) InstallMatchingRuntime(flavor constants.Flavor, allowAccelerator bool) error {
+	cliVersion := version.Version()
 	err := c.prepareInstallDir()
 	if err != nil {
 		return err
 	}
 
-	release, err := github.GetLatestRuntimeRelease()
+	release, err := github.GetRuntimeRelease(cliVersion)
 	if err != nil {
 		return err
 	}
 
-	runtimeVersion := release.TagName
+	slog.Info(fmt.Sprintf("Downloading and installing Spice.ai Runtime %s ...\n", release.TagName))
 
-	slog.Info(fmt.Sprintf("Downloading and installing Spice.ai Runtime %s ...\n", runtimeVersion))
-
-	err = github.DownloadRuntimeAsset(flavor, release, c.spiceBinDir)
+	err = github.DownloadRuntimeAsset(flavor, release, c.spiceBinDir, allowAccelerator)
 	if err != nil {
 		slog.Error("downloading Spice.ai runtime binaries", "error", err)
 		return err
@@ -271,16 +278,13 @@ func (c *RuntimeContext) IsRuntimeUpgradeAvailable() (string, error) {
 		return "", nil
 	}
 
-	release, err := github.GetLatestRuntimeRelease()
-	if err != nil {
-		return "", err
-	}
+	cliVersion := version.Version()
 
-	if semver.Compare(currentVersion, release.TagName) >= 0 {
+	if semver.Compare(currentVersion, cliVersion) >= 0 {
 		return "", nil
 	}
 
-	return release.TagName, nil
+	return cliVersion, nil
 }
 
 func (c *RuntimeContext) GetSpiceAppRelativePath(absolutePath string) string {
@@ -361,13 +365,15 @@ func (c *RuntimeContext) AddHeaders(headers map[string]string) {
 func (c *RuntimeContext) GetHeaders() map[string]string {
 	headers := make(map[string]string)
 
-	if c.isCloud {
-		apiKey := os.Getenv("SPICE_API_KEY")
-		if apiKey != "" {
-			headers["X-API-Key"] = apiKey
-		}
+	apiKey := os.Getenv("SPICE_API_KEY")
+	if apiKey == "" {
+		apiKey = os.Getenv("SPICE_SPICEAI_API_KEY")
+	}
+	if apiKey != "" {
+		headers["X-API-Key"] = apiKey
 	}
 
+	// api_key from context takes precedence
 	if c.apiKey != "" {
 		headers["X-API-Key"] = c.apiKey
 	}
@@ -385,6 +391,38 @@ func (c *RuntimeContext) IsCloud() bool {
 
 func (c *RuntimeContext) SetHttpEndpoint(endpoint string) {
 	c.httpEndpoint = endpoint
+}
+
+func (c *RuntimeContext) SpicePath() (constants.SpiceInstallPath, string, error) {
+	executableDir, err := os.Executable()
+	if err != nil {
+		return constants.OtherInstall, "", err
+	}
+
+	spiceBinDir := filepath.Join(c.SpiceRuntimeDir(), "bin")
+	releaseFilePath := filepath.Join(spiceBinDir, constants.SpiceCliFilename)
+
+	if executableDir == releaseFilePath {
+		return constants.StandardInstall, executableDir, nil
+	}
+
+	brewPath := getBrewPrefix()
+	if brewPath != "" && strings.Contains(executableDir, brewPath) {
+		return constants.BrewInstall, executableDir, nil
+	}
+
+	return constants.OtherInstall, executableDir, nil
+}
+
+func getBrewPrefix() string {
+	cmd := exec.Command("brew", "--prefix")
+	out, err := cmd.Output()
+	if err != nil {
+		return ""
+	}
+
+	brewPrefix := strings.TrimSpace(string(out))
+	return brewPrefix
 }
 
 func loadDotEnvValues() (map[string]string, error) {

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, datafusion::dialect::new_duckdb_dialect};
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
@@ -22,7 +22,7 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::duckdb::DuckDBTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::duckdbconn::is_table_function;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
-use datafusion_table_providers::InvalidTypeAction;
+use datafusion_table_providers::UnsupportedTypeAction;
 use duckdb::AccessMode;
 use snafu::prelude::*;
 use std::any::Any;
@@ -31,8 +31,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{
-    AnyErrorResult, ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorParams, ParameterSpec,
+    AnyErrorResult, ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError,
+    DataConnectorFactory, ParameterSpec,
 };
 
 #[derive(Debug, Snafu)]
@@ -50,9 +50,7 @@ pub struct DuckDB {
 }
 
 impl DuckDB {
-    pub(crate) fn create_in_memory(
-        params: &DataConnectorParams,
-    ) -> AnyErrorResult<DuckDBTableFactory> {
+    pub(crate) fn create_in_memory(params: &ConnectorParams) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
             DuckDbConnectionPool::new_memory()
                 .map_err(|source| DataConnectorError::UnableToConnectInternal {
@@ -60,19 +58,19 @@ impl DuckDB {
                     connector_component: params.component.clone(),
                     source,
                 })?
-                .with_invalid_type_action(
+                .with_unsupported_type_action(
                     params
-                        .invalid_type_action
-                        .unwrap_or(InvalidTypeAction::Error),
+                        .unsupported_type_action
+                        .unwrap_or(UnsupportedTypeAction::Error),
                 ),
         );
 
-        Ok(DuckDBTableFactory::new(pool))
+        Ok(DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()))
     }
 
     pub(crate) fn create_file(
         path: &str,
-        params: &DataConnectorParams,
+        params: &ConnectorParams,
     ) -> AnyErrorResult<DuckDBTableFactory> {
         let pool = Arc::new(
             DuckDbConnectionPool::new_file(path, &AccessMode::ReadOnly)
@@ -81,14 +79,14 @@ impl DuckDB {
                     connector_component: params.component.clone(),
                     source,
                 })?
-                .with_invalid_type_action(
+                .with_unsupported_type_action(
                     params
-                        .invalid_type_action
-                        .unwrap_or(InvalidTypeAction::Error),
+                        .unsupported_type_action
+                        .unwrap_or(UnsupportedTypeAction::Error),
                 ),
         );
 
-        Ok(DuckDBTableFactory::new(pool))
+        Ok(DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()))
     }
 }
 
@@ -107,12 +105,16 @@ impl DuckDBFactory {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::connector("open")];
+const PARAMETERS: &[ParameterSpec] = &[ParameterSpec::component("open")];
 
 impl DataConnectorFactory for DuckDBFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let duckdb_factory =
@@ -126,7 +128,7 @@ impl DataConnectorFactory for DuckDBFactory {
         })
     }
 
-    fn supports_invalid_type_action(&self) -> bool {
+    fn supports_unsupported_type_action(&self) -> bool {
         true
     }
 

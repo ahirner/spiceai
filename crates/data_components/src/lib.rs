@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ use std::{error::Error, sync::Arc};
 
 use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{catalog::CatalogProvider, datasource::TableProvider, sql::TableReference};
 
 pub mod arrow;
 #[cfg(feature = "clickhouse")]
@@ -36,9 +36,12 @@ pub mod debezium_kafka;
 pub mod delta_lake;
 #[cfg(feature = "duckdb")]
 pub mod duckdb;
+#[cfg(feature = "dynamodb")]
+pub mod dynamodb;
 pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
+pub mod iceberg;
 #[cfg(feature = "debezium")]
 pub mod kafka;
 #[cfg(feature = "mssql")]
@@ -55,6 +58,7 @@ pub mod sharepoint;
 pub mod snowflake;
 #[cfg(feature = "spark_connect")]
 pub mod spark_connect;
+pub mod spice_cloud;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod unity_catalog;
@@ -65,6 +69,8 @@ pub mod rate_limit;
 pub mod cdc;
 pub mod delete;
 pub mod graphql;
+#[cfg(feature = "imap")]
+pub mod imap;
 pub mod object;
 pub mod poly;
 pub mod token_provider;
@@ -85,4 +91,9 @@ pub trait ReadWrite: Send + Sync {
         table_reference: TableReference,
         schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
+}
+
+#[async_trait]
+pub trait RefreshableCatalogProvider: CatalogProvider {
+    async fn refresh(&self) -> Result<(), Box<dyn Error + Send + Sync>>;
 }

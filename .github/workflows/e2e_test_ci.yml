@@ -5,15 +5,46 @@ on:
     branches:
       - trunk
       - release-*
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'README.md'
+      - 'Makefile'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/**'
+      - 'version.txt'
+      - '.schema/**'
+      - '.vscode/**'
+      - 'deploy/**'
+      - 'install/**'
+      - 'media/**'
+      - 'monitoring/**'
+      - 'acknowledgements.md'
+      - 'Dockerfile*'
 
   pull_request:
     branches:
       - trunk
     paths-ignore:
+      - '**/*.md'
       - 'docs/**'
       - 'README.md'
+      - 'Makefile'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/**'
       - 'version.txt'
+      - '.schema/**'
+      - '.vscode/**'
+      - 'deploy/**'
+      - 'install/**'
+      - 'media/**'
+      - 'monitoring/**'
       - 'acknowledgements.md'
+      - 'Dockerfile*'
 
   workflow_dispatch:
 
@@ -50,13 +81,6 @@ jobs:
                 target_os: "darwin",
                 target_arch: "aarch64",
                 target_arch_go: "arm64"
-              }, {
-                name: "macOS x64 (Intel)",
-                builder: "macos-14-large",
-                runner: "macos-14-large",
-                target_os: "darwin",
-                target_arch: "x86_64",
-                target_arch_go: "amd64"
               }
             ];
 
@@ -67,7 +91,7 @@ jobs:
     runs-on: ${{ matrix.target.builder }}
     needs: setup-matrix
     env:
-      GOVER: 1.22.0
+      GOVER: 1.23.4
       GOOS: ${{ matrix.target.target_os }}
       GOARCH: ${{ matrix.target.target_arch_go }}
 
@@ -195,6 +219,8 @@ jobs:
 
       - name: Start spice runtime
         working-directory: test_app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           spice run &> spice.log &
           # time to initialize added dataset
@@ -261,11 +287,12 @@ jobs:
       - name: Spice dataset configure
         working-directory: test_app
         run: |
-          echo -e "eth_recent_blocks\neth recent logs\nspice.ai/eth.recent_blocks\ny" | spice dataset configure
+          echo -e "taxi_trips\nnew york taxi trips\nspice.ai/spiceai/quickstart/datasets/taxi_trips\ny" | spice dataset configure
           cat spicepod.yaml
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
@@ -282,7 +309,7 @@ jobs:
       - name: Verify dataset
         uses: ./.github/actions/verify-dataset
         with:
-          name: eth_recent_blocks
+          name: taxi_trips
 
       - name: Stop spice and check logs
         working-directory: test_app
@@ -359,6 +386,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
         working-directory: test_app
         run: |
@@ -531,6 +559,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_PG_PASS: postgres
         working-directory: test_app
         run: |
@@ -549,7 +578,7 @@ jobs:
         with:
           name: test_postgresql_table
           expected-rows-count: ${{ matrix.acceleration.engine != '' && 2 || 3 }}
-      
+
       - name: Verify dataset2
         uses: ./.github/actions/verify-dataset
         with:
@@ -679,11 +708,17 @@ jobs:
           if [[ -n "$ENGINE" ]]; then
             echo "    acceleration:" >> spicepod.yaml
             echo "      enabled: true" >> spicepod.yaml
-            echo "      refresh_sql: SELECT * FROM test_mysql_table WHERE col_bit is NULL or col_bit !=0" >> spicepod.yaml
+            echo "      refresh_sql: SELECT * FROM test_mysql_table WHERE col_Bit is NULL or col_Bit !=0" >> spicepod.yaml
             echo "      engine: $ENGINE" >> spicepod.yaml
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
-           fi
+            fi
+            if [[ "$ENGINE" != 'arrow' ]]; then
+              echo "      primary_key: ID" >> spicepod.yaml
+              echo "      indexes:" >> spicepod.yaml
+              echo "        col_Timestamp: enabled" >> spicepod.yaml
+              echo "        '(col_Timestamp, col_String)': unique" >> spicepod.yaml
+            fi
           fi
 
           # add params if present
@@ -710,13 +745,13 @@ jobs:
           MODE=$(echo '${{ matrix.acceleration.mode }}')
 
           if [[ -n "$ENGINE" ]]; then
-            echo "    time_column: col_timestamp" >> spicepod.yaml
+            echo "    time_column: col_Timestamp" >> spicepod.yaml
             echo "    acceleration:" >> spicepod.yaml
             echo "      enabled: true" >> spicepod.yaml
             echo "      engine: $ENGINE" >> spicepod.yaml
             echo "      refresh_mode: append" >> spicepod.yaml
             echo "      refresh_check_interval: 2s" >> spicepod.yaml
-            echo "      refresh_sql: SELECT * FROM test_mysql_table2 WHERE col_bit is NULL or col_bit !=0" >> spicepod.yaml
+            echo "      refresh_sql: SELECT * FROM test_mysql_table2 WHERE col_Bit is NULL or col_Bit !=0" >> spicepod.yaml
             if [[ -n "$MODE" ]]; then
               echo "      mode: $MODE" >> spicepod.yaml
            fi
@@ -736,6 +771,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_MYSQL_PASS: password
         working-directory: test_app
         run: |
@@ -846,6 +882,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_CLICKHOUSE_PASS: password
         working-directory: test_app
         run: |
@@ -931,6 +968,8 @@ jobs:
 
       - name: Start Spice runtime
         working-directory: duckdb-app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           spice run &> spice.log &
           # time to initialize added dataset
@@ -1041,6 +1080,7 @@ jobs:
 
       - name: Start spice runtime
         env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SPICE_PG_PASS: postgres
         working-directory: test_app
         run: |
@@ -1072,7 +1112,7 @@ jobs:
         with:
           name: eth.recent_blocks
           expected-rows-count: 1
-      
+
       - name: Manually refresh dataset (with params)
         working-directory: test_app
         run: |
@@ -1150,6 +1190,8 @@ jobs:
 
       - name: Start spice runtime
         working-directory: test_app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           spice run &> spice.log &
           # time to initialize added dataset
@@ -1166,7 +1208,7 @@ jobs:
         run: |
           response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
           echo "$response"
-          if echo "$response" | grep -q "x-cache: Miss from spiceai"; then
+          if echo "$response" | grep -q "results-cache-status: MISS"; then
             echo "Cache miss detected as expected"
           else
             echo "Cache miss not detected" >&2
@@ -1178,7 +1220,7 @@ jobs:
         run: |
           response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "select c_name from (select * from customer)")
           echo "$response"
-          if echo "$response" | grep -q "x-cache: Hit from spiceai"; then
+          if echo "$response" | grep -q "results-cache-status: HIT"; then
             echo "Cache hit detected as expected"
           else
             echo "Cache hit not detected" >&2
@@ -1203,7 +1245,7 @@ jobs:
         run: |
           response=$(curl -i -XPOST "127.0.0.1:8090/v1/sql" --data "SELECT c_name FROM (SELECT * FROM customer)")
           echo "$response"
-          if echo "$response" | grep -q "x-cache: Miss from spiceai"; then
+          if echo "$response" | grep -q "results-cache-status: MISS"; then
             echo "Cache miss detected as expected"
           else
             echo "Cache miss not detected" >&2
@@ -1316,30 +1358,40 @@ jobs:
           while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
 
       - name: Run test query (issues)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
           query: 'select number, title, state, labels, updated_at from spiceai.issues order by updated_at desc limit 10;'
 
       - name: Run test query (pulls)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
           query: "select number, title, state, merged_at from spiceai.pulls where state = 'MERGED' order by merged_at desc limit 10;"
 
       - name: Run test query (commits)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
           query: 'select message_head_line, author_name, sha from spiceai.commits order by committed_date desc limit 10;'
 
       - name: Run test query (files)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
           query: 'select name, path, download_url, content from spiceai.files limit 1;'
 
       - name: Run test query (stargazers)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
@@ -1382,14 +1434,16 @@ jobs:
 
       - name: Install mssql-tools
         run: |
+          curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
+          curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
           sudo apt-get update
-          sudo apt-get install -y mssql-tools unixodbc-dev
-          # echo 'export PATH="$PATH:/opt/mssql-tools/bin"' >> ~/.bashrc
+          sudo apt-get install -y mssql-tools18 unixodbc-dev
+          # echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
           # source ~/.bashrc
 
       - name: Setup MS SQL test database
         run: |
-          /opt/mssql-tools/bin/sqlcmd -S localhost -U sa -P 1StrongPwd!! -i ./test/scripts/setup-data-mssql.sql
+          /opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 1StrongPwd!! -C -i ./test/scripts/setup-data-mssql.sql
 
       - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
         uses: actions/download-artifact@v4
@@ -1429,6 +1483,8 @@ jobs:
 
       - name: Start spice runtime
         working-directory: test_app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           spice run &> spice.log &
           # time to accelerate added datasets
@@ -1446,6 +1502,8 @@ jobs:
           name: test_mssql_table
 
       - name: Run test query (issues)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         uses: ./.github/actions/run-query
         with:
           fail-on-error: true
@@ -1461,3 +1519,95 @@ jobs:
             echo "Failures detected in spice.log"
             exit 1
           fi
+
+  databricks_delta_catalog_connector_quickstart:
+    name: 'Test Databricks catalog connector (mode: delta_lake) on ${{ matrix.target.name }}'
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-matrix
+    timeout-minutes: 5
+
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@v4
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Init spice app
+        run: |
+          spice init test_app
+
+      - name: Spice configure
+        working-directory: test_app
+        run: |
+
+          echo "catalogs:" >> spicepod.yaml
+          echo "  - from: databricks:spiceai_sandbox" >> spicepod.yaml
+          echo "    name: db_uc" >> spicepod.yaml
+          echo "    include:" >> spicepod.yaml
+          echo "      - 'tpcds.*'" >> spicepod.yaml
+          echo "      - 'tpch.*'" >> spicepod.yaml
+          echo "    params:" >> spicepod.yaml
+          echo "      mode: delta_lake" >> spicepod.yaml
+          echo "      databricks_aws_access_key_id: \${ secrets:AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }" >> spicepod.yaml
+          echo "      databricks_aws_secret_access_key: \${ secrets:AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }" >> spicepod.yaml
+          echo "      databricks_endpoint: \${ secrets:DATABRICKS_ENDPOINT }" >> spicepod.yaml
+          echo "      databricks_token: \${ secrets:DATABRICKS_TOKEN }" >> spicepod.yaml
+
+
+          cat spicepod.yaml
+
+      - name: Start spice runtime
+        working-directory: test_app
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+        run: |
+          spice run &> spice.log &
+          # time to initialize added datasets
+          sleep 20
+
+      - name: Wait for dataset to be ready
+        working-directory: test_app
+        timeout-minutes: 1
+        run: |
+          while [[ "$(curl -s http://localhost:8090/v1/ready)" != "ready" ]]; do sleep 1; done
+
+      - name: Run test query (tpch)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/run-query
+        with:
+          fail-on-error: true
+          query: 'select * from db_uc.tpch.lineitem limit 1;'
+
+      - name: Run test query (tpcds)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/run-query
+        with:
+          fail-on-error: true
+          query: 'select * from db_uc.tpcds.store limit 1;'
+
+      - name: Stop spice and check logs
+        working-directory: test_app
+        if: always()
+        run: |
+          killall spice || true
+          cat spice.log

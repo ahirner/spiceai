@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -36,10 +36,6 @@ type DatasetSpec struct {
 	Description  string            `json:"description,omitempty" csv:"description" yaml:"description,omitempty"`
 	Params       map[string]string `json:"params,omitempty" csv:"params" yaml:"params,omitempty"`
 	Acceleration *AccelerationSpec `json:"acceleration,omitempty" csv:"acceleration" yaml:"acceleration,omitempty"`
-}
-
-func (d DatasetSpec) ToComponent() Component {
-	return Component{Dataset: d}
 }
 
 type AccelerationSpec struct {

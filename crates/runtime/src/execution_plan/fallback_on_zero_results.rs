@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -191,7 +191,7 @@ impl ExecutionPlan for FallbackOnZeroResultsScanExec {
                 Box::pin(stream_adapter) as SendableRecordBatchStream
             } else {
                 tracing::trace!("FallbackOnZeroResultsScanExec input_stream.next() returned None");
-                tracing::info!("{fallback_msg}");
+                tracing::debug!("{fallback_msg}");
                 metrics::FEDERATED_FALLBACK.add(1, &[KeyValue::new("dataset_name", table_name.to_string())]);
                 let federated_provider = fallback_provider.table_provider().await;
                 let fallback_plan = match federated_provider
@@ -250,7 +250,7 @@ mod metrics {
         METER
             .u64_counter("accelerated_zero_results_federated_fallback")
             .with_description("Number of times the federated table was queried due to the accelerated table returning zero results.")
-            .init()
+            .build()
     });
 }
 

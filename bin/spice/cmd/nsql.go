@@ -1,3 +1,19 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package cmd
 
 import (
@@ -77,21 +93,21 @@ nsql> How much money have I made in each country?
 			os.Exit(1)
 		}
 		if model == "" {
-			models, err := api.GetData[api.Model](rtcontext, "/v1/models?status=true")
+			models, err := api.GetDataSingle[api.ModelResponse](rtcontext, "/v1/models?status=true")
 			if err != nil {
 				slog.Error("listing spiced models", "error", err)
 				os.Exit(1)
 			}
-			if len(models) == 0 {
+			if len(models.Data) == 0 {
 				slog.Error("no models found")
 				os.Exit(1)
 			}
 
 			modelsSelection := []string{}
-			selectedModel := models[0].Name
-			if len(models) > 1 {
-				for _, model := range models {
-					modelsSelection = append(modelsSelection, model.Name)
+			selectedModel := models.Data[0].Id
+			if len(models.Data) > 1 {
+				for _, model := range models.Data {
+					modelsSelection = append(modelsSelection, model.Id)
 				}
 
 				prompt := promptui.Select{
@@ -224,7 +240,6 @@ func init() {
 	nsqlCmd.Flags().String(modelKeyFlag, "", "Model to use for nsql")
 	nsqlCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for nsql (default: http://localhost:8090)")
 	nsqlCmd.Flags().String("user-agent", "", "User agent to use in all requests")
-	nsqlCmd.Flags().String("api-key", "", "The API key to use for authentication")
 
 	RootCmd.AddCommand(nsqlCmd)
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ use datafusion::{
     },
     sql::unparser::dialect::Dialect,
 };
+use datafusion_federation::table_reference::MultiPartTableReference;
 use datafusion_table_providers::sql::sql_provider_datafusion::expr;
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
@@ -73,15 +74,24 @@ pub struct FlightFactory {
     name: &'static str,
     client: FlightClient,
     dialect: Arc<dyn Dialect>,
+    subquery_use_partial_path: bool,
+    extra_compute_context: Option<Arc<str>>,
 }
 
 impl FlightFactory {
     #[must_use]
-    pub fn new(name: &'static str, client: FlightClient, dialect: Arc<dyn Dialect>) -> Self {
+    pub fn new(
+        name: &'static str,
+        client: FlightClient,
+        dialect: Arc<dyn Dialect>,
+        subquery_use_partial_path: bool,
+    ) -> Self {
         Self {
             name,
             client,
             dialect,
+            subquery_use_partial_path,
+            extra_compute_context: None,
         }
     }
 
@@ -95,13 +105,16 @@ impl FlightFactory {
         self.client = self.client.with_metadata(metadata);
         self
     }
-}
 
-#[async_trait]
-impl Read for FlightFactory {
-    async fn table_provider(
+    #[must_use]
+    pub fn with_extra_compute_context(mut self, compute_context: &str) -> Self {
+        self.extra_compute_context = Some(Arc::from(compute_context));
+        self
+    }
+
+    pub async fn table_provider(
         &self,
-        table_reference: TableReference,
+        table_reference: impl Into<MultiPartTableReference>,
         schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let table_provider = match schema {
@@ -111,6 +124,8 @@ impl Read for FlightFactory {
                 table_reference,
                 schema,
                 Arc::clone(&self.dialect),
+                self.subquery_use_partial_path,
+                self.extra_compute_context.as_ref().map(Arc::clone),
             )),
             None => Arc::new(
                 FlightTable::create(
@@ -118,6 +133,8 @@ impl Read for FlightFactory {
                     self.client.clone(),
                     table_reference,
                     Arc::clone(&self.dialect),
+                    self.subquery_use_partial_path,
+                    self.extra_compute_context.as_ref().map(Arc::clone),
                 )
                 .await?,
             ),
@@ -130,6 +147,17 @@ impl Read for FlightFactory {
         );
 
         Ok(table_provider)
+    }
+}
+
+#[async_trait]
+impl Read for FlightFactory {
+    async fn table_provider(
+        &self,
+        table_reference: TableReference,
+        schema: Option<SchemaRef>,
+    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        FlightFactory::table_provider(self, table_reference, schema).await
     }
 }
 
@@ -156,7 +184,8 @@ pub struct FlightTable {
     client: FlightClient,
     schema: SchemaRef,
     dialect: Arc<dyn Dialect>,
-    table_reference: TableReference,
+    table_reference: MultiPartTableReference,
+    subquery_use_partial_path: bool,
 }
 
 impl std::fmt::Debug for FlightTable {
@@ -176,66 +205,77 @@ impl FlightTable {
     pub async fn create(
         name: &'static str,
         client: FlightClient,
-        table_reference: impl Into<TableReference>,
+        table_reference: impl Into<MultiPartTableReference>,
         dialect: Arc<dyn Dialect>,
+        subquery_use_partial_path: bool,
+        extra_compute_context: Option<Arc<str>>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
-        let schema = Self::get_query_schema(
-            client.clone(),
-            &format!("SELECT * FROM {}", table_reference.to_quoted_string()),
-        )
-        .await?;
+        let schema = Self::get_schema(client.clone(), table_reference.clone()).await?;
+
+        let base_context = Self::get_base_context(&client);
+        let join_push_down_context =
+            Self::get_extended_context(&base_context, extra_compute_context);
+
         Ok(Self {
             name,
             client: client.clone(),
             schema,
             table_reference,
             dialect,
-            join_push_down_context: format!(
-                "url={},username={}",
-                client.url(),
-                client.username().unwrap_or_default()
-            ),
+            join_push_down_context,
+            subquery_use_partial_path,
         })
     }
 
     pub fn create_with_schema(
         name: &'static str,
         client: FlightClient,
-        table_reference: impl Into<TableReference>,
+        table_reference: impl Into<MultiPartTableReference>,
         schema: SchemaRef,
         dialect: Arc<dyn Dialect>,
+        subquery_use_partial_path: bool,
+        extra_compute_context: Option<Arc<str>>,
     ) -> Self {
         let table_reference = table_reference.into();
+        tracing::debug!("table_reference={:?}", table_reference);
+
+        let base_context = Self::get_base_context(&client);
+        let join_push_down_context =
+            Self::get_extended_context(&base_context, extra_compute_context);
+
         Self {
             name,
             client: client.clone(),
             schema,
             table_reference,
             dialect,
-            join_push_down_context: format!(
-                "url={},username={:?}",
-                client.url(),
-                client.username().unwrap_or_default()
-            ),
+            join_push_down_context,
+            subquery_use_partial_path,
         }
     }
 
     async fn get_schema(
         client: FlightClient,
-        table_reference: &TableReference,
+        table_reference: impl Into<MultiPartTableReference>,
     ) -> Result<SchemaRef> {
-        let table_paths = match table_reference {
-            TableReference::Bare { table } => vec![table.to_string()],
-            TableReference::Partial { schema, table } => {
-                vec![schema.to_string(), table.to_string()]
-            }
-            TableReference::Full {
-                catalog,
-                schema,
-                table,
-            } => {
-                vec![catalog.to_string(), schema.to_string(), table.to_string()]
+        let table_reference = table_reference.into();
+        let table_paths = match &table_reference {
+            MultiPartTableReference::TableReference(table_reference) => match table_reference {
+                TableReference::Bare { table } => vec![table.to_string()],
+                TableReference::Partial { schema, table } => {
+                    vec![schema.to_string(), table.to_string()]
+                }
+                TableReference::Full {
+                    catalog,
+                    schema,
+                    table,
+                } => {
+                    vec![catalog.to_string(), schema.to_string(), table.to_string()]
+                }
+            },
+            MultiPartTableReference::Multi(parts) => {
+                parts.iter().map(ToString::to_string).collect::<Vec<_>>()
             }
         };
 
@@ -245,15 +285,6 @@ impl FlightTable {
             .context(UnableToGetSchemaSnafu {
                 table: table_reference.to_quoted_string(),
             })?;
-
-        Ok(Arc::new(schema))
-    }
-
-    async fn get_query_schema(client: FlightClient, sql: &str) -> Result<SchemaRef> {
-        let schema = client
-            .get_query_schema(sql.into())
-            .await
-            .context(FlightSnafu)?;
 
         Ok(Arc::new(schema))
     }
@@ -281,6 +312,22 @@ impl FlightTable {
 
     pub fn get_table_reference(&self) -> String {
         self.table_reference.to_string()
+    }
+
+    fn get_base_context(client: &FlightClient) -> String {
+        format!(
+            "url={},username={}",
+            client.url(),
+            client.username().unwrap_or_default()
+        )
+    }
+
+    fn get_extended_context(base_context: &str, compute_context: Option<Arc<str>>) -> String {
+        if let Some(compute_context) = compute_context {
+            format!("{base_context},{compute_context}")
+        } else {
+            base_context.to_string()
+        }
     }
 }
 
@@ -327,7 +374,7 @@ impl TableProvider for FlightTable {
 #[derive(Clone)]
 struct FlightExec {
     projected_schema: SchemaRef,
-    table_reference: TableReference,
+    table_reference: MultiPartTableReference,
     client: FlightClient,
     filters: Vec<Expr>,
     limit: Option<usize>,
@@ -338,7 +385,7 @@ impl FlightExec {
     fn new(
         projections: Option<&Vec<usize>>,
         schema: &SchemaRef,
-        table_reference: &TableReference,
+        table_reference: &MultiPartTableReference,
         client: FlightClient,
         filters: &[Expr],
         limit: Option<usize>,
@@ -438,10 +485,7 @@ impl ExecutionPlan for FlightExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let sql = match self.sql().map_err(to_execution_error) {
-            Ok(sql) => sql,
-            Err(error) => return Err(error),
-        };
+        let sql = self.sql().map_err(to_execution_error)?;
 
         let stream_adapter = RecordBatchStreamAdapter::new(
             self.schema(),

@@ -70,34 +70,6 @@
     },
     "runtime": {
       "description": "Optional runtime configuration",
-      "default": {
-        "auth": null,
-        "cors": {
-          "allowed_origins": [
-            "*"
-          ],
-          "enabled": false
-        },
-        "dataset_load_parallelism": null,
-        "results_cache": {
-          "cache_max_size": null,
-          "enabled": true,
-          "eviction_policy": null,
-          "item_ttl": null
-        },
-        "task_history": {
-          "captured_output": "none",
-          "enabled": true,
-          "retention_check_interval": "15m",
-          "retention_period": "8h"
-        },
-        "telemetry": {
-          "enabled": true,
-          "user_agent_collection": "full"
-        },
-        "tls": null,
-        "tracing": null
-      },
       "allOf": [
         {
           "$ref": "#/definitions/Runtime"
@@ -106,7 +78,6 @@
     },
     "secrets": {
       "description": "Optional spicepod secrets configuration Default value is: ```yaml secrets: - from: env name: env ```",
-      "default": [],
       "type": "array",
       "items": {
         "$ref": "#/definitions/Secret"
@@ -277,6 +248,50 @@
       },
       "additionalProperties": false
     },
+    "ApiKey": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": [
+            "ReadOnly"
+          ],
+          "properties": {
+            "ReadOnly": {
+              "type": "object",
+              "required": [
+                "key"
+              ],
+              "properties": {
+                "key": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": [
+            "ReadWrite"
+          ],
+          "properties": {
+            "ReadWrite": {
+              "type": "object",
+              "required": [
+                "key"
+              ],
+              "properties": {
+                "key": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
     "ApiKeyAuth": {
       "type": "object",
       "required": [
@@ -290,7 +305,7 @@
         "keys": {
           "type": "array",
           "items": {
-            "type": "string"
+            "$ref": "#/definitions/ApiKey"
           }
         }
       },
@@ -299,7 +314,7 @@
     "Auth": {
       "type": "object",
       "properties": {
-        "api-key": {
+        "api_key": {
           "anyOf": [
             {
               "$ref": "#/definitions/ApiKeyAuth"
@@ -490,10 +505,10 @@
     "ComponentOrReference_for_Eval": {
       "anyOf": [
         {
-          "$ref": "#/definitions/ComponentReference"
+          "$ref": "#/definitions/Eval"
         },
         {
-          "$ref": "#/definitions/Eval"
+          "$ref": "#/definitions/ComponentReference"
         }
       ]
     },
@@ -612,27 +627,12 @@
             "null"
           ]
         },
-        "invalid_type_action": {
-          "anyOf": [
-            {
-              "$ref": "#/definitions/InvalidTypeAction"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "metadata": {
           "type": "object",
           "additionalProperties": true
         },
         "mode": {
-          "default": "read",
-          "allOf": [
-            {
-              "$ref": "#/definitions/Mode"
-            }
-          ]
+          "$ref": "#/definitions/Mode"
         },
         "name": {
           "type": "string"
@@ -648,12 +648,7 @@
           ]
         },
         "ready_state": {
-          "default": "on_load",
-          "allOf": [
-            {
-              "$ref": "#/definitions/ReadyState"
-            }
-          ]
+          "$ref": "#/definitions/ReadyState"
         },
         "replication": {
           "anyOf": [
@@ -675,6 +670,32 @@
           "anyOf": [
             {
               "$ref": "#/definitions/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "time_partition_column": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "time_partition_format": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/TimeFormat"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "unsupported_type_action": {
+          "anyOf": [
+            {
+              "$ref": "#/definitions/UnsupportedTypeAction"
             },
             {
               "type": "null"
@@ -804,14 +825,6 @@
         "unique"
       ]
     },
-    "InvalidTypeAction": {
-      "type": "string",
-      "enum": [
-        "error",
-        "warn",
-        "ignore"
-      ]
-    },
     "Mode": {
       "type": "string",
       "enum": [
@@ -916,7 +929,8 @@
         "weights",
         "config",
         "tokenizer",
-        "tokenizerConfig"
+        "tokenizerConfig",
+        "generationConfig"
       ]
     },
     "OnConflictBehavior": {
@@ -1014,7 +1028,6 @@
       "type": "object",
       "properties": {
         "auth": {
-          "default": null,
           "anyOf": [
             {
               "$ref": "#/definitions/Auth"
@@ -1025,17 +1038,7 @@
           ]
         },
         "cors": {
-          "default": {
-            "allowed_origins": [
-              "*"
-            ],
-            "enabled": false
-          },
-          "allOf": [
-            {
-              "$ref": "#/definitions/CorsConfig"
-            }
-          ]
+          "$ref": "#/definitions/CorsConfig"
         },
         "dataset_load_parallelism": {
           "type": [
@@ -1052,41 +1055,13 @@
           }
         },
         "results_cache": {
-          "default": {
-            "cache_max_size": null,
-            "enabled": true,
-            "eviction_policy": null,
-            "item_ttl": null
-          },
-          "allOf": [
-            {
-              "$ref": "#/definitions/ResultsCache"
-            }
-          ]
+          "$ref": "#/definitions/ResultsCache"
         },
         "task_history": {
-          "default": {
-            "captured_output": "none",
-            "enabled": true,
-            "retention_check_interval": "15m",
-            "retention_period": "8h"
-          },
-          "allOf": [
-            {
-              "$ref": "#/definitions/TaskHistory"
-            }
-          ]
+          "$ref": "#/definitions/TaskHistory"
         },
         "telemetry": {
-          "default": {
-            "enabled": true,
-            "user_agent_collection": "full"
-          },
-          "allOf": [
-            {
-              "$ref": "#/definitions/TelemetryConfig"
-            }
-          ]
+          "$ref": "#/definitions/TelemetryConfig"
         },
         "tls": {
           "description": "If set, the runtime will configure all endpoints to use TLS",
@@ -1153,7 +1128,8 @@
     "SpicepodVersion": {
       "type": "string",
       "enum": [
-        "v1beta1"
+        "v1beta1",
+        "v1"
       ]
     },
     "TaskHistory": {
@@ -1185,6 +1161,13 @@
           "default": true,
           "type": "boolean"
         },
+        "properties": {
+          "default": {},
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
         "user_agent_collection": {
           "default": "full",
           "allOf": [
@@ -1203,7 +1186,8 @@
         "timestamptz",
         "unix_seconds",
         "unix_millis",
-        "ISO8601"
+        "ISO8601",
+        "date"
       ]
     },
     "TlsConfig": {
@@ -1297,6 +1281,15 @@
         }
       },
       "additionalProperties": false
+    },
+    "UnsupportedTypeAction": {
+      "type": "string",
+      "enum": [
+        "error",
+        "warn",
+        "ignore",
+        "string"
+      ]
     },
     "UserAgentCollection": {
       "type": "string",

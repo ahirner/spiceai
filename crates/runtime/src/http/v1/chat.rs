@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,7 +18,15 @@ use core::time;
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use crate::{http::traceparent::override_task_history_with_traceparent, model::LLMModelStore};
-use async_openai::types::{ChatCompletionResponseStream, CreateChatCompletionRequest};
+#[cfg(feature = "openapi")]
+use async_openai::types::CreateChatCompletionResponse;
+use async_openai::{
+    error::OpenAIError,
+    types::{
+        ChatChoice, ChatCompletionResponseMessage, ChatCompletionResponseStream,
+        CreateChatCompletionRequest,
+    },
+};
 use async_stream::stream;
 use axum::{
     http::{HeaderMap, StatusCode},
@@ -33,6 +41,67 @@ use serde::Serialize;
 use tokio::sync::RwLock;
 use tracing::{Instrument, Span};
 
+/// Create Chat Completion
+///
+/// Creates a model response for the given chat conversation.
+#[cfg_attr(feature = "openapi", utoipa::path(
+    post,
+    path = "/v1/chat/completions",
+    operation_id = "post_chat_completions",
+    tag = "AI",
+    request_body(
+        description = "Create a chat completion request using a language model.",
+        content((
+            CreateChatCompletionRequest = "application/json",
+            example = json!({
+                "model": "gpt-4o",
+                "messages": [
+                    { "role": "developer", "content": "You are a helpful assistant." },
+                    { "role": "user", "content": "Hello!" }
+                ],
+                "stream": false
+            })
+        ))
+    ),
+    responses(
+        (status = 200, description = "Chat completion generated successfully", content((
+            CreateChatCompletionResponse = "application/json",
+            example = json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "created": 1_677_652_288,
+                "model": "gpt-4o-mini",
+                "system_fingerprint": "fp_44709d6fcb",
+                "choices": [{
+                    "index": 0,
+                    "message": {
+                        "role": "assistant",
+                        "content": "\n\nHello there, how may I assist you today?"
+                    },
+                    "logprobs": null,
+                    "finish_reason": "stop"
+                }],
+                "usage": {
+                    "prompt_tokens": 9,
+                    "completion_tokens": 12,
+                    "total_tokens": 21,
+                    "completion_tokens_details": {
+                        "reasoning_tokens": 0,
+                        "accepted_prediction_tokens": 0,
+                        "rejected_prediction_tokens": 0
+                    }
+                }
+            })
+        ))),
+        (status = 404, description = "The specified model was not found"),
+        (status = 500, description = "An internal server error occurred while processing the chat completion", content((
+            serde_json::Value = "application/json",
+            example = json!({
+                "error": "An internal server error occurred while processing the chat completion."
+            })
+        )))
+    )
+))]
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
     headers: HeaderMap,
@@ -61,30 +130,34 @@ pub(crate) async fn post(
                         Err(e) => {
                             tracing::error!(target: "task_history", parent: &span_clone, "{e}");
                             tracing::error!("Error from v1/chat: {e}");
-                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+
+                            openai_error_to_response(e)
                         }
                     }
                 } else {
                     match model.chat_request(req).await {
                         Ok(response) => {
-                            let preview = response
+                            if let Some(ChatChoice{message: ChatCompletionResponseMessage{
+                                content: Some(content),..
+                            },..}) = response
                                 .choices
-                                .first()
-                                .map(|s| serde_json::to_string(s).unwrap_or_default())
-                                .unwrap_or_default();
+                                .first() {
+                                    tracing::info!(target: "task_history", parent: &span_clone, captured_output = %content);
+                                }
+                                tracing::info!(target: "task_history", parent: &span_clone,  id = %response.id, "labels");
 
-                            tracing::info!(target: "task_history", parent: &span_clone, captured_output = %preview);
                             Json(response).into_response()
                         }
                         Err(e) => {
                             tracing::error!(target: "task_history", parent: &span_clone, "{e}");
                             tracing::error!("Error from v1/chat: {e}");
-                            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+
+                            openai_error_to_response(e)
                         }
                     }
                 }
             }
-            None => StatusCode::NOT_FOUND.into_response(),
+            None => (StatusCode::NOT_FOUND, format!("model '{model_id}' not found")).into_response(),
         }
     }
     .instrument(span)
@@ -99,9 +172,13 @@ fn create_sse_response(
 ) -> Response {
     Sse::new(Box::pin(stream! {
         let mut chat_output = String::new();
+        let mut id: Option<String> = None;
         while let Some(msg) = strm.next().instrument(span.clone()).await {
             match msg {
                 Ok(resp) => {
+                    if id.is_none() {
+                        id = Some(resp.id.clone());
+                    }
                     if let Some(choice) = resp.choices.first() {
                         if let Some(intermediate_chat_output) = &choice.delta.content {
                             chat_output.push_str(intermediate_chat_output);
@@ -121,6 +198,9 @@ fn create_sse_response(
             }
         };
         tracing::info!(target: "task_history", parent: &span, captured_output = %chat_output);
+        if let Some(id) = id {
+            tracing::info!(target: "task_history", parent: &span, id = %id, "labels");
+        }
         drop(span);
     }))
     .keep_alive(KeepAlive::new().interval(keep_alive_interval))
@@ -156,5 +236,33 @@ impl OpenaiErrorEvent {
                 message: err.into(),
             },
         }
+    }
+}
+
+/// Converts `OpenAI` errors to HTTP responses
+/// Preserve the original `OpenAI` error structure to maintain compatibility with `OpenAI` documentation
+#[must_use]
+pub fn openai_error_to_response(e: OpenAIError) -> Response {
+    match e {
+        OpenAIError::InvalidArgument(_) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        OpenAIError::ApiError(api_error) => {
+            let error_response = serde_json::json!({
+                "message": api_error.message,
+                "type": api_error.r#type,
+                "param": api_error.param,
+                "code": api_error.code
+            });
+
+            let status_code = match api_error.code.as_deref() {
+                Some("invalid_request_error") => StatusCode::BAD_REQUEST,
+                Some("invalid_api_key") => StatusCode::UNAUTHORIZED,
+                Some("insufficient_quota") => StatusCode::PAYMENT_REQUIRED,
+                Some("rate_limit_exceeded") => StatusCode::TOO_MANY_REQUESTS,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+
+            (status_code, Json(error_response)).into_response()
+        }
+        _ => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }

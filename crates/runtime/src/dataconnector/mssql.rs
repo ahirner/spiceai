@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,13 +28,13 @@ use std::{any::Any, future::Future};
 use tiberius::{Config, EncryptionLevel};
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams,
-    DataConnectorResult, ParameterSpec, Parameters, UnableToGetReadProviderSnafu,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
+    ParameterSpec, Parameters, UnableToGetReadProviderSnafu,
 };
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: '{parameter}'. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/mssql#configuration"))]
+    #[snafu(display("Missing required parameter: '{parameter}'. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/mssql#configuration"))]
     MissingParameter { parameter: String },
 
     #[snafu(display("Failed to connect to the MS SQL Server.\nVerify your connection configuration, and try again.\n{source}"))]
@@ -43,22 +43,22 @@ pub enum Error {
     #[snafu(display("Invalid connection string.\nVerify the connection string is valid, and try again.\n{source}"))]
     InvalidConnectionStringError { source: tiberius::error::Error },
 
-    #[snafu(display("Invalid value provided for the 'port' parameter: {port}.\nSpecify a valid port, and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/mssql#configuration"))]
+    #[snafu(display("Invalid value provided for the 'port' parameter: {port}.\nSpecify a valid port, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/mssql#configuration"))]
     FailedToParsePort { port: String },
 
-    #[snafu(display("Invalid value provided for parameter '{parameter}'\nSpecify a valid value, and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/mssql#configuration"))]
+    #[snafu(display("Invalid value provided for parameter '{parameter}'\nSpecify a valid value, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/mssql#configuration"))]
     InvalidParameterValue { parameter: String },
 }
 
 const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("connection_string").secret(),
-    ParameterSpec::connector("username").secret(),
-    ParameterSpec::connector("password").secret(),
-    ParameterSpec::connector("host"),
-    ParameterSpec::connector("port"),
-    ParameterSpec::connector("database"),
-    ParameterSpec::connector("encrypt"),
-    ParameterSpec::connector("trust_server_certificate"),
+    ParameterSpec::component("connection_string").secret(),
+    ParameterSpec::component("username").secret(),
+    ParameterSpec::component("password").secret(),
+    ParameterSpec::component("host"),
+    ParameterSpec::component("port"),
+    ParameterSpec::component("database"),
+    ParameterSpec::component("encrypt"),
+    ParameterSpec::component("trust_server_certificate"),
 ];
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -165,9 +165,13 @@ impl SqlServerFactory {
 }
 
 impl DataConnectorFactory for SqlServerFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             Ok(Arc::new(SqlServer::new(&params.parameters).await?) as Arc<dyn DataConnector>)

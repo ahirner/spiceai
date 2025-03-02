@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,9 @@ limitations under the License.
 
 use std::sync::{Arc, LazyLock, OnceLock};
 
-use opentelemetry::metrics::{noop::NoopMeterProvider, Meter, MeterProvider};
+use opentelemetry::metrics::{Meter, MeterProvider};
+
+use crate::noop::NoopMeterProvider;
 
 pub(crate) static METER_PROVIDER_ONCE: OnceLock<Arc<dyn MeterProvider + Send + Sync>> =
     OnceLock::new();

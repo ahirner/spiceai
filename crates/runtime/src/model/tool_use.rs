@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -78,7 +78,7 @@ impl ToolUsingChat {
                 function: FunctionObject {
                     strict: t.strict(),
                     name: t.name().to_string(),
-                    description: t.description().map(ToString::to_string),
+                    description: t.description().map(|d| d.to_string()),
                     parameters: t.parameters(),
                 },
             })
@@ -151,7 +151,10 @@ impl ToolUsingChat {
                     .await
                 {
                     Ok(v) => v,
-                    Err(e) => Value::String(format!("Error calling tool {}. Error: {e}", t.name())),
+                    Err(e) => Value::String(format!(
+                        "Failed to call the tool {}.\nAn error occurred: {e}",
+                        t.name()
+                    )),
                 }
             }
             None => Value::Null,
@@ -253,16 +256,6 @@ impl ToolUsingChat {
             let inner_req = self.add_runtime_tools(&req);
 
             let resp = self.inner_chat.chat_request(inner_req.clone()).await?;
-            let proceed_with_tools = resp.choices.first().is_some_and(|c| {
-                c.finish_reason
-                    .is_some_and(|f| matches!(f, FinishReason::ToolCalls))
-            });
-
-            // Return reason was not to call tools, so return early.
-            if !proceed_with_tools {
-                return Ok(resp);
-            }
-
             let usage = resp.usage.clone();
 
             let tools_used = resp
@@ -399,9 +392,15 @@ fn create_new_recursive_req(
 ) -> CreateChatCompletionRequest {
     let mut new_req = req.clone();
     new_req.messages = new_msg;
-    if let Some(ChatCompletionToolChoiceOption::Named(t)) = new_req.tool_choice {
-        tracing::debug!("Not recursively using tool_choice named={t:?} in subsequent calls.");
+
+    // Remove tool_choice if it is named (since it was just used), and set it to `Auto`.
+    // This also includes when a tool_choice is not set. It could be set as a default (in spicepod.yaml via openai_tool_choice), but will appear as None here. We want to set it to Auto here to ensure named tool is used once and does not cause infinite tool use.
+    if matches!(
+        new_req.tool_choice,
+        Some(ChatCompletionToolChoiceOption::Named(_)) | None
+    ) {
         // Auto is default when tools exist.
+        tracing::debug!("Not recursively using named tool_choice in subsequent calls.");
         new_req.tool_choice = Some(ChatCompletionToolChoiceOption::Auto);
     }
 
@@ -537,12 +536,11 @@ fn make_a_stream(
                         // TODO: only concatenate, spiced tools
                         if let Some(ref tool_calls) = chat_choice.delta.tool_calls {
                             for tool_call_chunk in tool_calls {
-                                let key = if let Ok(index) = chat_choice.index.try_into() {
-                                    (index, tool_call_chunk.index)
-                                } else {
+                                let key: (i32, i32) = if let (Ok(index), Ok(tool_call_index)) = (chat_choice.index.try_into(), tool_call_chunk.index.try_into()) { (index, tool_call_index) } else {
                                     tracing::error!(
-                                        "chat_choice.index value {} is too large to fit in an i32",
-                                        chat_choice.index
+                                        "chat_choice.index value {} or tool_call_chunk.index value {} is too large to fit in an i32",
+                                        chat_choice.index,
+                                        tool_call_chunk.index
                                     );
                                     return;
                                 };
@@ -675,6 +673,15 @@ fn make_a_stream(
                         let mut resp2 = response.clone();
                         resp2.choices = finished_choices;
                         if let Err(e) = sender_clone.send(Ok(resp2)).await {
+                            if !sender_clone.is_closed() {
+                                tracing::error!("Error sending error: {}", e);
+                            }
+                        }
+                    }
+
+                    // When there are no [`ChatChoiceStream`]s, but the model has usage, send the response (with no choices).
+                    if response.choices.is_empty() && response.usage.is_some() {
+                        if let Err(e) = sender_clone.send(Ok(response)).await {
                             if !sender_clone.is_closed() {
                                 tracing::error!("Error sending error: {}", e);
                             }

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,8 +27,8 @@ use std::{any::Any, future::Future, pin::Pin, sync::Arc};
 use url::Url;
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorParams, InvalidConfigurationSnafu, ParameterSpec, Parameters,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    InvalidConfigurationSnafu, ParameterSpec, Parameters,
 };
 
 pub struct GraphQL {
@@ -52,16 +52,16 @@ impl GraphQLFactory {
 
 const PARAMETERS: &[ParameterSpec] = &[
     // Connector parameters
-    ParameterSpec::connector("auth_token")
+    ParameterSpec::component("auth_token")
         .description("The bearer token to use in the GraphQL requests.")
         .secret(),
-    ParameterSpec::connector("auth_user")
+    ParameterSpec::component("auth_user")
         .description("The username to use for HTTP Basic Auth.")
         .secret(),
-    ParameterSpec::connector("auth_pass")
+    ParameterSpec::component("auth_pass")
         .description("The password to use for HTTP Basic Auth.")
         .secret(),
-    ParameterSpec::connector("query")
+    ParameterSpec::component("query")
         .description("The GraphQL query to execute.")
         .required(),
     // Runtime parameters
@@ -73,9 +73,13 @@ const PARAMETERS: &[ParameterSpec] = &[
 ];
 
 impl DataConnectorFactory for GraphQLFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let graphql = GraphQL {
@@ -126,7 +130,7 @@ impl GraphQL {
         let endpoint = Url::parse(dataset.path()).map_err(Into::into).context(
             super::InvalidConfigurationSnafu {
                 dataconnector: "graphql",
-                message: "The specified URL in the dataset 'from' is not valid. Ensure the URL is valid and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/graphql",
+                message: "The specified URL in the dataset 'from' is not valid. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/graphql",
                 connector_component: ConnectorComponent::from(dataset),
             },
         )?;
@@ -143,7 +147,7 @@ impl GraphQL {
             .boxed()
             .context(InvalidConfigurationSnafu {
                 dataconnector: "graphql",
-                message: "The `unnest_depth` parameter must be a positive integer.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/graphql#configuration",
+                message: "The `unnest_depth` parameter must be a positive integer.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/graphql#configuration",
                 connector_component: ConnectorComponent::from(dataset),
             })?;
 
@@ -189,7 +193,7 @@ impl DataConnector for GraphQL {
         let query = self.params.get("query").expose().ok_or_else(|p| {
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "graphql",
-                message: format!("A required parameter was missing: `{}`.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/graphql#configuration", p.0),
+                message: format!("A required parameter was missing: `{}`.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/graphql#configuration", p.0),
                 connector_component: ConnectorComponent::from(dataset),
             }
             .build()
