@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -30,6 +30,14 @@ pub struct DatabricksDelta {
     endpoint: Endpoint,
     token: SecretString,
     storage_options: HashMap<String, SecretString>,
+}
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("A storage location for the Databricks table '{table_reference}' must be provided.\nSpecify a storage location, and try again."))]
+    TableDoesNotHaveStorageLocation { table_reference: TableReference },
+    #[snafu(display("Failed to find the Databricks table '{table_reference}'.\nVerify the table exists, and try again."))]
+    TableDoesNotExist { table_reference: TableReference },
 }
 
 impl DatabricksDelta {
@@ -85,13 +93,10 @@ impl DatabricksDelta {
             if let Some(storage_location) = table.storage_location {
                 Ok(storage_location)
             } else {
-                Err(
-                    format!("Databricks table {table_reference} does not have a storage location")
-                        .into(),
-                )
+                Err(Error::TableDoesNotHaveStorageLocation { table_reference }.into())
             }
         } else {
-            Err(format!("Databricks table {table_reference} does not exist").into())
+            Err(Error::TableDoesNotExist { table_reference }.into())
         }
     }
 }

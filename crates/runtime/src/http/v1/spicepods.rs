@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -59,9 +59,9 @@ pub struct SpicepodCsvRow {
     pub dependencies_count: usize,
 }
 
-/// Get a list of spicepods and their details.
+/// List Spicepods
 ///
-/// This endpoint returns a list of all spicepods in the system. In CSV format, it will return a summarised form.
+/// Get a list of spicepods and their details. In CSV format, it will return a summarised form.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/spicepods",

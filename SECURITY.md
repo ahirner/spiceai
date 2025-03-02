@@ -2,13 +2,19 @@
 
 ## Supported Versions
 
-As Spice.ai is in active development (release candidate), only the latest version is supported for security updates.
+Spice.ai has released 1.0-stable 🎉
 
-| Version    | Supported          |
-| ---------- | ------------------ |
-| 1.0.0-rc.2 | :white_check_mark: |
-| 1.0.0-rc.1 | :x:                |
-| < 1.0.0    | :x:                |
+In the latest major version, the last 2 minor versions are supported for security updates.
+
+| Version        | Supported          |
+| -------------- | ------------------ |
+| 1.0.4          | :white_check_mark: |
+| 1.0.3          | :white_check_mark: |
+| 1.0.2          | :white_check_mark: |
+| 1.0.1          | :white_check_mark: |
+| 1.0.0          | :white_check_mark: |
+| 1.0.0-rc.[1-5] | :x:                |
+| < 1.0.0        | :x:                |
 
 ## Reporting a Vulnerability
 

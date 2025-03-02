@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,9 +17,9 @@ limitations under the License.
 use super::Error;
 use super::ModelSource;
 use async_trait::async_trait;
-use regex::Regex;
 use secrecy::{ExposeSecret, Secret, SecretString};
 use snafu::prelude::*;
+use spicepod::component::model::HUGGINGFACE_PATH_REGEX;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::sync::Arc;
@@ -36,7 +36,7 @@ impl ModelSource for Huggingface {
 
         let Some(name) = name else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "Name is required",
+                reason: "The 'name' parameter is required, and was not provided.",
             }
             .build());
         };
@@ -61,22 +61,16 @@ impl ModelSource for Huggingface {
 
         let Some(remote_path) = remote_path else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "From is required",
+                reason: "The 'from' parameter is required, and was not provided.",
             }
             .build());
         };
 
-        let Ok(re) = Regex::new(
-            r"\A(huggingface:)(huggingface\.co\/)?(?<org>[\w\-]+)\/(?<model>[\w\-]+)(:(?<revision>[\w\d\-\.]+))?\z",
-        ) else {
+        let Some(caps) = HUGGINGFACE_PATH_REGEX.captures(remote_path.as_str()) else {
             return Err(super::UnableToLoadConfigSnafu {
-                reason: "Invalid regex",
-            }
-            .build());
-        };
-        let Some(caps) = re.captures(remote_path.as_str()) else {
-            return Err(super::UnableToLoadConfigSnafu {
-                reason: format!("from is invalid for huggingface source: {remote_path}"),
+                reason: format!(
+                    "The 'from' parameter is invalid for a huggingface source: {remote_path}.\nFor details, visit: https://spiceai.org/docs/components/models/huggingface#from-format"
+                ),
             }
             .build());
         };

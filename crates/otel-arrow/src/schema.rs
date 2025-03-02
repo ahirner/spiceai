@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -141,7 +141,7 @@ pub(crate) fn attribute_struct_fields() -> Vec<Field> {
         Field::new("key", DataType::Utf8, false),
         // AttributeValueType is the Rust enum corresponding to the UInt8 `type`.
         Field::new("type", DataType::UInt8, false),
-        Field::new("str", DataType::Utf8, false),
+        Field::new("str", DataType::Utf8, true),
         Field::new("int", DataType::Int64, true),
         Field::new("double", DataType::Float64, true),
         Field::new("bool", DataType::Boolean, true),

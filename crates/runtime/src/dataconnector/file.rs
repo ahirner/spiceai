@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,8 +16,10 @@ limitations under the License.
 
 use crate::accelerated_table::AcceleratedTable;
 use crate::component::dataset::Dataset;
+use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
 use crate::dataconnector::ConnectorComponent;
 use async_trait::async_trait;
+
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use snafu::prelude::*;
 use std::future::Future;
@@ -31,7 +33,7 @@ use std::{any::Any, env};
 use tokio::sync::mpsc;
 use url::Url;
 
-use super::DataConnectorParams;
+use super::ConnectorParams;
 use super::{
     listing::ListingTableConnector, DataConnector, DataConnectorFactory, DataConnectorResult,
     InvalidConfigurationSnafu, ParameterSpec, Parameters,
@@ -62,31 +64,14 @@ impl FileFactory {
     }
 }
 
-const PARAMETERS: &[ParameterSpec] = &[
-    // Common listing table parameters
-    ParameterSpec::runtime("file_format"),
-    ParameterSpec::runtime("file_extension"),
-    ParameterSpec::runtime("schema_infer_max_records")
-        .description("Set a limit in terms of records to scan to infer the schema."),
-    ParameterSpec::runtime("csv_has_header")
-        .description("Set true to indicate that the first line is a header."),
-    ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
-    ParameterSpec::runtime("csv_escape").description("The escape character in a row."),
-    ParameterSpec::runtime("csv_schema_infer_max_records")
-        .description("Set a limit in terms of records to scan to infer the schema.")
-        .deprecated("use 'schema_infer_max_records' instead"),
-    ParameterSpec::runtime("csv_delimiter")
-        .description("The character separating values within a row."),
-    ParameterSpec::runtime("file_compression_type")
-        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
-    ParameterSpec::runtime("hive_partitioning_enabled")
-        .description("Enable partitioning using hive-style partitioning from the folder structure. Defaults to false."),
-];
-
 impl DataConnectorFactory for FileFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             Ok(Arc::new(File {
@@ -100,7 +85,7 @@ impl DataConnectorFactory for FileFactory {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        PARAMETERS
+        LISTING_TABLE_PARAMETERS
     }
 }
 
@@ -142,7 +127,7 @@ impl ListingTableConnector for File {
             .boxed()
             .context(InvalidConfigurationSnafu {
                 dataconnector: "file".to_string(),
-                message: "The specified file path created an invalid URL. Check your file path and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/file".to_string(),
+                message: "The specified file path created an invalid URL. Check your file path and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/file".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
             })
     }

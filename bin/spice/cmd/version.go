@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -26,6 +26,7 @@ import (
 
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
+	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/github"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
@@ -107,10 +108,26 @@ func checkLatestCliReleaseVersion() error {
 
 	cliVersion := version.Version()
 
-	cliIsPreRelease := strings.HasPrefix(cliVersion, "local") || strings.Contains(cliVersion, "rc")
+	cliIsPreRelease := strings.HasPrefix(cliVersion, "local") || strings.Contains(cliVersion, "build")
 
 	if !cliIsPreRelease && semver.Compare(cliVersion, latestReleaseVersion) < 0 {
-		slog.Info(fmt.Sprintf("\nCLI version %s is now available!\nTo upgrade, run \"spice upgrade\".\n", aurora.BrightGreen(latestReleaseVersion)))
+		spicePathVar, spicePath, err := rtcontext.SpicePath()
+		if err != nil {
+			return err
+		}
+		switch spicePathVar {
+		case constants.StandardInstall:
+			slog.Info(fmt.Sprintf("\nCLI version %s is now available!\nTo upgrade, run \"spice upgrade\".\n", aurora.BrightGreen(latestReleaseVersion)))
+		case constants.BrewInstall:
+			slog.Info(fmt.Sprintf("\nCLI version %s is now available!\nTo upgrade, run \"brew upgrade spiceai/spiceai/spice\".\n", aurora.BrightGreen(latestReleaseVersion)))
+		case constants.OtherInstall:
+			msg := fmt.Sprintf("\nCLI version %s is now available!\n"+
+				"Spice CLI found at non-standard location '%s'. To upgrade:\n"+
+				"1. Remove current installation\n"+
+				"2. Refer to https://spiceai.org/docs/installation to reinstall spice\n"+
+				"3. Try upgrade again", aurora.BrightGreen(latestReleaseVersion), spicePath)
+			slog.Info(msg)
+		}
 	}
 
 	return nil

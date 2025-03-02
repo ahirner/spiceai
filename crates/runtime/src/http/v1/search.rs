@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::embeddings::vector_search::{
-    to_matches_sorted, Match, SearchRequest, SearchRequestJson, VectorSearch,
+    self, to_matches_sorted, Match, SearchRequest, SearchRequestAIJson, SearchRequestHTTPJson,
+    VectorSearch,
 };
 use axum::{
     http::StatusCode,
@@ -34,7 +35,9 @@ struct SearchResponse {
     pub duration_ms: u128,
 }
 
-/// Perform a vector search operation on a dataset.
+/// Search
+///
+/// Perform a vector similarity search (VSS) operation on a dataset.
 ///
 /// The search operation will return the most relevant matches based on cosine similarity with the input `text`.
 /// The datasets queries should have an embedding column, and the appropriate embedding model loaded.
@@ -45,15 +48,15 @@ struct SearchResponse {
     tag = "SQL",
     request_body(
         description = "Search request parameters",
-        required = true,
         content((
-            SearchRequestJson = "application/json",
+            SearchRequestHTTPJson = "application/json",
                 example = json!({
                     "datasets": ["app_messages"],
                     "text": "Tokyo plane tickets",
                     "where": "user=1234321",
                     "additional_columns": ["timestamp"],
-                    "limit": 3
+                    "limit": 3,
+                    "keywords": ["plane", "tickets"]
                 })
             )
         )
@@ -102,12 +105,13 @@ struct SearchResponse {
 ))]
 pub(crate) async fn post(
     Extension(vs): Extension<Arc<VectorSearch>>,
-    Json(payload): Json<SearchRequestJson>,
+    Json(payload): Json<SearchRequestHTTPJson>,
 ) -> Response {
     let start_time = Instant::now();
 
     // For now, force the user to specify which data.
     if payload
+        .base
         .datasets
         .as_ref()
         .is_some_and(std::vec::Vec::is_empty)
@@ -115,13 +119,13 @@ pub(crate) async fn post(
         return (StatusCode::BAD_REQUEST, "No data sources provided").into_response();
     }
 
-    if payload.limit.is_some_and(|limit| limit == 0) {
+    if payload.base.limit.is_some_and(|limit| limit == 0) {
         return (StatusCode::BAD_REQUEST, "Limit must be greater than 0").into_response();
     }
 
-    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = %payload.text);
+    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = %payload.base.text);
 
-    let search_request = match SearchRequest::try_from(payload) {
+    let search_request = match SearchRequest::try_from(SearchRequestAIJson::from(payload)) {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(target: "task_history", parent: &span, "{e}");
@@ -142,8 +146,14 @@ pub(crate) async fn post(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },
         Err(e) => {
+            let error_type = match e {
+                vector_search::Error::NoTablesWithEmbeddingsFound {}
+                | vector_search::Error::CannotVectorSearchDataset { .. } => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+
             tracing::error!(target: "task_history", parent: &span, "{e}");
-            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+            (error_type, e.to_string()).into_response()
         }
     }
 }

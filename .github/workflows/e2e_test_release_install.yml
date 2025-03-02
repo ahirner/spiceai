@@ -23,10 +23,6 @@ jobs:
             runner: macos-14
             target_os: darwin
             target_arch: aarch64
-          - name: macOS x64 (Intel)
-            runner: macos-13
-            target_os: darwin
-            target_arch: x86_64
           - name: Windows x64
             runner: windows-latest
             target_os: windows
@@ -57,10 +53,11 @@ jobs:
     
     - name: install Spice (Windows)
       if : matrix.target_os == 'windows'
+      shell: pwsh
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
-        curl -L "https://install.spiceai.org/Install.ps1" -o Install.ps1 && PowerShell -ExecutionPolicy Bypass -File ./Install.ps1
+        iex ((New-Object System.Net.WebClient).DownloadString("https://install.spiceai.org/Install.ps1")) 
 
     - name: add Spice bin to PATH
       if : matrix.target_os != 'windows'
@@ -79,6 +76,8 @@ jobs:
 
     - name: start Spice runtime
       if: matrix.target_os != 'windows'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         spice init app
         cd app
@@ -86,6 +85,8 @@ jobs:
   
     - name: start Spice runtime (Windows)
       if: matrix.target_os == 'windows'
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       run: |
         spice init app
         cd app
@@ -125,13 +126,14 @@ jobs:
         cli_version=$(echo "$version" | grep 'CLI version:' | cut -d':' -f2 | xargs)
         runtime_version=$(echo "$version" | grep 'Runtime version:' | cut -d':' -f2 | xargs)
 
-        release_version=$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        release_version="$(curl -s "https://api.github.com/repos/spiceai/spiceai/releases/latest" -H "Authorization: token $GITHUB_TOKEN" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')+models"
         
         echo "Release Version: $release_version"
         echo "CLI Version: $cli_version"
         echo "Runtime Version: $runtime_version"
 
-        if [ "$cli_version" != "$release_version" ]; then
+        # Release version contains '+models' suffix, so we need to add it to the cli_version for comparison
+        if [ "$cli_version+models" != "$release_version" ]; then
           echo "CLI version $cli_version does not match the latest release version $release_version."
           exit 1
         fi
@@ -162,9 +164,12 @@ jobs:
 
         $response = Invoke-WebRequest -Uri "https://api.github.com/repos/spiceai/spiceai/releases/latest" -UseBasicParsing -Headers $headers
         $releaseVersion = ($response.Content | ConvertFrom-Json).tag_name
+        # Append "+models" to the release version to match default runtime
+        $releaseVersion = "$releaseVersion+models"
         Write-Host "Release Version: $releaseVersion"
 
-        if ($cliVersion -ne $releaseVersion) {
+        # Release version contains '+models' suffix, so we need to add it to the cliVersion for comparison
+        if ("$cliVersion+models" -ne $releaseVersion) {
           Write-Host "CLI version $cliVersion does not match the latest release version $releaseVersion."
           exit 1
         }

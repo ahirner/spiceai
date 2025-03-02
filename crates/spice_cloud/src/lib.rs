@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,12 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
-use catalog::SpiceAICatalogProvider;
-use datafusion::{catalog::CatalogProvider, datasource::TableProvider, sql::TableReference};
-use globset::GlobSet;
+use datafusion::{datasource::TableProvider, sql::TableReference};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use snafu::prelude::*;
@@ -34,9 +32,7 @@ use runtime::{
         Dataset, Mode, TimeFormat,
     },
     dataaccelerator::{self, create_accelerator_table},
-    dataconnector::{
-        create_new_connector, DataConnector, DataConnectorError, DataConnectorParamsBuilder,
-    },
+    dataconnector::{create_new_connector, ConnectorParamsBuilder, DataConnectorError},
     extension::{Error as ExtensionError, Extension, ExtensionFactory, ExtensionManifest, Result},
     federated_table::FederatedTable,
     secrets::{ExposeSecret, Secrets},
@@ -44,9 +40,6 @@ use runtime::{
     status, Runtime,
 };
 use tokio::sync::RwLock;
-
-pub mod catalog;
-pub mod schema;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -156,27 +149,12 @@ impl SpiceExtension {
         Ok(response)
     }
 
-    async fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, Error> {
-        let client = reqwest::Client::new();
-        let response = client
-            .get(format!("{}{path}", self.spice_http_url()))
-            .header("X-API-Key", &self.api_key)
-            .send()
-            .await
-            .context(UnableToConnectToSpiceCloudSnafu)?;
-
-        let response: T = response
-            .json()
-            .await
-            .context(UnableToConnectToSpiceCloudSnafu)?;
-
-        Ok(response)
-    }
-
     async fn register_runtime_metrics_table(&self, runtime: &Runtime, from: String) -> Result<()> {
         let retention = Retention::new(
             Some("timestamp".to_string()),
             Some(TimeFormat::UnixSeconds),
+            None,
+            None,
             Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
             Some(Duration::from_secs(300)),  // run retention every 5 minutes
             true,
@@ -269,20 +247,6 @@ impl Extension for SpiceExtension {
 
         Ok(())
     }
-
-    async fn catalog_provider(
-        &self,
-        data_connector: Arc<dyn DataConnector>,
-        filters: Option<GlobSet>,
-    ) -> Option<Result<Arc<dyn CatalogProvider>>> {
-        Some(
-            SpiceAICatalogProvider::try_new(self, data_connector, filters)
-                .await
-                .map(|c| Arc::new(c) as Arc<dyn CatalogProvider>)
-                .boxed()
-                .map_err(|source| ExtensionError::UnableToGetCatalogProvider { source }),
-        )
-    }
 }
 
 #[derive(Clone, Default)]
@@ -318,8 +282,8 @@ async fn get_spiceai_table_provider(
     dataset.mode = Mode::ReadWrite;
     dataset.replication = Some(Replication { enabled: true });
 
-    let params = DataConnectorParamsBuilder::new(name.into(), (&dataset).into())
-        .without_runtime(HashMap::new(), secrets)
+    let params = ConnectorParamsBuilder::new(name.into(), (&dataset).into())
+        .build(secrets)
         .await
         .context(UnableToCreateDataConnectorSnafu)?;
 
@@ -370,6 +334,7 @@ pub async fn create_synced_internal_accelerated_table(
         runtime_status,
         table_reference.clone(),
         federated_table,
+        "spice.ai".to_string(),
         accelerated_table_provider,
         refresh,
     );

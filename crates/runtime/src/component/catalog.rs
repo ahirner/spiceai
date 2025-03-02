@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ use snafu::prelude::*;
 use spicepod::component::{catalog as spicepod_catalog, params::Params};
 use std::collections::HashMap;
 
-use super::validate_identifier;
+use super::{find_first_delimiter, validate_identifier};
 
 #[derive(Debug, Clone)]
 pub struct Catalog {
@@ -104,7 +104,7 @@ impl Catalog {
         }
     }
 
-    /// Returns the catalog provider - the first part of the `from` field before the first `:`.
+    /// Returns the catalog provider - the first part of the `from` field before the first '://', ':', or '/'.
     ///
     /// # Examples
     ///
@@ -125,7 +125,10 @@ impl Catalog {
     /// ```
     #[must_use]
     fn provider(from: &str) -> &str {
-        from.split(':').next().unwrap_or(from)
+        match find_first_delimiter(from) {
+            Some((0, _)) | None => from,
+            Some((pos, _)) => &from[..pos],
+        }
     }
 
     /// Returns the catalog id - the second part of the `from` field after the first `:`.
@@ -150,8 +153,8 @@ impl Catalog {
     /// ```
     #[must_use]
     fn catalog_id(from: &str) -> Option<&str> {
-        match from.find(':') {
-            Some(index) => Some(&from[index + 1..]),
+        match find_first_delimiter(from) {
+            Some((pos, len)) => Some(&from[pos + len..]),
             None => None,
         }
     }

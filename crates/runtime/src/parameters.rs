@@ -1,3 +1,19 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use secrecy::{ExposeSecret, SecretString};
@@ -199,6 +215,11 @@ impl Parameters {
             self.params.push((key, value));
         }
     }
+
+    /// Returns an iterator over the parameter key-value pairs
+    pub fn iter(&self) -> std::slice::Iter<'_, (String, SecretString)> {
+        self.params.iter()
+    }
 }
 
 #[derive(Clone)]
@@ -206,6 +227,15 @@ pub struct Parameters {
     params: Vec<(String, SecretString)>,
     prefix: &'static str,
     all_params: &'static [ParameterSpec],
+}
+
+impl<'a> IntoIterator for &'a Parameters {
+    type Item = &'a (String, SecretString);
+    type IntoIter = std::slice::Iter<'a, (String, SecretString)>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.params.iter()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -267,9 +297,16 @@ impl<'a> ExposedParamLookup<'a> {
             ExposedParamLookup::Absent(s) => Err(f(s)),
         }
     }
+
+    pub fn unwrap_or_else(self, f: impl FnOnce(UserParam) -> &'a str) -> &'a str {
+        match self {
+            ExposedParamLookup::Present(s) => s,
+            ExposedParamLookup::Absent(s) => f(s),
+        }
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParameterSpec {
     pub name: &'static str,
     pub required: bool,

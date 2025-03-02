@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -44,12 +44,23 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use axum_extra::TypedHeader;
+use cache::QueryResultsCacheStatus;
 use csv::Writer;
 use headers_accept::Accept;
+use http::HeaderValue;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 
 use futures::TryStreamExt;
+
+#[cfg(feature = "openapi")]
+use utoipa::{
+    openapi::{
+        path::{Parameter, ParameterBuilder, ParameterIn},
+        Required,
+    },
+    schema,
+};
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -61,6 +72,19 @@ pub enum Format {
 
     /// CSV format
     Csv,
+}
+
+#[cfg(feature = "openapi")]
+impl utoipa::IntoParams for Format {
+    fn into_params(parameter_in_provider: impl Fn() -> Option<ParameterIn>) -> Vec<Parameter> {
+        vec![ParameterBuilder::new()
+            .description(Some(""))
+            .name("format")
+            .required(Required::True)
+            .parameter_in(parameter_in_provider().unwrap_or_default())
+            .schema(Some(schema!(Format)))
+            .build()]
+    }
 }
 
 #[derive(Default, Debug, Serialize, Deserialize)]
@@ -115,9 +139,9 @@ fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
 pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, format: ArrowFormat) -> Response {
     let query = QueryBuilder::new(sql, Arc::clone(&df)).build();
 
-    let (data, is_data_from_cache) = match query.run().await {
+    let (data, results_cache_status) = match query.run().await {
         Ok(query_result) => match query_result.data.try_collect::<Vec<RecordBatch>>().await {
-            Ok(batches) => (batches, query_result.from_cache),
+            Ok(batches) => (batches, query_result.results_cache_status),
             Err(e) => {
                 tracing::debug!("Error executing query: {e}");
                 return (
@@ -148,20 +172,39 @@ pub async fn sql_to_http_response(df: Arc<DataFusion>, sql: &str, format: ArrowF
 
     let mut headers = HeaderMap::new();
 
-    match is_data_from_cache {
-        Some(true) => {
-            if let Ok(value) = "Hit from spiceai".parse() {
-                headers.insert("X-Cache", value);
-            }
-        }
-        Some(false) => {
-            if let Ok(value) = "Miss from spiceai".parse() {
-                headers.insert("X-Cache", value);
-            }
-        }
-        None => {}
-    };
+    attach_cache_headers(&mut headers, results_cache_status);
+
     (StatusCode::OK, headers, body).into_response()
+}
+
+fn attach_cache_headers(headers: &mut HeaderMap, results_cache_status: QueryResultsCacheStatus) {
+    if let Some(val) = status_to_x_cache_value(results_cache_status) {
+        headers.insert("X-Cache", val);
+    }
+
+    if let Some(val) = status_to_results_cache_value(results_cache_status) {
+        headers.insert("Results-Cache-Status", val);
+    }
+}
+
+/// This is the legacy cache header, preserved for backwards compatibility.
+fn status_to_x_cache_value(results_cache_status: QueryResultsCacheStatus) -> Option<HeaderValue> {
+    match results_cache_status {
+        QueryResultsCacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
+        QueryResultsCacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
+        QueryResultsCacheStatus::CacheDisabled | QueryResultsCacheStatus::CacheBypass => None,
+    }
+}
+
+fn status_to_results_cache_value(
+    results_cache_status: QueryResultsCacheStatus,
+) -> Option<HeaderValue> {
+    match results_cache_status {
+        QueryResultsCacheStatus::CacheHit => "HIT".parse().ok(),
+        QueryResultsCacheStatus::CacheMiss => "MISS".parse().ok(),
+        QueryResultsCacheStatus::CacheBypass => "BYPASS".parse().ok(),
+        QueryResultsCacheStatus::CacheDisabled => None,
+    }
 }
 
 /// Converts a vector of `RecordBatch` to a JSON string.

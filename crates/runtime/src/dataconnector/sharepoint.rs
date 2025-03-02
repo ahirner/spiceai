@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,19 +27,19 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams,
-    DataConnectorResult, ParameterSpec, Parameters, UnableToGetReadProviderSnafu,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, DataConnectorResult,
+    ParameterSpec, Parameters, UnableToGetReadProviderSnafu,
 };
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/sharepoint#parameters"))]
+    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("No authentication was specified.\nProvide either an 'bearer_token' or 'client_secret'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/sharepoint#parameters"))]
+    #[snafu(display("No authentication was specified.\nProvide either an 'bearer_token' or 'client_secret'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"))]
     InvalidAuthentication,
 
-    #[snafu(display("Both `bearer_token` and `client_secret` were specified.\nProvide only one of either an 'bearer_token' or 'client_secret'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/sharepoint#parameters"))]
+    #[snafu(display("Both `bearer_token` and `client_secret` were specified.\nProvide only one of either an 'bearer_token' or 'client_secret'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"))]
     DuplicateAuthentication,
 
     #[snafu(display(
@@ -128,9 +128,13 @@ const PARAMETERS: &[ParameterSpec] = &[
 ];
 
 impl DataConnectorFactory for SharepointFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             Ok(Arc::new(Sharepoint::new(&params.parameters)?) as Arc<dyn DataConnector>)

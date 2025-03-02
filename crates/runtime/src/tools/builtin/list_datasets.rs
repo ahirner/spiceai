@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,7 @@ use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use snafu::ResultExt;
-use std::{collections::HashMap, sync::Arc};
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use crate::{
     datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
@@ -60,12 +60,12 @@ impl Default for ListDatasetsTool {
 
 #[async_trait]
 impl SpiceModelTool for ListDatasetsTool {
-    fn name(&self) -> &str {
-        self.name.as_str()
+    fn name(&self) -> Cow<'_, str> {
+        Cow::Borrowed(&self.name)
     }
 
-    fn description(&self) -> Option<&str> {
-        self.description.as_deref()
+    fn description(&self) -> Option<Cow<'_, str>> {
+        self.description.as_deref().map(Cow::Borrowed)
     }
 
     fn parameters(&self) -> Option<Value> {
@@ -77,7 +77,7 @@ impl SpiceModelTool for ListDatasetsTool {
         arg: &str,
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name(), input = arg);
+        let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name().to_string(), input = arg);
 
         let elements = get_dataset_elements(Arc::clone(&rt), self.table_allowlist.as_deref())
             .await

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ limitations under the License.
 
 use arrow::datatypes::{Field, Schema, SchemaRef};
 use async_stream::stream;
-use axum::async_trait;
+use async_trait::async_trait;
 use datafusion::catalog::Session;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::{DataFusionError, Result};
@@ -73,7 +73,7 @@ impl fmt::Debug for SchemaCastScanExec {
 }
 
 impl ExecutionPlan for SchemaCastScanExec {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "SchemaCastScanExec"
     }
 
@@ -86,19 +86,22 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::new(Schema::new(
-            self.input
-                .schema()
-                .fields()
-                .into_iter()
-                .map(|field| {
-                    self.schema
-                        .field_with_name(field.name())
-                        .ok()
-                        .map_or(field.deref().clone(), Clone::clone)
-                })
-                .collect::<Vec<Field>>(),
-        ))
+        Arc::new(
+            Schema::new(
+                self.input
+                    .schema()
+                    .fields()
+                    .into_iter()
+                    .map(|field| {
+                        self.schema
+                            .field_with_name(field.name())
+                            .ok()
+                            .map_or(field.deref().clone(), Clone::clone)
+                    })
+                    .collect::<Vec<Field>>(),
+            )
+            .with_metadata(self.input.schema().metadata().clone()),
+        )
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

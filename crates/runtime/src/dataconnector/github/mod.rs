@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -46,18 +46,18 @@ use graphql_parser::query::{
     Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
 };
 use issues::IssuesTableArgs;
-use lazy_static::lazy_static;
 use pull_requests::PullRequestTableArgs;
 use rate_limit::GitHubRateLimiter;
 use snafu::ResultExt;
 use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc};
 use url::Url;
 
 use super::{
-    graphql::default_spice_client, ConnectorComponent, DataConnector, DataConnectorError,
-    DataConnectorFactory, DataConnectorParams, ParameterSpec, Parameters,
+    graphql::default_spice_client, ConnectorComponent, ConnectorParams, DataConnector,
+    DataConnectorError, DataConnectorFactory, ParameterSpec, Parameters,
 };
 
 mod commits;
@@ -207,7 +207,7 @@ impl Github {
         let Some(tree_sha) = tree_sha.filter(|s| !s.is_empty()) else {
             return Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
-                source: format!("The branch or tag name is required in the dataset 'from' and must be in the format 'github.com/{owner}/{repo}/files/<BRANCH_NAME>'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/github#querying-github-files").into(),
+                source: format!("The branch or tag name is required in the dataset 'from' and must be in the format 'github.com/{owner}/{repo}/files/<BRANCH_NAME>'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#querying-github-files").into(),
                 connector_component: ConnectorComponent::from(dataset),
             });
         };
@@ -323,9 +323,13 @@ const PARAMETERS: &[ParameterSpec] = &[
 ];
 
 impl DataConnectorFactory for GithubFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let token = params.parameters.get("token").expose().ok();
         let client_id = params.parameters.get("client_id").expose().ok();
@@ -405,7 +409,7 @@ impl DataConnector for Github {
             DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                source: format!("Invalid query mode: {e}.\nEnsure a valid query mode is used, and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/github#common-parameters").into(),
+                source: format!("Invalid query mode: {e}.\nEnsure a valid query mode is used, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-parameters").into(),
             }
         })?;
 
@@ -463,19 +467,19 @@ impl DataConnector for Github {
             (Some("github.com"), Some(_), Some(_), Some(invalid_table)) => {
                 Err(DataConnectorError::UnableToGetReadProvider {
                     dataconnector: "github".to_string(),
-                    source: format!("Invalid GitHub table type: {invalid_table}.\nEnsure a valid table type is used, and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration").into(),
+                    source: format!("Invalid GitHub table type: {invalid_table}.\nEnsure a valid table type is used, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration").into(),
                     connector_component: ConnectorComponent::from(dataset),
                 })
             }
             (_, Some(owner), Some(repo), _) => Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                source: format!("The dataset `from` must start with 'github.com/{owner}/{repo}'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration").into(),
+                source: format!("The dataset `from` must start with 'github.com/{owner}/{repo}'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration").into(),
             }),
             _ => Err(DataConnectorError::UnableToGetReadProvider {
                 dataconnector: "github".to_string(),
                 connector_component: ConnectorComponent::from(dataset),
-                source: "Invalid GitHub path provided in the dataset 'from'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/github#common-configuration".into(),
+                source: "Invalid GitHub path provided in the dataset 'from'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/github#common-configuration".into(),
             }),
         }
     }
@@ -526,15 +530,15 @@ struct GitHubPushdownSupport {
 
 // TODO: add support for IN filters, to support columns like assignees, labels, etc.
 // Table currently doesn't support IN at all though, with or without pushdown, so that needs to be fixed first
-lazy_static! {
-    static ref GITHUB_FILTER_PUSHDOWNS_SUPPORTED: HashMap<&'static str, GitHubPushdownSupport> = {
+static GITHUB_FILTER_PUSHDOWNS_SUPPORTED: LazyLock<HashMap<&'static str, GitHubPushdownSupport>> =
+    LazyLock::new(|| {
         let mut m = HashMap::new();
         m.insert(
             "author",
             GitHubPushdownSupport {
                 ops: vec![Operator::Eq, Operator::NotEq],
                 remaps: None,
-                uses_modifiers: true
+                uses_modifiers: true,
             },
         );
 
@@ -549,7 +553,7 @@ lazy_static! {
                     Operator::NotILikeMatch,
                 ],
                 remaps: None,
-                uses_modifiers: false
+                uses_modifiers: false,
             },
         );
 
@@ -558,7 +562,7 @@ lazy_static! {
             GitHubPushdownSupport {
                 ops: vec![Operator::Eq, Operator::NotEq],
                 remaps: None,
-                uses_modifiers: true
+                uses_modifiers: true,
             },
         );
 
@@ -573,7 +577,7 @@ lazy_static! {
                     Operator::NotILikeMatch,
                 ],
                 remaps: None,
-                uses_modifiers: false
+                uses_modifiers: false,
             },
         );
 
@@ -588,7 +592,7 @@ lazy_static! {
                     Operator::GtEq,
                 ],
                 remaps: Some(vec![GitHubFilterRemap::Column("created")]),
-                uses_modifiers: true
+                uses_modifiers: true,
             },
         );
 
@@ -603,7 +607,7 @@ lazy_static! {
                     Operator::GtEq,
                 ],
                 remaps: Some(vec![GitHubFilterRemap::Column("updated")]),
-                uses_modifiers: true
+                uses_modifiers: true,
             },
         );
 
@@ -618,7 +622,7 @@ lazy_static! {
                     Operator::GtEq,
                 ],
                 remaps: Some(vec![GitHubFilterRemap::Column("closed")]),
-                uses_modifiers: true
+                uses_modifiers: true,
             },
         );
 
@@ -633,7 +637,7 @@ lazy_static! {
                     Operator::GtEq,
                 ],
                 remaps: Some(vec![GitHubFilterRemap::Column("merged")]),
-                uses_modifiers: true
+                uses_modifiers: true,
             },
         );
 
@@ -641,30 +645,28 @@ lazy_static! {
             "committed_date",
             GitHubPushdownSupport {
                 // e.g. committed_date > '2024-09-14'
-                ops: vec![
-                    Operator::Lt,
-                    Operator::LtEq,
-                    Operator::Gt,
-                    Operator::GtEq,
-                ],
+                ops: vec![Operator::Lt, Operator::LtEq, Operator::Gt, Operator::GtEq],
                 remaps: Some(vec![
                     GitHubFilterRemap::Operator((Operator::Gt, "since")),
                     GitHubFilterRemap::Operator((Operator::GtEq, "since")),
                     GitHubFilterRemap::Operator((Operator::Lt, "until")),
-                    GitHubFilterRemap::Operator((Operator::LtEq, "until"))]),
-                uses_modifiers: false
+                    GitHubFilterRemap::Operator((Operator::LtEq, "until")),
+                ]),
+                uses_modifiers: false,
             },
         );
 
-        m.insert("labels", GitHubPushdownSupport {
-            ops: vec![Operator::LikeMatch],
-            remaps: Some(vec![GitHubFilterRemap::Column("label")]),
-            uses_modifiers: false
-        });
+        m.insert(
+            "labels",
+            GitHubPushdownSupport {
+                ops: vec![Operator::LikeMatch],
+                remaps: Some(vec![GitHubFilterRemap::Column("label")]),
+                uses_modifiers: false,
+            },
+        );
 
         m
-    };
-}
+    });
 
 fn expr_to_match(expr: &Expr) -> Option<(Column, ScalarValue, Operator)> {
     match expr {
@@ -842,7 +844,7 @@ pub(crate) fn search_inject_parameters(
     let query_value = match &query_arg.1 {
         graphql_parser::query::Value::String(v) => {
             let v = v.replace('"', "");
-            Ok(format!(r#"{v} {arg_additions}"#))
+            Ok(format!("{v} {arg_additions}"))
         }
         _ => Err(DataFusionError::Execution(
             "GitHub GraphQL query 'query' argument was not a string".to_string(),
@@ -884,7 +886,7 @@ pub(crate) fn inject_parameters<F>(
     target_field_name: &str,
     field_modifier: F,
     filters: &[FilterPushdownResult],
-    query: &mut GraphQLQuery<'_>,
+    query: &mut GraphQLQuery,
 ) -> Result<(), datafusion::error::DataFusionError>
 where
     F: Fn(
@@ -904,7 +906,7 @@ where
 
     // find the history() field leaf in the AST
     let mut all_selections: Vec<&mut Selection<'_, String>> = Vec::new();
-    for def in &mut query.ast.definitions {
+    for def in &mut query.ast_mut().definitions {
         let selections = match def {
             Definition::Operation(OperationDefinition::Query(Query { selection_set, .. })) => {
                 &mut selection_set.items
@@ -961,7 +963,7 @@ where
     field_modifier(target_field, &filters)?;
 
     // update any change in JSON pointer and pagination parameters
-    let (pagination_parameters, json_pointer) = PaginationParameters::parse(&query.ast);
+    let (pagination_parameters, json_pointer) = PaginationParameters::parse(query.ast());
     query.pagination_parameters = pagination_parameters;
     query.json_pointer = json_pointer.map(Arc::from);
 

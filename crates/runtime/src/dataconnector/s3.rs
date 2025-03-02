@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,19 +16,20 @@ limitations under the License.
 
 use super::{
     listing::{self, ListingTableConnector},
-    ConnectorComponent, DataConnector, DataConnectorError, DataConnectorFactory,
-    DataConnectorParams, DataConnectorResult, ParameterSpec, Parameters,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    DataConnectorResult, ParameterSpec, Parameters,
 };
 
-use crate::component::dataset::Dataset;
 use crate::parameters::ParamLookup;
+use crate::{component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS};
+
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
 use std::future::Future;
 use std::pin::Pin;
 use std::string::String;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use url::Url;
 
 // https://docs.aws.amazon.com/general/latest/gr/rande.html
@@ -69,39 +70,42 @@ pub const AWS_REGIONS: [&str; 32] = [
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("S3 auth method 'key' requires an AWS access secret.\nSpecify an access secret with the `s3_secret` parameter.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    #[snafu(display("S3 auth method 'key' requires an AWS access secret.\nSpecify an access secret with the `s3_secret` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
     NoAccessSecret,
 
-    #[snafu(display("S3 auth method 'key' requires an AWS access key.\nSpecify an access key with the `s3_key` parameter.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    #[snafu(display("S3 auth method 'key' requires an AWS access key.\nSpecify an access key with the `s3_key` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
     NoAccessKey,
 
-    #[snafu(display("Unsupported S3 auth method '{method}'.\nUse 'public', 'iam_role', or 'key' for `s3_auth` parameter.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    #[snafu(display("Unsupported S3 auth method '{method}'.\nUse 'public', 'iam_role', or 'key' for `s3_auth` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
     UnsupportedAuthenticationMethod { method: String },
 
     #[snafu(display(
-        "The '{parameter}' parameter requires `s3_auth` set to '{auth}'.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"
+        "The '{parameter}' parameter requires `s3_auth` set to '{auth}'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
     ))]
     InvalidAuthParameterCombination { parameter: String, auth: String },
 
     #[snafu(display(
-        "The `s3_endpoint` parameter must be a HTTP/S URL, but '{endpoint}' was provided.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+        "The `s3_endpoint` parameter must be a HTTP/S URL, but '{endpoint}' was provided.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#params"
     ))]
     InvalidEndpoint { endpoint: String },
 
     #[snafu(display(
-        "The `s3_region` parameter must be a valid AWS region code, but '{region}' was provided.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+        "The `s3_region` parameter must be a valid AWS region code, but '{region}' was provided.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#params"
     ))]
     InvalidRegion { region: String },
 
     #[snafu(display(
-        "The `s3_region` parameter requires a lowercase AWS region code, but '{region}' was provided.\nSpice will automatically convert the region code to lowercase.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#params"
+        "The `s3_region` parameter requires a lowercase AWS region code, but '{region}' was provided.\nSpice will automatically convert the region code to lowercase.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#params"
     ))]
     InvalidRegionCorrected { region: String },
 
-    #[snafu(display("IAM role authentication failed.\nAre you sure you're running in an environment with an IAM role?\n{source}\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#auth"))]
+    #[snafu(display("IAM role authentication failed.\nAre you sure you're running in an environment with an IAM role?\n{source}\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"))]
     InvalidIAMRoleAuthentication {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display("The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"))]
+    InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
 
 pub struct S3 {
@@ -122,42 +126,33 @@ impl S3Factory {
         Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
     }
 }
-
-const PARAMETERS: &[ParameterSpec] = &[
-    ParameterSpec::connector("region").secret(),
-    ParameterSpec::connector("endpoint").secret(),
-    ParameterSpec::connector("key").secret(),
-    ParameterSpec::connector("secret").secret(),
-    ParameterSpec::connector("auth").description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.").secret(),
-    ParameterSpec::runtime("client_timeout")
-        .description("The timeout setting for S3 client."),
-    ParameterSpec::runtime("allow_http")
-        .description("Allow HTTP protocol for S3 endpoint."),
-
-    // Common listing table parameters
-    ParameterSpec::runtime("file_format"),
-    ParameterSpec::runtime("file_extension"),
-    ParameterSpec::runtime("schema_infer_max_records")
-        .description("Set a limit in terms of records to scan to infer the schema."),
-    ParameterSpec::runtime("csv_has_header")
-        .description("Set true to indicate that the first line is a header."),
-    ParameterSpec::runtime("csv_quote").description("The quote character in a row."),
-    ParameterSpec::runtime("csv_escape").description("The escape character in a row."),
-    ParameterSpec::runtime("csv_schema_infer_max_records")
-        .description("Set a limit in terms of records to scan to infer the schema.")
-        .deprecated("use 'schema_infer_max_records' instead"),
-    ParameterSpec::runtime("csv_delimiter")
-        .description("The character separating values within a row."),
-    ParameterSpec::runtime("file_compression_type")
-        .description("The type of compression used on the file. Supported types are: GZIP, BZIP2, XZ, ZSTD, UNCOMPRESSED"),
-    ParameterSpec::runtime("hive_partitioning_enabled")
-        .description("Enable partitioning using hive-style partitioning from the folder structure. Defaults to false."),
-];
+static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    let mut all_parameters = Vec::new();
+    all_parameters.extend_from_slice(&[
+            ParameterSpec::connector("region").secret(),
+            ParameterSpec::connector("endpoint").secret(),
+            ParameterSpec::connector("key").secret(),
+            ParameterSpec::connector("secret").secret(),
+            ParameterSpec::connector("auth")
+                .description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.")
+                .secret(),
+            ParameterSpec::runtime("client_timeout")
+                .description("The timeout setting for S3 client."),
+            ParameterSpec::runtime("allow_http")
+                .description("Allow HTTP protocol for S3 endpoint."),
+        ]);
+    all_parameters.extend_from_slice(LISTING_TABLE_PARAMETERS);
+    all_parameters
+});
 
 impl DataConnectorFactory for S3Factory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        mut params: DataConnectorParams,
+        mut params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
             if endpoint.ends_with('/') {
@@ -173,6 +168,15 @@ impl DataConnectorFactory for S3Factory {
             if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
                 if !(endpoint.starts_with("https://") || endpoint.starts_with("http://")) {
                     return Err(Box::new(Error::InvalidEndpoint {
+                        endpoint: endpoint.to_string(),
+                    })
+                        as Box<dyn std::error::Error + Send + Sync>);
+                }
+
+                if endpoint.starts_with("http://")
+                    && params.parameters.get("allow_http").expose().ok() != Some("true")
+                {
+                    return Err(Box::new(Error::InsecureEndpointWithoutAllowHTTP {
                         endpoint: endpoint.to_string(),
                     })
                         as Box<dyn std::error::Error + Send + Sync>);
@@ -251,7 +255,7 @@ impl DataConnectorFactory for S3Factory {
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
-        PARAMETERS
+        &PARAMETERS
     }
 }
 
@@ -276,7 +280,7 @@ impl ListingTableConnector for S3 {
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("The specified URL is not valid: {}.\nEnsure the URL is valid and try again.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/s3#from", dataset.from),
+                    message: format!("The specified URL is not valid: {}.\nEnsure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#from", dataset.from),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
 

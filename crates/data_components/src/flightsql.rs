@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,13 +21,16 @@ use arrow::{
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion_table_providers::sql::sql_provider_datafusion::expr;
-use flight_client::tls::new_tls_flight_channel;
+use flight_client::{
+    tls::new_tls_flight_channel, MAX_DECODING_MESSAGE_SIZE, MAX_ENCODING_MESSAGE_SIZE,
+};
 use futures::{Stream, StreamExt, TryStreamExt};
 use snafu::prelude::*;
 use std::{any::Any, fmt, sync::Arc, vec};
 
 use arrow_flight::{
     error::FlightError,
+    flight_service_client::FlightServiceClient,
     sql::{client::FlightSqlServiceClient, CommandGetTables},
     FlightEndpoint, IpcMessage,
 };
@@ -54,28 +57,28 @@ pub mod federation;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to connect to the Flight server.\n{source}\nVerify configuration and try again. For details, visit https://docs.spiceai.org/components/data-connectors/flightsql#params"))]
+    #[snafu(display("Failed to connect to the Flight server.\n{source}\nVerify configuration and try again. For details, visit https://spiceai.org/docs/components/data-connectors/flightsql#params"))]
     UnableToConnectToServer { source: tonic::transport::Error },
 
-    #[snafu(display("Failed to create SQL query (flightsql).\n{source}\nAn unexpected error occurred. Please report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Failed to create SQL query (flightsql).\n{source}\nAn unexpected error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     UnableToGenerateSQL { source: expr::Error },
 
     #[snafu(display("Query execution failed (flightsql).\n{source}"))]
     UnableToQueryArrowFlight { source: FlightError },
 
-    #[snafu(display("Failed to retrieve table {table_name} schema (flightsql).\n{source}\nAn internal error occurred. Please report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Failed to retrieve table {table_name} schema (flightsql).\n{source}\nAn internal error occurred. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     UnableToRetrieveSchemaFromIpcMessage {
         source: arrow::error::ArrowError,
         table_name: String,
     },
 
-    #[snafu(display("Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, please report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     UnableToRetrieveSchemaArrow {
         source: arrow::error::ArrowError,
         table_name: String,
     },
 
-    #[snafu(display("Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, please report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display("Failed to detect table '{table_name}' schema (flightsql).\n{source}\nVerify the connection and try again. If the issue persists, report a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
     UnableToRetrieveSchemaFlight {
         source: FlightError,
         table_name: String,
@@ -189,10 +192,15 @@ impl FlightSQLTable {
             .connect()
             .await
             .context(UnableToConnectToServerSnafu)?;
+
+        let flight_client = FlightServiceClient::new(channel)
+            .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
+            .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE);
+
         Self::create(
             "flightsql",
             s,
-            FlightSqlServiceClient::new(channel),
+            FlightSqlServiceClient::new_from_inner(flight_client),
             table_reference.into(),
         )
         .await
@@ -497,10 +505,7 @@ impl ExecutionPlan for FlightSqlExec {
         _partition: usize,
         _context: Arc<TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let sql = match self.sql().map_err(to_execution_error) {
-            Ok(sql) => sql,
-            Err(error) => return Err(error),
-        };
+        let sql = self.sql().map_err(to_execution_error)?;
 
         let stream_adapter = RecordBatchStreamAdapter::new(
             self.schema(),

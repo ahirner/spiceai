@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -48,6 +48,12 @@ sql> show tables
 	Run: func(cmd *cobra.Command, args []string) {
 		rtcontext := context.NewContext()
 
+		_, err := rtcontext.Version()
+		if err != nil {
+			slog.Error("Failed to run `spice sql`: The Spice runtime is not installed. Run `spice install` and retry.")
+			return
+		}
+
 		spiceArgs := []string{"--repl"}
 
 		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
@@ -60,6 +66,10 @@ sql> show tables
 
 		if userAgent, err := cmd.Flags().GetString("user-agent"); err == nil && userAgent != "" {
 			args = append(args, "--user-agent", userAgent)
+		}
+
+		if cacheControl, err := cmd.Flags().GetString("cache-control"); err == nil && cacheControl != "" {
+			args = append(args, "--cache-control", cacheControl)
 		}
 
 		args = append(spiceArgs, args...)
@@ -84,7 +94,7 @@ sql> show tables
 
 func init() {
 	sqlCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
-	sqlCmd.Flags().String("api-key", "", "The API key to use for authentication")
 	sqlCmd.Flags().String("user-agent", "", "The user agent to use for all requests")
+	sqlCmd.Flags().String("cache-control", "cache", "Control whether the results cache is used for queries. [possible values: cache, no-cache]")
 	RootCmd.AddCommand(sqlCmd)
 }

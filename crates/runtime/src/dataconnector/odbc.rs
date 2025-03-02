@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,7 +33,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use super::{
-    ConnectorComponent, DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
 };
 
 #[derive(Debug, Snafu)]
@@ -42,13 +42,13 @@ pub enum Error {
     UnableToCreateODBCConnectionPool {
         source: db_connection_pool::odbcpool::Error,
     },
-    #[snafu(display("Missing required parameter: {param}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    #[snafu(display("Missing required parameter: {param}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
     MissingParameter { param: String },
-    #[snafu(display("An ODBC parameter is configured incorrectly: {param}.\n{msg}\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    #[snafu(display("An ODBC parameter is configured incorrectly: {param}.\n{msg}\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
     InvalidParameter { param: String, msg: String },
-    #[snafu(display("No ODBC driver was specified in the connection string.\nSpecify an installed driver in the connection string.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    #[snafu(display("No ODBC driver was specified in the connection string.\nSpecify an installed driver in the connection string.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
     NoDriverSpecified,
-    #[snafu(display("Accessing an ODBC driver with a file path is not permitted.\nInstall a driver using the system driver manager, and specify the driver name instead.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/odbc"))]
+    #[snafu(display("Accessing an ODBC driver with a file path is not permitted.\nInstall a driver using the system driver manager, and specify the driver name instead.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
     DirectDriverNotPermitted,
 }
 
@@ -198,9 +198,13 @@ fn parameter_is_integer(parameters: &Parameters, param: &str) -> Result<()> {
 }
 
 impl DataConnectorFactory for ODBCFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             parameter_is_integer(&params.parameters, "max_binary_size")?;

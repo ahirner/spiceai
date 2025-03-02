@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -35,7 +35,7 @@ use datafusion::{
 };
 use futures::Future;
 
-use super::{DataConnector, DataConnectorFactory, DataConnectorParams, ParameterSpec};
+use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec};
 
 /// A no-op connector that allows for Spice to act as a "sink" for data.
 ///
@@ -85,9 +85,13 @@ impl SinkConnectorFactory {
 }
 
 impl DataConnectorFactory for SinkConnectorFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        _params: DataConnectorParams,
+        _params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let schema = Schema::new(vec![Field::new("placeholder", DataType::Utf8, false)]);

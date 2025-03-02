@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -54,7 +54,7 @@ const APPLICATION_JSON: MediaType = MediaType::from_parts(APPLICATION, JSON, Non
 const TEXT_CSV: MediaType = MediaType::from_parts(TEXT, CSV, None, &[]);
 const ACCEPT_LIST: &[MediaType; 2] = &[APPLICATION_JSON, TEXT_CSV];
 
-/// Get a list of catalogs.
+/// List Catalogs
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/catalogs",
@@ -62,7 +62,7 @@ const ACCEPT_LIST: &[MediaType; 2] = &[APPLICATION_JSON, TEXT_CSV];
     tag = "Datasets",
     params(CatalogFilter),
     responses(
-        (status = 200, description = "List of catalogs in JSON format", content((
+        (status = 200, description = "List of catalogs", content((
             CatalogResponseItem = "application/json",
             example = json!([
                 {
@@ -70,8 +70,7 @@ const ACCEPT_LIST: &[MediaType; 2] = &[APPLICATION_JSON, TEXT_CSV];
                     "name": "spiceai"
                 }
             ])
-        ))),
-        (status = 200, description = "List of catalogs in CSV format", content((
+        ), (
             String = "text/csv",
             example = "
 from,name

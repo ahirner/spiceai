@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -47,7 +47,7 @@ use super::synchronized_table::SynchronizedTable;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(r#"time_column '{time_column}' in dataset {table_name} has data type '{actual_time_format}', but time_format is configured as '{expected_time_format}'"#))]
+    #[snafu(display("time_column '{time_column}' in dataset {table_name} has data type '{actual_time_format}', but time_format is configured as '{expected_time_format}'"))]
     TimeFormatMismatch {
         table_name: String,
         time_column: String,
@@ -55,7 +55,7 @@ pub enum Error {
         actual_time_format: String,
     },
 
-    #[snafu(display(r#"time_column '{time_column}' was not found in dataset {table_name}"#))]
+    #[snafu(display("time_column '{time_column}' was not found in dataset {table_name}"))]
     NoTimeColumnFound {
         table_name: String,
         time_column: String,
@@ -66,6 +66,8 @@ pub enum Error {
 pub struct Refresh {
     pub(crate) time_column: Option<String>,
     pub(crate) time_format: Option<TimeFormat>,
+    pub(crate) time_partition_column: Option<String>,
+    pub(crate) time_partition_format: Option<TimeFormat>,
     pub(crate) check_interval: Option<Duration>,
     pub(crate) max_jitter: Option<Duration>,
     pub(crate) sql: Option<String>,
@@ -125,6 +127,18 @@ impl Refresh {
     #[must_use]
     pub fn time_format(mut self, time_format: TimeFormat) -> Self {
         self.time_format = Some(time_format);
+        self
+    }
+
+    #[must_use]
+    pub fn time_partition_column(mut self, time_partition_column: String) -> Self {
+        self.time_partition_column = Some(time_partition_column);
+        self
+    }
+
+    #[must_use]
+    pub fn time_partition_format(mut self, time_partition_format: TimeFormat) -> Self {
+        self.time_partition_format = Some(time_partition_format);
         self
     }
 
@@ -198,78 +212,111 @@ impl Refresh {
         let time_format = self.time_format.unwrap_or(TimeFormat::Timestamp);
         let data_type = field.data_type().clone();
 
-        let mut invalid = false;
-        match data_type {
-            arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8 => {
-                if time_format != TimeFormat::ISO8601 {
-                    invalid = true;
-                }
-            }
-            arrow::datatypes::DataType::Int8
-            | arrow::datatypes::DataType::Int16
-            | arrow::datatypes::DataType::Int32
-            | arrow::datatypes::DataType::Int64
-            | arrow::datatypes::DataType::UInt8
-            | arrow::datatypes::DataType::UInt16
-            | arrow::datatypes::DataType::UInt32
-            | arrow::datatypes::DataType::UInt64
-            | arrow::datatypes::DataType::Float16
-            | arrow::datatypes::DataType::Float32
-            | arrow::datatypes::DataType::Float64 => {
-                if time_format != TimeFormat::UnixSeconds && time_format != TimeFormat::UnixMillis {
-                    invalid = true;
-                }
-            }
-            arrow::datatypes::DataType::Timestamp(_, None) => {
-                if time_format != TimeFormat::Timestamp {
-                    invalid = true;
-                }
-            }
-            arrow::datatypes::DataType::Timestamp(_, Some(_)) => {
-                if time_format != TimeFormat::Timestamptz {
-                    invalid = true;
-                }
-            }
-            arrow::datatypes::DataType::Null
-            | arrow::datatypes::DataType::Boolean
-            | arrow::datatypes::DataType::Date32
-            | arrow::datatypes::DataType::Date64
-            | arrow::datatypes::DataType::Time32(_)
-            | arrow::datatypes::DataType::Time64(_)
-            | arrow::datatypes::DataType::Duration(_)
-            | arrow::datatypes::DataType::Interval(_)
-            | arrow::datatypes::DataType::Binary
-            | arrow::datatypes::DataType::FixedSizeBinary(_)
-            | arrow::datatypes::DataType::LargeBinary
-            | arrow::datatypes::DataType::BinaryView
-            | arrow::datatypes::DataType::Utf8View
-            | arrow::datatypes::DataType::List(_)
-            | arrow::datatypes::DataType::ListView(_)
-            | arrow::datatypes::DataType::FixedSizeList(_, _)
-            | arrow::datatypes::DataType::LargeList(_)
-            | arrow::datatypes::DataType::LargeListView(_)
-            | arrow::datatypes::DataType::Struct(_)
-            | arrow::datatypes::DataType::Union(_, _)
-            | arrow::datatypes::DataType::Dictionary(_, _)
-            | arrow::datatypes::DataType::Decimal128(_, _)
-            | arrow::datatypes::DataType::Decimal256(_, _)
-            | arrow::datatypes::DataType::Map(_, _)
-            | arrow::datatypes::DataType::RunEndEncoded(_, _) => {
-                invalid = true;
-            }
-        };
+        validate_time_partition_format(&data_type, &dataset_name, &time_column, time_format)?;
 
-        if invalid {
-            return Err(Error::TimeFormatMismatch {
-                table_name: dataset_name,
-                time_column,
-                expected_time_format: time_format.to_string(),
-                actual_time_format: data_type.to_string(),
-            });
-        };
+        if let Some(time_partition_column) = self.time_partition_column.clone() {
+            let Some((_, field)) = schema.column_with_name(&time_partition_column) else {
+                return Err(Error::NoTimeColumnFound {
+                    table_name: dataset_name,
+                    time_column: time_partition_column,
+                });
+            };
+
+            let time_partition_format = self.time_partition_format.unwrap_or(TimeFormat::Timestamp);
+            let partition_data_type = field.data_type().clone();
+            validate_time_partition_format(
+                &partition_data_type,
+                &dataset_name,
+                &time_partition_column,
+                time_partition_format,
+            )?;
+        }
 
         Ok(())
     }
+}
+
+fn validate_time_partition_format(
+    data_type: &arrow::datatypes::DataType,
+    dataset_name: &str,
+    time_column: &str,
+    time_format: TimeFormat,
+) -> Result<(), Error> {
+    let mut invalid = false;
+    match data_type {
+        arrow::datatypes::DataType::Utf8 | arrow::datatypes::DataType::LargeUtf8 => {
+            if time_format != TimeFormat::ISO8601 {
+                invalid = true;
+            }
+        }
+        arrow::datatypes::DataType::Int8
+        | arrow::datatypes::DataType::Int16
+        | arrow::datatypes::DataType::Int32
+        | arrow::datatypes::DataType::Int64
+        | arrow::datatypes::DataType::UInt8
+        | arrow::datatypes::DataType::UInt16
+        | arrow::datatypes::DataType::UInt32
+        | arrow::datatypes::DataType::UInt64
+        | arrow::datatypes::DataType::Float16
+        | arrow::datatypes::DataType::Float32
+        | arrow::datatypes::DataType::Float64 => {
+            if time_format != TimeFormat::UnixSeconds && time_format != TimeFormat::UnixMillis {
+                invalid = true;
+            }
+        }
+        arrow::datatypes::DataType::Timestamp(_, None) => {
+            if time_format != TimeFormat::Timestamp {
+                invalid = true;
+            }
+        }
+        arrow::datatypes::DataType::Timestamp(_, Some(_)) => {
+            if time_format != TimeFormat::Timestamptz {
+                invalid = true;
+            }
+        }
+        arrow::datatypes::DataType::Date32 => {
+            if time_format != TimeFormat::Date {
+                invalid = true;
+            }
+        }
+        arrow::datatypes::DataType::Null
+        | arrow::datatypes::DataType::Boolean
+        | arrow::datatypes::DataType::Date64
+        | arrow::datatypes::DataType::Time32(_)
+        | arrow::datatypes::DataType::Time64(_)
+        | arrow::datatypes::DataType::Duration(_)
+        | arrow::datatypes::DataType::Interval(_)
+        | arrow::datatypes::DataType::Binary
+        | arrow::datatypes::DataType::FixedSizeBinary(_)
+        | arrow::datatypes::DataType::LargeBinary
+        | arrow::datatypes::DataType::BinaryView
+        | arrow::datatypes::DataType::Utf8View
+        | arrow::datatypes::DataType::List(_)
+        | arrow::datatypes::DataType::ListView(_)
+        | arrow::datatypes::DataType::FixedSizeList(_, _)
+        | arrow::datatypes::DataType::LargeList(_)
+        | arrow::datatypes::DataType::LargeListView(_)
+        | arrow::datatypes::DataType::Struct(_)
+        | arrow::datatypes::DataType::Union(_, _)
+        | arrow::datatypes::DataType::Dictionary(_, _)
+        | arrow::datatypes::DataType::Decimal128(_, _)
+        | arrow::datatypes::DataType::Decimal256(_, _)
+        | arrow::datatypes::DataType::Map(_, _)
+        | arrow::datatypes::DataType::RunEndEncoded(_, _) => {
+            invalid = true;
+        }
+    };
+
+    if invalid {
+        return Err(Error::TimeFormatMismatch {
+            table_name: dataset_name.to_string(),
+            time_column: time_column.to_string(),
+            expected_time_format: time_format.to_string(),
+            actual_time_format: data_type.to_string(),
+        });
+    };
+
+    Ok(())
 }
 
 impl Default for Refresh {
@@ -277,6 +324,8 @@ impl Default for Refresh {
         Self {
             time_column: None,
             time_format: None,
+            time_partition_column: None,
+            time_partition_format: None,
             check_interval: None,
             max_jitter: None,
             sql: None,
@@ -300,6 +349,7 @@ pub struct Refresher {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
     federated: Arc<FederatedTable>,
+    federated_source: Option<String>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
     cache_provider: Option<Arc<QueryResultsCacheProvider>>,
@@ -315,6 +365,7 @@ impl Refresher {
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<FederatedTable>,
+        federated_source: Option<String>,
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
@@ -322,6 +373,7 @@ impl Refresher {
             runtime_status,
             dataset_name,
             federated,
+            federated_source,
             refresh,
             accelerator,
             cache_provider: None,
@@ -383,18 +435,15 @@ impl Refresher {
     ) -> Option<tokio::task::JoinHandle<()>> {
         let time_column = self.refresh.read().await.time_column.clone();
 
-        let mut on_start_refresh_external = match acceleration_refresh_mode {
-            AccelerationRefreshMode::Disabled => return None,
-            AccelerationRefreshMode::Append(receiver) => {
-                if let (Some(receiver), Some(_)) = (receiver, time_column) {
-                    receiver
-                } else {
-                    return Some(self.start_streaming_append(ready_sender));
-                }
+        let mut on_start_refresh_external = match (acceleration_refresh_mode, time_column) {
+            (AccelerationRefreshMode::Disabled, _) => return None,
+            (AccelerationRefreshMode::Append(Some(receiver)), Some(_))
+            | (AccelerationRefreshMode::Full(receiver), _) => receiver,
+            (AccelerationRefreshMode::Append(_), _) => {
+                return Some(self.start_streaming_append(ready_sender))
             }
-            AccelerationRefreshMode::Full(receiver) => receiver,
-            AccelerationRefreshMode::Changes(stream) => {
-                return Some(self.start_changes_stream(stream, ready_sender));
+            (AccelerationRefreshMode::Changes(stream), _) => {
+                return Some(self.start_changes_stream(stream, ready_sender))
             }
         };
 
@@ -402,6 +451,7 @@ impl Refresher {
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
+            self.federated_source.clone(),
             Arc::clone(&self.refresh),
             Arc::clone(&self.accelerator),
         );
@@ -542,6 +592,7 @@ impl Refresher {
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
+            self.federated_source.clone(),
             Arc::clone(&self.accelerator),
         ));
 
@@ -574,6 +625,7 @@ impl Refresher {
             Arc::clone(&self.runtime_status),
             self.dataset_name.clone(),
             Arc::clone(&self.federated),
+            self.federated_source.clone(),
             Arc::clone(&self.accelerator),
         ));
 
@@ -688,6 +740,7 @@ mod tests {
             status,
             TableReference::bare("test"),
             federated,
+            Some("mem_table".to_string()),
             Arc::new(RwLock::new(refresh)),
             Arc::clone(&accelerator),
         );
@@ -895,6 +948,7 @@ mod tests {
                 status::RuntimeStatus::new(),
                 TableReference::bare("test"),
                 federated,
+                Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
             );
@@ -1047,6 +1101,7 @@ mod tests {
                 status::RuntimeStatus::new(),
                 TableReference::bare("test"),
                 federated,
+                Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
             );
@@ -1249,6 +1304,7 @@ mod tests {
                 status::RuntimeStatus::new(),
                 TableReference::bare("test"),
                 federated,
+                Some("mem_table".to_string()),
                 Arc::new(RwLock::new(refresh)),
                 Arc::clone(&accelerator),
             );
@@ -1415,6 +1471,7 @@ mod tests {
             TimeFormat::UnixMillis,
             TimeFormat::Timestamp,
             TimeFormat::Timestamptz,
+            TimeFormat::Date,
         ] {
             let refresh = Refresh::new(RefreshMode::Full)
                 .time_column("time".to_string())
@@ -1433,6 +1490,7 @@ mod tests {
             TimeFormat::Timestamp,
             TimeFormat::Timestamptz,
             TimeFormat::ISO8601,
+            TimeFormat::Date,
         ] {
             let refresh = Refresh::new(RefreshMode::Full)
                 .time_column("time".to_string())
@@ -1457,6 +1515,7 @@ mod tests {
             TimeFormat::UnixSeconds,
             TimeFormat::Timestamptz,
             TimeFormat::ISO8601,
+            TimeFormat::Date,
         ] {
             let refresh = Refresh::new(RefreshMode::Full)
                 .time_column("time".to_string())
@@ -1481,6 +1540,7 @@ mod tests {
             TimeFormat::UnixSeconds,
             TimeFormat::Timestamp,
             TimeFormat::ISO8601,
+            TimeFormat::Date,
         ] {
             let refresh = Refresh::new(RefreshMode::Full)
                 .time_column("time".to_string())
@@ -1558,5 +1618,46 @@ mod tests {
         assert!(refresh
             .validate_time_format("dataset_name".to_string(), &schema)
             .is_ok());
+    }
+
+    #[test]
+    fn test_validate_time_column_when_date_match() {
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("time".to_string())
+            .time_format(TimeFormat::Date);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time",
+            DataType::Date32,
+            false,
+        )]));
+        assert!(refresh
+            .validate_time_format("dataset_name".to_string(), &schema)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_validate_time_column_when_date_mismatch() {
+        for format in [
+            TimeFormat::UnixMillis,
+            TimeFormat::UnixSeconds,
+            TimeFormat::Timestamp,
+            TimeFormat::Timestamptz,
+            TimeFormat::ISO8601,
+        ] {
+            let refresh = Refresh::new(RefreshMode::Full)
+                .time_column("time".to_string())
+                .time_format(format);
+
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "time",
+                DataType::Date32,
+                false,
+            )]));
+            assert!(matches!(
+                refresh.validate_time_format("test_dataset".to_string(), &schema),
+                Err(Error::TimeFormatMismatch { .. })
+            ));
+        }
     }
 }

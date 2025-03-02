@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -43,7 +43,7 @@ var configureCmd = &cobra.Command{
 	Example: `
 spice dataset configure
 
-# See more at: https://docs.spiceai.org/
+# See more at: https://spiceai.org/docs/
 `,
 	Run: func(cmd *cobra.Command, args []string) {
 		if fi, err := os.Stat("spicepod.yaml"); os.IsNotExist(err) || fi.IsDir() {

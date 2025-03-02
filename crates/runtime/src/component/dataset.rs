@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -34,15 +34,23 @@ use std::{collections::HashMap, fmt::Display, str::FromStr, sync::Arc, time::Dur
 
 use crate::dataaccelerator::get_accelerator_engine;
 
-use super::validate_identifier;
+use super::{find_first_delimiter, validate_identifier};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Column for index {index} not found in schema. Valid columns: {valid_columns}"
+        "Column for index '{index}' was not found in the schema.\nValid columns: {valid_columns}.\nVerify configuration and try again.\nFor details, visit https://spiceai.org/docs/features/data-acceleration/indexes"
     ))]
     IndexColumnNotFound {
         index: String,
+        valid_columns: String,
+    },
+
+    #[snafu(display(
+        "Primary key column '{invalid_column}' was not found in the schema.\nValid columns: {valid_columns}.\nVerify configuration and try again.\nFor details, visit https://spiceai.org/docs/features/data-acceleration/constraints"
+    ))]
+    PrimaryKeyColumnNotFound {
+        invalid_column: String,
         valid_columns: String,
     },
 
@@ -101,6 +109,7 @@ pub enum TimeFormat {
     UnixSeconds,
     UnixMillis,
     ISO8601,
+    Date,
 }
 
 impl From<spicepod_dataset::TimeFormat> for TimeFormat {
@@ -111,6 +120,7 @@ impl From<spicepod_dataset::TimeFormat> for TimeFormat {
             spicepod_dataset::TimeFormat::ISO8601 => TimeFormat::ISO8601,
             spicepod_dataset::TimeFormat::Timestamp => TimeFormat::Timestamp,
             spicepod_dataset::TimeFormat::Timestamptz => TimeFormat::Timestamptz,
+            spicepod_dataset::TimeFormat::Date => TimeFormat::Date,
         }
     }
 }
@@ -122,28 +132,37 @@ impl std::fmt::Display for TimeFormat {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub enum InvalidTypeAction {
+pub enum UnsupportedTypeAction {
     Error,
     Warn,
     Ignore,
+    String,
 }
 
-impl From<spicepod_dataset::InvalidTypeAction> for InvalidTypeAction {
-    fn from(action: spicepod_dataset::InvalidTypeAction) -> Self {
+impl From<spicepod_dataset::UnsupportedTypeAction> for UnsupportedTypeAction {
+    fn from(action: spicepod_dataset::UnsupportedTypeAction) -> Self {
         match action {
-            spicepod_dataset::InvalidTypeAction::Error => InvalidTypeAction::Error,
-            spicepod_dataset::InvalidTypeAction::Warn => InvalidTypeAction::Warn,
-            spicepod_dataset::InvalidTypeAction::Ignore => InvalidTypeAction::Ignore,
+            spicepod_dataset::UnsupportedTypeAction::Error => UnsupportedTypeAction::Error,
+            spicepod_dataset::UnsupportedTypeAction::Warn => UnsupportedTypeAction::Warn,
+            spicepod_dataset::UnsupportedTypeAction::Ignore => UnsupportedTypeAction::Ignore,
+            spicepod_dataset::UnsupportedTypeAction::String => UnsupportedTypeAction::String,
         }
     }
 }
 
-impl From<InvalidTypeAction> for datafusion_table_providers::InvalidTypeAction {
-    fn from(action: InvalidTypeAction) -> Self {
+impl From<UnsupportedTypeAction> for datafusion_table_providers::UnsupportedTypeAction {
+    fn from(action: UnsupportedTypeAction) -> Self {
         match action {
-            InvalidTypeAction::Error => datafusion_table_providers::InvalidTypeAction::Error,
-            InvalidTypeAction::Warn => datafusion_table_providers::InvalidTypeAction::Warn,
-            InvalidTypeAction::Ignore => datafusion_table_providers::InvalidTypeAction::Ignore,
+            UnsupportedTypeAction::Error => {
+                datafusion_table_providers::UnsupportedTypeAction::Error
+            }
+            UnsupportedTypeAction::Warn => datafusion_table_providers::UnsupportedTypeAction::Warn,
+            UnsupportedTypeAction::Ignore => {
+                datafusion_table_providers::UnsupportedTypeAction::Ignore
+            }
+            UnsupportedTypeAction::String => {
+                datafusion_table_providers::UnsupportedTypeAction::String
+            }
         }
     }
 }
@@ -188,11 +207,13 @@ pub struct Dataset {
     pub replication: Option<replication::Replication>,
     pub time_column: Option<String>,
     pub time_format: Option<TimeFormat>,
+    pub time_partition_column: Option<String>,
+    pub time_partition_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Option<Arc<App>>,
     schema: Option<SchemaRef>,
-    pub invalid_type_action: Option<InvalidTypeAction>,
+    pub unsupported_type_action: Option<UnsupportedTypeAction>,
     pub ready_state: ReadyState,
 }
 
@@ -209,6 +230,8 @@ impl PartialEq for Dataset {
             && self.replication == other.replication
             && self.time_column == other.time_column
             && self.time_format == other.time_format
+            && self.time_partition_column == other.time_partition_column
+            && self.time_partition_format == other.time_partition_format
             && self.acceleration == other.acceleration
             && self.embeddings == other.embeddings
             && self.schema == other.schema
@@ -262,11 +285,15 @@ impl TryFrom<spicepod_dataset::Dataset> for Dataset {
             replication: dataset.replication.map(replication::Replication::from),
             time_column: dataset.time_column,
             time_format: dataset.time_format.map(TimeFormat::from),
+            time_partition_column: dataset.time_partition_column,
+            time_partition_format: dataset.time_partition_format.map(TimeFormat::from),
             embeddings: dataset.embeddings,
             acceleration,
             schema: None,
             app: None,
-            invalid_type_action: dataset.invalid_type_action.map(InvalidTypeAction::from),
+            unsupported_type_action: dataset
+                .unsupported_type_action
+                .map(UnsupportedTypeAction::from),
             ready_state,
         })
     }
@@ -285,11 +312,13 @@ impl Dataset {
             replication: None,
             time_column: None,
             time_format: None,
+            time_partition_column: None,
+            time_partition_format: None,
             acceleration: None,
             embeddings: Vec::default(),
             schema: None,
             app: None,
-            invalid_type_action: None,
+            unsupported_type_action: None,
             ready_state: ReadyState::default(),
         })
     }
@@ -308,6 +337,12 @@ impl Dataset {
     #[must_use]
     pub fn with_schema(mut self, schema: SchemaRef) -> Self {
         self.schema = Some(schema);
+        self
+    }
+
+    #[must_use]
+    pub fn with_params(mut self, params: HashMap<String, String>) -> Self {
+        self.params = params;
         self
     }
 
@@ -337,33 +372,6 @@ impl Dataset {
         }
     }
 
-    /// Helper function that finds the position and length of the first delimiter ('://', ':', or '/')
-    fn find_first_delimiter(&self) -> Option<(usize, usize)> {
-        // Find the earliest occurrence of each delimiter
-        let colon_slash_slash = self.from.find("://");
-        let colon = self.from.find(':');
-        let slash = self.from.find('/');
-
-        // Get the position and length of the first delimiter
-        match (colon_slash_slash, colon, slash) {
-            (Some(css), Some(c), Some(s)) => {
-                let min_pos = css.min(c).min(s);
-                Some(if min_pos == css {
-                    (css, 3)
-                } else {
-                    (min_pos, 1)
-                })
-            }
-            (Some(css), Some(c), None) => Some(if css < c { (css, 3) } else { (c, 1) }),
-            (Some(css), None, Some(s)) => Some(if css < s { (css, 3) } else { (s, 1) }),
-            (None, Some(c), Some(s)) => Some(if c < s { (c, 1) } else { (s, 1) }),
-            (Some(css), None, None) => Some((css, 3)),
-            (None, Some(c), None) => Some((c, 1)),
-            (None, None, Some(s)) => Some((s, 1)),
-            (None, None, None) => None,
-        }
-    }
-
     /// Returns the dataset source - the first part of the `from` field before the first '://', ':', or '/'
     #[must_use]
     pub fn source(&self) -> &str {
@@ -371,7 +379,7 @@ impl Dataset {
             return "sink";
         }
 
-        match self.find_first_delimiter() {
+        match find_first_delimiter(&self.from) {
             Some((0, _)) => "",
             Some((pos, _)) => &self.from[..pos],
             None => "spice.ai",
@@ -381,7 +389,7 @@ impl Dataset {
     /// Returns the dataset path - the remainder of the `from` field after the first '://', ':', or '/'
     #[must_use]
     pub fn path(&self) -> &str {
-        match self.find_first_delimiter() {
+        match find_first_delimiter(&self.from) {
             Some((pos, len)) => &self.from[pos + len..],
             None => &self.from,
         }

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -19,7 +19,8 @@ use std::collections::HashMap;
 use crate::results::BenchmarkResultsBuilder;
 use app::AppBuilder;
 use runtime::Runtime;
-use spicepod::component::dataset::acceleration::Mode;
+use spicepod::component::dataset::acceleration::Acceleration;
+use test_framework::queries::{get_clickbench_test_queries, get_tpch_test_queries, QueryOverrides};
 
 pub(crate) mod abfs;
 pub(crate) mod file;
@@ -29,31 +30,37 @@ pub(crate) fn build_app(
     connector: &str,
     app_builder: AppBuilder,
     bench_name: &str,
+    acceleration: Option<Acceleration>,
 ) -> Result<AppBuilder, String> {
     match connector {
         "s3" => s3::build_app(app_builder, bench_name),
         "abfs" => Ok(abfs::build_app(app_builder, bench_name)),
-        "file" => file::build_app(app_builder, bench_name),
+        "file" => file::build_app(app_builder, bench_name, acceleration),
         _ => Err(format!("Unsupported connector {connector}")),
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn run(
     connector: &str,
     rt: &mut Runtime,
     benchmark_results: &mut BenchmarkResultsBuilder,
-    engine: Option<String>,
-    mode: Option<Mode>,
+    acceleration: Option<Acceleration>,
     bench_name: &str,
 ) -> Result<(), String> {
+    let engine = acceleration.clone().and_then(|a| a.engine.clone());
+    let mode = acceleration.clone().map(|a| a.mode);
+
     let test_queries = match bench_name {
-        "tpch" => get_tpch_test_queries(),
+        "tpch" => get_tpch_test_queries(None),
         "tpcds" => {
             // TPCDS Query 1, 30, 64, 81 are commented out for Postgres accelerator, see details in `get_postgres_tpcds_test_queries` function
             #[cfg(feature = "postgres")]
             {
                 if engine.clone().unwrap_or_default().as_str() == "postgres" {
-                    super::bench_postgres::get_tpcds_test_queries()
+                    test_framework::queries::get_tpcds_test_queries(Some(
+                        QueryOverrides::PostgreSQL,
+                    ))
                 } else {
                     get_tpcds_test_queries(engine.as_deref())
                 }
@@ -64,7 +71,9 @@ pub(crate) async fn run(
                 get_tpcds_test_queries(engine.as_deref())
             }
         }
-        "clickbench" => get_clickbench_test_queries(),
+        "clickbench" => {
+            get_clickbench_test_queries(engine.as_deref().and_then(QueryOverrides::from_engine))
+        }
         _ => return Err(format!("Invalid benchmark to run {bench_name}")),
     };
 
@@ -77,34 +86,23 @@ pub(crate) async fn run(
 
     let mut errors = Vec::new();
 
-    for (query_name, query) in test_queries {
-        let verify_query_results = if query_name.starts_with("tpch_q") {
-            matches!(
-                bench_name.as_str(),
-                "s3" | "s3_arrow_memory"
-                    | "s3_sqlite_memory"
-                    | "s3_sqlite_file"
-                    | "s3_duckdb_memory"
-                    | "abfs"
-                    | "s3_duckdb_file"
-                    | "file"
-            )
-        } else if query_name.starts_with("tpcds_q") {
-            matches!(
-                bench_name.as_str(),
-                "s3" | "s3_postgres_memory"
-                    | "s3_arrow_memory"
-                    | "s3_duckdb_file"
-                    | "s3_sqlite_file"
-                    | "file"
-            )
-        } else {
-            false
-        };
+    for (query_name, query) in &test_queries {
+        let verify_query_results = matches!(
+            bench_name.as_str(),
+            "s3" | "s3_postgres_memory"
+                | "s3_arrow_memory"
+                | "s3_duckdb_file"
+                | "s3_sqlite_file"
+                | "file"
+                | "s3_arrow_memory_use_source"
+                | "s3_duckdb_memory_use_source"
+                | "s3_duckdb_file_use_source"
+        ) && (query_name.starts_with("tpch_q")
+            || query_name.starts_with("tpcds_q"));
 
-        if let Err(e) = super::run_query_and_record_result(
+        match super::run_query_and_return_result(
             rt,
-            benchmark_results,
+            benchmark_results.iterations(),
             bench_name.as_str(),
             query_name,
             query,
@@ -112,7 +110,12 @@ pub(crate) async fn run(
         )
         .await
         {
-            errors.push(format!("Query {query_name} failed with error: {e}"));
+            Ok(result) => {
+                benchmark_results.record_result(result);
+            }
+            Err(e) => {
+                errors.push(format!("Query {query_name} failed with error: {e}"));
+            }
         }
     }
 
@@ -121,61 +124,6 @@ pub(crate) async fn run(
     }
 
     Ok(())
-}
-
-fn get_tpch_test_queries() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("tpch_q1", include_str!("../queries/tpch/q1.sql")),
-        ("tpch_q2", include_str!("../queries/tpch/q2.sql")),
-        ("tpch_q3", include_str!("../queries/tpch/q3.sql")),
-        ("tpch_q4", include_str!("../queries/tpch/q4.sql")),
-        ("tpch_q5", include_str!("../queries/tpch/q5.sql")),
-        ("tpch_q6", include_str!("../queries/tpch/q6.sql")),
-        ("tpch_q7", include_str!("../queries/tpch/q7.sql")),
-        ("tpch_q8", include_str!("../queries/tpch/q8.sql")),
-        ("tpch_q9", include_str!("../queries/tpch/q9.sql")),
-        ("tpch_q10", include_str!("../queries/tpch/q10.sql")),
-        ("tpch_q11", include_str!("../queries/tpch/q11.sql")),
-        ("tpch_q12", include_str!("../queries/tpch/q12.sql")),
-        ("tpch_q13", include_str!("../queries/tpch/q13.sql")),
-        ("tpch_q14", include_str!("../queries/tpch/q14.sql")),
-        // tpch_q15 has a view creation which we don't support by design
-        ("tpch_q16", include_str!("../queries/tpch/q16.sql")),
-        ("tpch_q17", include_str!("../queries/tpch/q17.sql")),
-        ("tpch_q18", include_str!("../queries/tpch/q18.sql")),
-        ("tpch_q19", include_str!("../queries/tpch/q19.sql")),
-        ("tpch_q20", include_str!("../queries/tpch/q20.sql")),
-        ("tpch_q21", include_str!("../queries/tpch/q21.sql")),
-        ("tpch_q22", include_str!("../queries/tpch/q22.sql")),
-        (
-            "tpch_simple_q1",
-            include_str!("../queries/tpch/simple_q1.sql"),
-        ),
-        (
-            "tpch_simple_q2",
-            include_str!("../queries/tpch/simple_q2.sql"),
-        ),
-        (
-            "tpch_simple_q3",
-            include_str!("../queries/tpch/simple_q3.sql"),
-        ),
-        (
-            "tpch_simple_q4",
-            include_str!("../queries/tpch/simple_q4.sql"),
-        ),
-        (
-            "tpch_simple_q5",
-            include_str!("../queries/tpch/simple_q5.sql"),
-        ),
-        (
-            "tpch_simple_q6",
-            include_str!("../queries/tpch/simple_q6.sql"),
-        ),
-        (
-            "tpch_simple_q7",
-            include_str!("../queries/tpch/simple_q7.sql"),
-        ),
-    ]
 }
 
 #[allow(clippy::too_many_lines)]
@@ -287,15 +235,15 @@ fn get_tpcds_test_queries(engine: Option<&str>) -> Vec<(&'static str, &'static s
         Some("sqlite") => vec![
             (
                 "tpcds_q49",
-                Some(include_str!("../queries/tpcds/q49_sqlite.sql")),
+                Some(include_str!("../queries/tpcds/sqlite/q49.sql")),
             ),
             (
                 "tpcds_q75",
-                Some(include_str!("../queries/tpcds/q75_sqlite.sql")),
+                Some(include_str!("../queries/tpcds/sqlite/q75.sql")),
             ),
             (
                 "tpcds_q90",
-                Some(include_str!("../queries/tpcds/q90_sqlite.sql")),
+                Some(include_str!("../queries/tpcds/sqlite/q90.sql")),
             ),
             // SQLite does not support `stddev`
             ("tpcds_q17", None),
@@ -345,24 +293,4 @@ fn get_tpcds_test_queries(engine: Option<&str>) -> Vec<(&'static str, &'static s
             }
         })
         .collect()
-}
-
-macro_rules! generate_clickbench_queries {
-    ( $( $i:literal ),* ) => {
-        vec![
-            $(
-                (
-                    concat!("clickbench_q", stringify!($i)),
-                    include_str!(concat!("../queries/clickbench/q", stringify!($i), ".sql"))
-                )
-            ),*
-        ]
-    }
-}
-
-fn get_clickbench_test_queries() -> Vec<(&'static str, &'static str)> {
-    generate_clickbench_queries!(
-        1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-        26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43
-    )
 }

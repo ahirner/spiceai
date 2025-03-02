@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -25,9 +25,11 @@ use crate::{
     utils::{test_request_context, wait_until_true},
 };
 use arrow_flight::{error::FlightError, flight_service_client::FlightServiceClient};
+use flightrepl::cache_control;
 use rand::Rng;
 use runtime::{auth::EndpointAuth, config::Config, Runtime};
 use runtime_auth::{api_key::ApiKeyAuth, FlightBasicAuth};
+use spicepod::component::runtime::ApiKey;
 use tonic::transport::Channel;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -62,7 +64,7 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
             .build()
             .await;
 
-        let api_key_auth = Arc::new(ApiKeyAuth::new(vec!["valid".to_string()]))
+        let api_key_auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid")]))
             as Arc<dyn FlightBasicAuth + Send + Sync>;
 
         // Start the servers
@@ -95,6 +97,7 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
             "SELECT 1",
             Some(&"valid".to_string()),
             &format!("spiceci/{}", env!("CARGO_PKG_VERSION")),
+            cache_control::CacheControl::Cache,
         )
         .await;
         assert!(result.is_ok());
@@ -104,6 +107,7 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
             "SELECT 1",
             None,
             &format!("spiceci/{}", env!("CARGO_PKG_VERSION")),
+            cache_control::CacheControl::Cache,
         )
         .await
         else {

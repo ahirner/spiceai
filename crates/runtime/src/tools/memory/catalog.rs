@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,7 +20,8 @@ use spicepod::component::tool::Tool;
 use std::{collections::HashMap, sync::Arc};
 
 use crate::tools::{
-    catalog::SpiceToolCatalog, factory::ToolFactory, memory::store::StoreMemoryTool, SpiceModelTool,
+    catalog::SpiceToolCatalog, factory::IndividualToolFactory, memory::store::StoreMemoryTool,
+    SpiceModelTool,
 };
 
 use super::load::LoadMemoryTool;
@@ -42,7 +43,7 @@ impl MemoryToolCatalog {
     }
 }
 
-impl ToolFactory for MemoryToolCatalog {
+impl IndividualToolFactory for MemoryToolCatalog {
     fn construct(
         &self,
         component: &Tool,
@@ -67,7 +68,7 @@ impl ToolFactory for MemoryToolCatalog {
 
 #[async_trait]
 impl SpiceToolCatalog for MemoryToolCatalog {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "memory"
     }
 

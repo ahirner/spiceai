@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,18 +18,31 @@ use anyhow::Context;
 use async_openai::error::OpenAIError;
 use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
 use llms::{
-    anthropic::{Anthropic, AnthropicConfig},
+    anthropic::Anthropic,
     chat::{create_hf_model, create_local_model, Chat, Error as ChatError},
+    config::GenericAuthMechanism,
     embeddings::candle::link_files_into_tmp_dir,
     openai::new_openai_client,
+    perplexity::PerplexitySonar,
+    xai::Xai,
 };
-use secrecy::Secret;
+use secrecy::{Secret, SecretString};
 use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+pub(crate) fn create_xai(model_id: &str) -> Result<Arc<Box<dyn Chat>>, anyhow::Error> {
+    let Ok(api_key) = std::env::var("SPICE_XAI_API_KEY") else {
+        return Err(anyhow::anyhow!("SPICE_XAI_API_KEY not set"));
+    };
+    Ok(Arc::new(Box::new(Xai::new(
+        Some(model_id),
+        api_key.as_str(),
+    ))))
+}
 
 pub(crate) fn create_openai(model_id: &str) -> Arc<Box<dyn Chat>> {
     let api_key = std::env::var("SPICE_OPENAI_API_KEY").ok();
@@ -43,20 +56,42 @@ pub(crate) fn create_openai(model_id: &str) -> Arc<Box<dyn Chat>> {
 }
 
 pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<Box<dyn Chat>>, OpenAIError> {
-    let cfg = AnthropicConfig::default()
-        .with_api_key(std::env::var("SPICE_ANTHROPIC_API_KEY").ok())
-        .with_auth_token(std::env::var("SPICE_ANTHROPIC_AUTH_TOKEN").ok());
-    let model = Anthropic::new(cfg, model_id)?;
-
-    Ok(Arc::new(Box::new(model)))
+    let auth = match (
+        std::env::var("SPICE_ANTHROPIC_API_KEY"),
+        std::env::var("SPICE_ANTHROPIC_AUTH_TOKEN"),
+    ) {
+        (Ok(api_key), _) => GenericAuthMechanism::from_api_key(api_key),
+        (_, Ok(auth_token)) => {
+            GenericAuthMechanism::from_bearer_token(auth_token)
+        }
+        _ => return Err(OpenAIError::InvalidArgument("One and only one of 'SPICE_ANTHROPIC_API_KEY' or 'SPICE_ANTHROPIC_AUTH_TOKEN' must be set".to_string())),
+    };
+    Ok(Arc::new(Box::new(Anthropic::new(
+        auth, model_id, None, None,
+    )?)))
 }
 
 pub(crate) fn create_hf(model_id: &str) -> Result<Arc<Box<dyn Chat>>, ChatError> {
     Ok(Arc::new(create_hf_model(
         model_id,
         None,
+        None,
         std::env::var("HF_TOKEN").ok().map(Secret::new).as_ref(),
     )?))
+}
+
+pub(crate) fn create_perplexity() -> Result<Arc<Box<dyn Chat>>, ChatError> {
+    let mut params: HashMap<String, SecretString> = HashMap::new();
+    if let Ok(api_key) = std::env::var("SPICE_PERPLEXITY_AUTH_TOKEN") {
+        params.insert(
+            "perplexity_auth_token".to_string(),
+            SecretString::new(api_key),
+        );
+    }
+    let sonar = PerplexitySonar::from_params(None, &params)
+        .map_err(|e| ChatError::FailedToLoadModel { source: e })?;
+
+    Ok(Arc::new(Box::new(sonar)))
 }
 
 pub(crate) fn create_local(model_id: &str) -> Result<Arc<Box<dyn Chat>>, anyhow::Error> {
@@ -68,6 +103,7 @@ pub(crate) fn create_local(model_id: &str) -> Result<Arc<Box<dyn Chat>>, anyhow:
         temp_dir.join("config.json").to_str(),
         temp_dir.join("tokenizer.json").to_str(),
         temp_dir.join("tokenizer_config.json").to_str(),
+        None,
         None,
     )
     .map_err(anyhow::Error::from)?;

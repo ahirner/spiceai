@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,12 +17,15 @@ limitations under the License.
 use arrow::{
     array::{new_null_array, Array, ArrayRef, ListArray, RecordBatch, StructArray},
     buffer::{Buffer, OffsetBuffer},
-    compute::cast,
     datatypes::{DataType, Field, SchemaRef},
     error::ArrowError,
 };
+use arrow_cast::cast;
+use arrow_schema::Schema;
 use snafu::prelude::*;
 use std::sync::Arc;
+
+use crate::format::{format_column_data, FormatOperation};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -136,6 +139,84 @@ pub fn to_primitive_type_list(
     }
 
     Err(ArrowError::CastError("Invalid column type".into()))
+}
+
+/// Recursively truncates the data in a [`RecordBatch`] to the specified maximum number of characters.
+/// The truncation is applies to [`DataType::Utf8`] and [`DataType::Utf8View`] data.
+///
+/// # Errors
+///
+/// This function will return an error if arrow conversion fails.
+pub fn truncate_string_columns(
+    record_batch: &RecordBatch,
+    max_characters: usize,
+) -> Result<RecordBatch, ArrowError> {
+    let schema = record_batch.schema();
+    let columns = record_batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            format_column_data(
+                Arc::clone(column),
+                field,
+                FormatOperation::TruncateUtf8Length(max_characters),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    RecordBatch::try_new(schema, columns)
+}
+
+/// Truncates any column in the [`RecordBatch`] that is a list of numerical values to the first `max_elements` elements.
+///
+/// # Errors
+///
+/// This function will return an error if arrow conversion fails.
+pub fn truncate_numeric_column_length(
+    record_batch: &RecordBatch,
+    max_elements: usize,
+) -> Result<RecordBatch, ArrowError> {
+    let schema = record_batch.schema();
+    let column_and_fields = record_batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            if is_numeric_list(field) {
+                let new_column = format_column_data(
+                    Arc::clone(column),
+                    field,
+                    FormatOperation::TruncateListLength(max_elements),
+                )?;
+                let new_field = Arc::new(Field::new(
+                    field.name(),
+                    new_column.data_type().clone(),
+                    field.is_nullable(),
+                ));
+                Ok((new_column, new_field))
+            } else {
+                Ok((Arc::clone(column), Arc::clone(field)))
+            }
+        })
+        .collect::<Result<Vec<_>, ArrowError>>()?;
+
+    let (columns, fields) = column_and_fields
+        .into_iter()
+        .unzip::<_, _, Vec<_>, Vec<_>>();
+
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+}
+
+fn is_numeric_list(field: &Arc<Field>) -> bool {
+    match field.data_type() {
+        DataType::LargeListView(inner)
+        | DataType::FixedSizeList(inner, _)
+        | DataType::LargeList(inner)
+        | DataType::ListView(inner)
+        | DataType::List(inner) => inner.data_type().is_numeric(),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -256,5 +337,45 @@ mod test {
         .expect("should create new record batch");
 
         assert_eq!(expected_list_batch, processed_batch);
+    }
+
+    #[test]
+    fn test_truncate_record_batch_data_complex_data() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "labels",
+            DataType::List(Arc::new(Field::new(
+                "struct",
+                DataType::Struct(
+                    vec![
+                        Field::new("id", DataType::Int32, true),
+                        Field::new("name", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ))),
+            true,
+        )]));
+
+        let input_batch_json_data = r#"
+            {"labels": [{"id": 1, "name": "123"}, {"id": 2, "name": "12345"}, {"id": 1, "name": "123456789"}]}
+            {"labels": null}
+            {"labels": [{"id": 4,"name":"test12345"}, {"id": null,"name":null}]}
+            "#;
+
+        let input_batch = parse_json_to_batch(input_batch_json_data, Arc::clone(&schema));
+
+        let processed_batch = truncate_string_columns(&input_batch, 5)
+            .expect("truncate_record_batch_data should succeed");
+
+        let expected_batch_json_data = r#"
+            {"labels": [{"id": 1, "name": "123"}, {"id": 2, "name": "12345"}, {"id": 1, "name": "12345"}]}
+            {"labels": null}
+            {"labels": [{"id": 4,"name":"test1"}, {"id": null,"name":null}]}
+            "#;
+
+        let expected_batch = parse_json_to_batch(expected_batch_json_data, schema);
+
+        assert_eq!(processed_batch, expected_batch);
     }
 }

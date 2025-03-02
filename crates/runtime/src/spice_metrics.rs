@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -83,6 +83,8 @@ pub async fn register_metrics_table(datafusion: &Arc<DataFusion>) -> Result<(), 
     let retention = Retention::new(
         Some("time_unix_nano".to_string()),
         Some(TimeFormat::Timestamptz),
+        None,
+        None,
         Some(Duration::from_secs(1800)), // delete metrics older then 30 minutes
         Some(Duration::from_secs(300)),  // run retention every 5 minutes
         true,

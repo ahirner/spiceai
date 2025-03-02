@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -29,21 +29,15 @@ use axum::{
 
 use crate::{config, status::ComponentStatus};
 
+use super::Format;
+
 #[derive(Debug, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
 #[serde(rename_all = "lowercase")]
 pub struct QueryParams {
     /// The format of the response, either "json" or "csv". Defaults to "json".
-    #[serde(default = "default_format")]
+    #[serde(default)]
     pub format: Format,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[serde(rename_all = "lowercase")]
-pub enum Format {
-    Json,
-    Csv,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -59,11 +53,9 @@ pub struct ConnectionDetails {
     pub status: ComponentStatus,
 }
 
-fn default_format() -> Format {
-    Format::Json
-}
-
-/// Return the status of connections in the runtime.
+/// Check Runtime Status
+///
+/// Return the status of all connections (http, flight, metrics, opentelemetry) in the runtime.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
     path = "/v1/status",

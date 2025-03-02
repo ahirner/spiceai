@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,13 +17,14 @@ limitations under the License.
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use app::App;
-use arrow::array::{RecordBatch, StringArray, StringViewArray};
+use arrow::array::{LargeStringArray, RecordBatch, StringArray, StringViewArray};
 use arrow::error::ArrowError;
 use arrow::util::pretty::pretty_format_batches;
 use arrow_schema::{Schema, SchemaRef};
 use async_openai::types::EmbeddingInput;
 use datafusion::common::utils::quote_identifier;
-use datafusion::sql::sqlparser::ast::Expr;
+use datafusion::sql::sqlparser;
+use datafusion::sql::sqlparser::ast::{Expr, SelectItem, TableFactor, TableWithJoins};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::keywords::Keyword;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -40,8 +41,8 @@ use tracing::{Instrument, Span};
 use crate::accelerated_table::AcceleratedTable;
 use crate::datafusion::query::write_to_json_string;
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
+use crate::{convert_string_arrow_to_iterator, embedding_col, offset_col};
 use crate::{datafusion::DataFusion, model::EmbeddingModelStore};
-use crate::{embedding_col, offset_col};
 
 use super::table::EmbeddingTable;
 use snafu::prelude::*;
@@ -51,7 +52,7 @@ pub enum Error {
     #[snafu(display("Data sources [{}] does not exist", data_source.iter().map(TableReference::to_quoted_string).join(", ")))]
     DataSourcesNotFound { data_source: Vec<TableReference> },
 
-    #[snafu(display("Failed to find table '{}'. An internal error occurred during vector search.\nPlease report a bug on GitHub: https://github.com/spiceai/spiceai/issues", table.to_quoted_string()))]
+    #[snafu(display("Failed to find table '{}'. An internal error occurred during vector search.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues", table.to_quoted_string()))]
     DataSourceNotFound { table: TableReference },
 
     #[snafu(display("Vector search failed: No tables with embeddings are available. Ensure embeddings are configured and try again."))]
@@ -92,6 +93,12 @@ pub enum Error {
 
     #[snafu(display("Invalid WHERE condition: {where_cond}"))]
     InvalidWhereCondition { where_cond: String },
+
+    #[snafu(display("An invalid keyword was specified: {keyword}"))]
+    InvalidKeyword { keyword: String },
+
+    #[snafu(display("Invalid additional column was specified: {additional_column}"))]
+    InvalidAdditionalColumns { additional_column: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -125,7 +132,7 @@ static VECTOR_DISTANCE_COLUMN_NAME: &str = "dist";
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(rename_all = "lowercase")]
-pub struct SearchRequestJson {
+pub struct SearchRequestBaseJson {
     /// The text to search documents for similarity
     pub text: String,
 
@@ -146,18 +153,57 @@ pub struct SearchRequestJson {
     pub additional_columns: Vec<String>,
 }
 
-impl TryFrom<SearchRequestJson> for SearchRequest {
+/// HTTP request schema is separate from AI requests, so that keywords can be supplied as an optional field for HTTP calls.
+/// `schemars` doesn't allow setting `#[serde(default)]` as well as `#[schemars(required)]` - the field does not become required.
+/// When the field is not required, the model ignores it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub struct SearchRequestHTTPJson {
+    #[serde(flatten)]
+    pub base: SearchRequestBaseJson,
+
+    // A list of optional keywords, to pre-filter on the embedding column in SQL before performing the vector search.
+    #[serde(default)]
+    pub keywords: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub struct SearchRequestAIJson {
+    #[serde(flatten)]
+    pub base: SearchRequestBaseJson,
+
+    /// At least one keyword should be supplied for a vector search. Keywords should be individual words.
+    /// Keywords are used to pre-filter the embedding column, applied as a `WHERE col LIKE '%keyword%'` condition.
+    /// Keywords should not contain column names, special characters, or other operators.
+    pub keywords: Vec<String>,
+}
+
+impl From<SearchRequestHTTPJson> for SearchRequestAIJson {
+    fn from(req: SearchRequestHTTPJson) -> Self {
+        SearchRequestAIJson {
+            base: req.base,
+            keywords: req.keywords.unwrap_or_default(),
+        }
+    }
+}
+
+impl TryFrom<SearchRequestAIJson> for SearchRequest {
     type Error = String;
 
-    fn try_from(req: SearchRequestJson) -> Result<Self, Self::Error> {
+    fn try_from(req: SearchRequestAIJson) -> Result<Self, Self::Error> {
         Ok(SearchRequest::new(
-            req.text,
-            req.datasets,
-            req.limit.unwrap_or(default_limit()),
-            req.where_cond
+            req.base.text,
+            req.base.datasets,
+            req.base.limit.unwrap_or(default_limit()),
+            req.base
+                .where_cond
                 .map(|r| SearchRequest::parse_where_cond(r).map_err(|e| e.to_string()))
                 .transpose()?,
-            req.additional_columns,
+            SearchRequest::parse_additional_columns(&req.base.additional_columns)
+                .map_err(|e| e.to_string())?,
+            SearchRequest::parse_keywords(&req.keywords).map_err(|e| e.to_string())?,
         ))
     }
 }
@@ -178,6 +224,9 @@ pub struct SearchRequest {
 
     /// Additional columns to return from the dataset.
     pub additional_columns: Vec<String>,
+
+    /// Keywords to perform a lexical search and pre-filter the embedding column.
+    pub keywords: Vec<String>,
 }
 
 #[must_use]
@@ -197,6 +246,7 @@ impl SearchRequest {
         limit: usize,
         where_cond: Option<Expr>,
         additional_columns: Vec<String>,
+        keywords: Vec<String>,
     ) -> Self {
         SearchRequest {
             text,
@@ -204,6 +254,7 @@ impl SearchRequest {
             limit,
             where_cond,
             additional_columns,
+            keywords,
         }
     }
 
@@ -234,6 +285,150 @@ impl SearchRequest {
         }
 
         Ok(expr)
+    }
+
+    pub fn parse_additional_columns(additional_columns: &[String]) -> Result<Vec<String>> {
+        additional_columns
+            .iter()
+            .map(|c| {
+                let select_statement = format!("{c} FROM testing");
+                let parser = Parser::new(&GenericDialect);
+                let mut parser = parser.try_with_sql(&select_statement).map_err(|err| {
+                    tracing::trace!("vector_search additional column parsing failed. {err}");
+                    InvalidAdditionalColumnsSnafu {
+                        additional_column: c.clone(),
+                    }
+                    .build()
+                })?;
+
+                // parse the SELECT
+                let expr = parser.parse_select().map_err(|err| {
+                    tracing::trace!("vector_search additional column parsing failed. {err}");
+                    InvalidAdditionalColumnsSnafu {
+                        additional_column: c.clone(),
+                    }
+                    .build()
+                })?;
+
+                if expr.projection.len() > 1 || expr.from.len() > 1 {
+                    tracing::trace!("vector_search additional column parsing failed. expected 1 projection and 1 table, but got {expr:?}");
+                    return Err(InvalidAdditionalColumnsSnafu {
+                        additional_column: c.clone(),
+                    }
+                    .build());
+                }
+
+                let Some(SelectItem::UnnamedExpr(Expr::Identifier(sqlparser::ast::Ident {
+                    value,
+                    ..
+                }))) = expr.projection.first()
+                else {
+                    tracing::trace!("vector_search additional column parsing failed. expected an identifier, but got {expr:?}");
+                    return Err(InvalidAdditionalColumnsSnafu {
+                        additional_column: c.clone(),
+                    }
+                    .build());
+                };
+
+                if value != c {
+                    tracing::trace!("vector_search additional column parsing failed. expected {c}, but got {value}");
+                    return Err(InvalidAdditionalColumnsSnafu {
+                        additional_column: c.clone(),
+                    }
+                    .build());
+                }
+
+                let Some(TableWithJoins { relation, .. }) = expr.from.first() else {
+                    tracing::trace!("vector_search additional column parsing failed. expected a table, but got {expr:?}");
+                    return Err(InvalidAdditionalColumnsSnafu {
+                        additional_column: c.clone(),
+                    }
+                    .build());
+                };
+
+                let TableFactor::Table { name, .. } = relation else {
+                    tracing::trace!("vector_search additional column parsing failed. expected a table, but got {relation:?}");
+                    return Err(InvalidAdditionalColumnsSnafu {
+                        additional_column: c.clone(),
+                    }
+                    .build());
+                };
+
+                if name.to_string() != "testing" {
+                    tracing::trace!("vector_search additional column parsing failed. expected 'testing', but got {name}");
+                    return Err(InvalidAdditionalColumnsSnafu {
+                        additional_column: c.clone(),
+                    }
+                    .build());
+                }
+
+                let next_token = parser.next_token();
+                if next_token != Token::EOF {
+                    tracing::trace!("vector_search additional column parsing failed. expected EOF, but got {next_token:?}");
+                    return Err(InvalidAdditionalColumnsSnafu {
+                        additional_column: c.clone(),
+                    }
+                    .build());
+                }
+
+                Ok(c.clone())
+            })
+            .collect::<Result<Vec<String>>>()
+    }
+
+    pub fn parse_keywords(keywords: &[String]) -> Result<Vec<String>> {
+        keywords
+            .iter()
+            .map(|k| {
+                let expression = format!("target_column ILIKE \"%{}%\"", k.to_lowercase()); // emulate the use of the keyword in the query.
+                let parser = Parser::new(&GenericDialect);
+                let mut parser = parser.try_with_sql(&expression).map_err(|err| {
+                    tracing::trace!("vector_search keyword parsing failed. {err}");
+                    InvalidKeywordSnafu {
+                        keyword: k.clone(),
+                    }
+                    .build()
+                })?;
+
+                // The keyword will exist on its own if nothing else is present.
+                let expr = parser.parse_expr().map_err(|err| {
+                    tracing::trace!("vector_search keyword parsing failed. {err}");
+                    InvalidKeywordSnafu {
+                        keyword: k.clone(),
+                    }
+                    .build()
+                })?;
+
+                let Expr::ILike { expr, pattern, .. } = expr else {
+                    tracing::trace!("vector_search keyword parsing failed. expected ILIKE, but got {expr:?}");
+                    return Err(InvalidKeywordSnafu { keyword: k.clone() }.build());
+                };
+
+                if let (Expr::Identifier(id), Expr::Identifier(v)) = (*expr.clone(), *pattern.clone()) {
+                    if id.value.to_lowercase() != "target_column" {
+                        tracing::trace!("vector_search keyword parsing failed. expected 'target_column', but got {}", id.value);
+                        return Err(InvalidKeywordSnafu { keyword: k.clone() }.build());
+                    }
+
+                    if v.value.to_lowercase() != format!("%{}%", k.to_lowercase()) {
+                        tracing::trace!("vector_search keyword parsing failed. expected '%{}%', but got {}", k.to_lowercase(), v.value);
+                        return Err(InvalidKeywordSnafu { keyword: k.clone() }.build());
+                    }
+                } else {
+                    tracing::trace!("vector_search keyword parsing failed. expected identifiers, but got {expr:?} - {pattern:?}");
+                    return Err(InvalidKeywordSnafu { keyword: k.clone() }.build());
+                };
+
+                // Ensure the expression is the last token.
+                let next_token = parser.next_token();
+                if next_token != Token::EOF {
+                    tracing::trace!("vector_search keyword parsing failed. expected EOF, but got {next_token:?}");
+                    return Err(InvalidKeywordSnafu { keyword: k.clone() }.build());
+                }
+
+                Ok(k.clone())
+            })
+            .collect::<Result<Vec<String>>>()
     }
 }
 
@@ -352,19 +547,9 @@ impl VectorSearchTableResult {
         let result = embedding_records
             .iter()
             .flat_map(|v| {
-                let embedded_column = v.column(0);
-                if let Some(col) = embedded_column.as_any().downcast_ref::<StringArray>() {
-                    col.iter()
-                        .map(|v| v.unwrap_or_default().to_string())
-                        .collect::<Vec<String>>()
-                } else if let Some(col) = embedded_column.as_any().downcast_ref::<StringViewArray>()
-                {
-                    col.iter()
-                        .map(|v| v.unwrap_or_default().to_string())
-                        .collect::<Vec<String>>()
-                } else {
-                    vec![]
-                }
+                convert_string_arrow_to_iterator!(v.column(0))
+                    .map(|v| v.map(|vv| vv.unwrap_or_default().to_string()).collect_vec())
+                    .unwrap_or_default()
             })
             .collect();
 
@@ -383,7 +568,6 @@ impl VectorSearchTableResult {
         if self.data.first().is_none_or(|d| d.num_rows() == 0) {
             return Ok(vec![]);
         }
-
         let primary_keys_json = self.primary_keys_json()?;
         let additional_columns_json = self.addition_columns_json()?;
         let values = self.embedding_columns_list()?;
@@ -476,7 +660,6 @@ pub fn to_matches_sorted(result: &VectorSearchResult, limit: usize) -> Result<Ve
     });
 
     matches.truncate(limit);
-
     Ok(matches)
 }
 
@@ -512,33 +695,43 @@ impl VectorSearch {
                 .collect_vec()
         };
 
+        let final_projection_str = if projection.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "{},",
+                // `t.` refers to the table name alias in SQL below.
+                projection.iter().map(|s| format!("t.{s}")).join(", ")
+            )
+        };
+
         format!(
-            "WITH ranked_docs as (
-                SELECT {pks}, {VECTOR_DISTANCE_COLUMN_NAME}, offset FROM (
-                    SELECT
-                        {pks},
-                        offset,
-                        {VECTOR_DISTANCE_COLUMN_NAME},
-                        ROW_NUMBER() OVER (
-                            PARTITION BY ({pks})
-                            ORDER BY dist ASC
-                        ) AS chunk_rank
-                    FROM (
-                        SELECT
-                            {pks},
-                            unnest({embed_col_offset}) AS offset,
-                            cosine_distance(unnest({embed_col_embedding}), {embedding:?}) AS {VECTOR_DISTANCE_COLUMN_NAME}
-                        FROM {table_name}
-                        {where_cond}
-                    )
-                )
+            "WITH distances as (
+                SELECT
+                    {pks},
+                    unnest({embed_col_offset}) AS offset,
+                    cosine_distance(unnest({embed_col_embedding}), {embedding:?}) AS {VECTOR_DISTANCE_COLUMN_NAME}
+                FROM {table_name}
+                {where_cond}
+            ),
+            ranks as (
+                SELECT
+                    {pks},
+                    distances.offset,
+                    distances.{VECTOR_DISTANCE_COLUMN_NAME},
+                    ROW_NUMBER() OVER (PARTITION BY ({pks}) ORDER BY distances.{VECTOR_DISTANCE_COLUMN_NAME} ASC) AS chunk_rank
+                FROM distances
+            ),
+            ranked_docs as (
+                select {pks}, ranks.{VECTOR_DISTANCE_COLUMN_NAME}, ranks.offset
+                from ranks
                 WHERE chunk_rank = 1
-                ORDER by dist ASC
+                ORDER by {VECTOR_DISTANCE_COLUMN_NAME} ASC
                 LIMIT {n}
             )
             SELECT
                 substring(t.{embed_col}, rd.offset[1], rd.offset[2] - rd.offset[1]) AS {embed_col}_chunk,
-                {projection_str},
+                {projection_str}
                 rd.{VECTOR_DISTANCE_COLUMN_NAME}
             FROM ranked_docs rd
             JOIN {table_name} t ON {join_on_conditions}",
@@ -546,9 +739,7 @@ impl VectorSearch {
                 embed_col_offset=offset_col!(quote_identifier(embedding_column).to_string()),
                 embed_col_embedding=embedding_col!(quote_identifier(embedding_column).to_string()),
                 pks = pks.iter().join(", "),
-                projection_str = projection.iter()
-                    .map(|s| format!("t.{s}"))
-                    .join(", "),
+                projection_str = final_projection_str,
                 join_on_conditions = pks
                     .iter()
                     .map(|pk| format!("rd.{p} = t.{p}", p = quote_identifier(pk)))
@@ -567,6 +758,7 @@ impl VectorSearch {
         is_chunked: bool,
         additional_columns: &[String],
         where_cond: Option<&Expr>,
+        keywords: &[&str],
         n: usize,
     ) -> Result<VectorSearchTableResult> {
         let projection: Vec<String> = primary_keys
@@ -578,12 +770,40 @@ impl VectorSearch {
             .map(|s| quote_identifier(&s).to_string())
             .collect();
 
-        let where_str = where_cond.map_or_else(String::new, |cond| format!("WHERE ({cond})"));
+        let keywords_filter = keywords
+            .iter()
+            .map(|k| format!("{embedding_column} ILIKE '%{k}%'"))
+            .join(" OR ");
+
+        let where_str = match (where_cond, keywords.is_empty()) {
+            (Some(cond), false) => {
+                format!("WHERE ({cond}) AND ({keywords_filter})")
+            }
+            (Some(cond), true) => format!("WHERE ({cond})"),
+            (None, false) => format!("WHERE ({keywords_filter})"),
+            (None, true) => String::new(),
+        };
 
         let query = if is_chunked {
+            // Remove the embedding column from the projection if it is not in the additional columns.
+            // The chunk from the embedding column is added back separately.
+            let mut chunked_projection = projection.clone();
+            let c = quote_identifier(embedding_column);
+            if !additional_columns.contains(&c.to_string()) {
+                if let Some(index) = chunked_projection.iter().enumerate().find_map(|(i, col)| {
+                    if col == &c {
+                        Some(i)
+                    } else {
+                        None
+                    }
+                }) {
+                    chunked_projection.remove(index);
+                }
+            }
+
             Self::construct_chunk_query_sql(
                 primary_keys,
-                &projection,
+                &chunked_projection,
                 embedding_column,
                 tbl,
                 &embedding,
@@ -644,6 +864,7 @@ impl VectorSearch {
             limit,
             where_cond,
             additional_columns,
+            keywords,
         } = req;
 
         let tables = match data_source_opt {
@@ -676,6 +897,7 @@ impl VectorSearch {
                 .await?;
 
             let mut response: VectorSearchResult = HashMap::new();
+            let keywords = keywords.iter().map(std::string::String::as_str).collect::<Vec<&str>>();
 
             for (tbl, search_vectors) in per_table_embeddings {
                 tracing::debug!("Running vector search for table {:#?}", tbl);
@@ -721,6 +943,7 @@ impl VectorSearch {
                                 embedding_table.is_chunked(embedding_column),
                                 additional_columns,
                                 where_cond.as_ref(),
+                                &keywords,
                                 *limit,
                             )
                             .await?;
@@ -979,7 +1202,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_search_request_schema() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        serde_json::to_value(schema_for!(SearchRequestJson)).boxed()?;
+        serde_json::to_value(schema_for!(SearchRequestAIJson)).boxed()?;
         Ok(())
     }
 
@@ -1103,5 +1326,99 @@ pub(crate) mod tests {
         } else {
             panic!("Expected BinaryOp expression");
         }
+    }
+
+    #[test]
+    fn test_search_request_parse_additional_columns() {
+        let additional_columns = vec!["column1".to_string(), "column2".to_string()];
+        let result = SearchRequest::parse_additional_columns(&additional_columns);
+        assert!(result.is_ok());
+
+        // Test invalid column name
+        let additional_columns = vec!["column 1".to_string()];
+        let result = SearchRequest::parse_additional_columns(&additional_columns);
+        assert!(result.is_err());
+
+        // Test empty column name
+        let additional_columns = vec![String::new()];
+        let result = SearchRequest::parse_additional_columns(&additional_columns);
+        assert!(result.is_err());
+
+        // Test escaping column name
+        let additional_columns = vec!["1; DROP TABLE testing; --".to_string()]; // would result in SELECT 1; DROP TABLE testing; -- FROM testing;
+        let result = SearchRequest::parse_additional_columns(&additional_columns);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_performance_of_column_parsing() {
+        let mut timings = vec![];
+
+        for _ in 0..3 {
+            let mut additional_columns = vec!["column1".to_string()];
+            for i in 0..100 {
+                let start = std::time::Instant::now();
+                let result = SearchRequest::parse_additional_columns(&additional_columns);
+                timings.push(start.elapsed());
+                assert!(result.is_ok());
+                additional_columns.push(format!("column{}", i + 2));
+            }
+        }
+
+        let total_time: std::time::Duration = timings.iter().sum();
+        #[allow(clippy::cast_possible_truncation)]
+        let average_time = total_time / (timings.len() as u32);
+        let average_time_ns = average_time.as_nanos();
+        assert!(
+            average_time_ns < 1_000_000,
+            "Average time: {average_time_ns}ns"
+        ); // less than 1ms
+    }
+
+    #[test]
+    fn test_search_request_parse_keywords() {
+        let keywords = vec!["keyword1".to_string(), "keyword2".to_string()];
+        let result = SearchRequest::parse_keywords(&keywords);
+        assert!(result.is_ok());
+
+        // Test keyword with a space
+        let keywords = vec!["keyword 1".to_string()];
+        let result = SearchRequest::parse_keywords(&keywords);
+        assert!(result.is_ok());
+
+        // Test empty keyword
+        let keywords = vec![String::new()];
+        let result = SearchRequest::parse_keywords(&keywords);
+        assert!(result.is_ok());
+
+        // Test escaping keyword
+        let keywords = vec!["\"); DROP TABLE testing;".to_string()];
+        let result = SearchRequest::parse_keywords(&keywords);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_performance_of_keyword_parsing() {
+        let mut timings = vec![];
+
+        for _ in 0..3 {
+            let mut keywords = vec!["column1".to_string()];
+            for i in 0..100 {
+                let start = std::time::Instant::now();
+                let result = SearchRequest::parse_keywords(&keywords);
+                timings.push(start.elapsed());
+                assert!(result.is_ok());
+                keywords.push(format!("column{}", i + 2));
+            }
+        }
+
+        let total_time: std::time::Duration = timings.iter().sum();
+        #[allow(clippy::cast_possible_truncation)]
+        let average_time = total_time / (timings.len() as u32);
+        let average_time_ns = average_time.as_nanos();
+        assert!(
+            average_time_ns < 1_000_000,
+            "Average time: {average_time_ns}ns"
+        ); // less than 1ms
     }
 }

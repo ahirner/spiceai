@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -45,14 +45,14 @@ pub type EvalScorerRegistry = Arc<RwLock<HashMap<String, Arc<dyn Scorer>>>>;
 /// Compute the scores for each [`Scorer`] selected given the results of running a model.
 pub(crate) async fn score_results(
     input: &[DatasetInput],
-    output: &[DatasetOutput],
+    actual: &[DatasetOutput],
     expected: &[DatasetOutput],
     scorers: &HashMap<String, Arc<dyn Scorer>>,
 ) -> HashMap<String, Vec<f32>> {
-    let mut aggregate: HashMap<String, Vec<f32>> = HashMap::with_capacity(output.len());
-    for ((input, output), expected) in input.iter().zip(output.iter()).zip(expected.iter()) {
+    let mut aggregate: HashMap<String, Vec<f32>> = HashMap::with_capacity(actual.len());
+    for ((input, actual), expected) in input.iter().zip(actual.iter()).zip(expected.iter()) {
         for (name, scorer) in scorers {
-            let s = scorer.score(input, output, expected).await;
+            let s = scorer.score(input, actual, expected).await;
             if let Some(scorer_results) = aggregate.get_mut(name) {
                 scorer_results.push(s);
             } else {

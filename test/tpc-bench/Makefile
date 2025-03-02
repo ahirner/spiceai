@@ -213,6 +213,8 @@ pg-tpcds-load:
 		sed 's/|$$//' tpcds-kit/tools/tmp/data/$$table.dat > ./tmp/$$table.dat; \
 		psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -c "\\copy $$table FROM './tmp/$$table.dat' CSV DELIMITER '|';"; \
 	done
+	@echo "Applying foreign keys from tpcds_ri.sql..."
+	@psql -h $(DB_HOST) -p $(DB_PORT) -U $(DB_USER) $(DB_NAME) -f ./tpcds-kit/tools/tpcds_ri.sql
 	@echo "Benchmark dataset has been successfully loaded to '$(DB_NAME)' database."
 
 file-tpch-init:
@@ -231,7 +233,7 @@ file-tpch-load:
 		echo "Loading $$table..."; \
 		cp ./tmp/$$table.parquet ./file-tpch-spicepod/$$table.parquet; \
 	done
-	@echo "version: v1beta1" >> ./file-tpch-spicepod/spicepod.yaml
+	@echo "version: v1" >> ./file-tpch-spicepod/spicepod.yaml
 	@echo "kind: Spicepod" >> ./file-tpch-spicepod/spicepod.yaml
 	@echo "name: file" >> ./file-tpch-spicepod/spicepod.yaml
 	@echo "datasets:" >> ./file-tpch-spicepod/spicepod.yaml
@@ -261,7 +263,7 @@ file-tpcds-load:
 		echo "Loading $$table..."; \
 		cp ./tmp/$$table.parquet ./file-tpcds-spicepod/$$table.parquet; \
 	done
-	@echo "version: v1beta1" >> ./file-tpcds-spicepod/spicepod.yaml
+	@echo "version: v1" >> ./file-tpcds-spicepod/spicepod.yaml
 	@echo "kind: Spicepod" >> ./file-tpcds-spicepod/spicepod.yaml
 	@echo "name: file" >> ./file-tpcds-spicepod/spicepod.yaml
 	@echo "datasets:" >> ./file-tpcds-spicepod/spicepod.yaml

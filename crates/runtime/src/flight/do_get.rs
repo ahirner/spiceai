@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -81,7 +81,7 @@ async fn do_get_simple(
     tracing::trace!("do_get_simple: {ticket:?}");
     match std::str::from_utf8(&ticket.ticket) {
         Ok(sql) => {
-            let (output, from_cache) =
+            let (output, cache_status) =
                 Box::pin(Service::sql_to_flight_stream(datafusion, sql)).await?;
 
             let timed_output = TimedStream::new(output, move || start);
@@ -89,7 +89,7 @@ async fn do_get_simple(
             let mut response =
                 Response::new(Box::pin(timed_output) as <Service as FlightService>::DoGetStream);
 
-            attach_cache_metadata(&mut response, from_cache);
+            attach_cache_metadata(&mut response, cache_status);
 
             Ok(response)
         }

@@ -1,3 +1,19 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package cmd
 
 import (
@@ -57,7 +73,9 @@ spice search --cloud
 		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
 		rtcontext := context.NewContext().WithCloud(cloud)
 
-		rtcontext.RequireModelsFlavor(cmd)
+		if !cloud {
+			rtcontext.RequireModelsFlavor(cmd)
+		}
 
 		datasets, err := api.GetDatasetsWithStatus(rtcontext)
 		if err != nil {
@@ -109,7 +127,7 @@ spice search --cloud
 			}
 
 			if strings.Trim(message, " ") == "" {
-				cmd.Println("Please enter a search query.")
+				cmd.Println("Enter a search query.")
 				continue
 			}
 
@@ -207,7 +225,6 @@ func init() {
 	searchCmd.Flags().String(modelKeyFlag, "", "Model to use for search")
 	searchCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for search (default: http://localhost:8090)")
 	searchCmd.Flags().Uint(limitKeyFlag, 10, "Limit number of search results")
-	searchCmd.Flags().String("api-key", "", "The API key to use for authentication")
 
 	RootCmd.AddCommand(searchCmd)
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,10 +18,11 @@ use crate::{
     Runtime,
 };
 use arrow::util::pretty::pretty_format_batches;
+use arrow_tools::record_batch::{truncate_numeric_column_length, truncate_string_columns};
 use async_trait::async_trait;
 use serde_json::Value;
 use snafu::ResultExt;
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 use tracing::Span;
 use tracing_futures::Instrument;
 
@@ -60,17 +61,17 @@ impl SampleDataTool {
 
 #[async_trait]
 impl SpiceModelTool for SampleDataTool {
-    fn name(&self) -> &str {
+    fn name(&self) -> Cow<'_, str> {
         match self.name {
-            Some(ref name) => name,
-            None => self.method.name(),
+            Some(ref name) => name.into(),
+            None => self.method.name().into(),
         }
     }
 
-    fn description(&self) -> Option<&str> {
+    fn description(&self) -> Option<Cow<'_, str>> {
         match self.description {
-            Some(ref desc) => Some(desc.as_str()),
-            None => Some(self.method.description()),
+            Some(ref desc) => Some(desc.into()),
+            None => Some(self.method.description().into()),
         }
     }
 
@@ -88,10 +89,15 @@ impl SpiceModelTool for SampleDataTool {
         rt: Arc<Runtime>,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let params = self.method.parse_args(arg).boxed()?;
-        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sample_data", tool = self.name(), input = format!("{params}"), sample_method = self.method.name());
+        let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sample_data", tool = self.name().to_string(), input = format!("{params}"), sample_method = self.method.name());
 
         async {
-            let batch = params.sample(rt.datafusion()).await?;
+            let mut batch = params.sample(rt.datafusion()).await?;
+
+            // truncate large text fields
+            batch = truncate_string_columns(&batch, 512)?;
+            batch = truncate_numeric_column_length(&batch, 8)?;
+
             let serial = pretty_format_batches(&[batch]).boxed()?;
 
             Ok(Value::String(format!("{serial}")))

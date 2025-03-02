@@ -6,137 +6,59 @@ If you have a feature request or suggestion, please [get in touch](https://githu
 
 ## Known bugs
 
-- See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to file a new Issue if you see a bug and let us know on Discord.
-
-## v1.0-rc.3 (Dec 2024)
-
-- Bugfixes and performance improvements
-- Spice.ai Cloud Platform data connector (Release Candidate)
-- Dremio data connector (Release Candidate)
-- MS SQL data connector (Release Candidate)
-- File data connector (Release Candidate)
-- Data Accelerators: SQLite & PostgreSQL (Release Candidate)
-- DynamoDB data connector (Alpha)
-- [#3318](https://github.com/spiceai/spiceai/issues/3318) FinanceBench in CI
-- [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search
-
-## v1.0-stable (Jan 2025)
-
-- Bugfixes and performance improvements
-- CLI
-  - Spicepod publish to [spicerack.org](https://spicerack.org)
-- Data Accelerators: Arrow, DuckDB, SQLite, PostgreSQL (Stable)
-- Model Providers: OpenAI, Hugging Face (Stable)
-- Catalog Providers: Unity Catalog, Spice.AI Cloud Platform (Stable)
-- Databricks DeltaLake data connector (Stable)
-- Spice.ai Cloud Platform data connector (Stable)
-- S3 data connector (Stable)
-- PostgreSQL Data Connector (Stable)
-- MySQL Data Connector (Stable)
-- DuckDB Data Connector (Stable)
-- GitHub Data Connector (Stable)
-- GraphQL Data Connector (Stable)
-- MS SQL data connector (Stable)
-- File data connector (Stable)
-- Dremio data connector (Stable)
-- Model Providers: Anthropic, Groq, Grok, File (Beta)
-- Catalog Providers: Databricks (Beta)
-- FTP/SFTP Data Connector (Beta)
-- Snowflake Data Connector (Beta)
-- Spark Data Connector (Beta)
-
-### v1.0-stable Data Connector Support
-
-| Name            | Status |
-| --------------- | ------ |
-| `databricks`    | Stable |
-| `delta_lake`    | Stable |
-| `postgres`      | Stable |
-| `spiceai`       | Stable |
-| `s3`            | Stable |
-| `mysql`         | Stable |
-| `file`          | Stable |
-| `duckdb`        | Stable |
-| `github`        | Stable |
-| `graphql`       | Stable |
-| `dremio`        | Stable |
-| `mssql`         | Stable |
-| `odbc`          | Beta   |
-| `spark`         | Beta   |
-| `snowflake`     | Beta   |
-| `ftp`, `sftp`   | Beta   |
-| `http`, `https` | Beta   |
-| `clickhouse`    | Alpha  |
-| `flightsql`     | Alpha  |
-| `debezium`      | Alpha  |
-| `sharepoint`    | Alpha  |
-
-### v1.0-stable Data Accelerator Support
-
-| Name         | Status |
-| ------------ | ------ |
-| `arrow`      | Stable |
-| `duckdb`     | Stable |
-| `sqlite`     | Stable |
-| `postgresql` | Stable |
-
-### v1.0-stable Catalog Provider Support
-
-| Name            | Status |
-| --------------- | ------ |
-| `unity_catalog` | Stable |
-| `spice.ai`      | Stable |
-| `databricks`    | Beta   |
-
-### v1.0-stable Model Provider Support
-
-| Name          | Status |
-| ------------- | ------ |
-| `openai`      | Stable |
-| `huggingface` | Stable |
-| `file`        | Beta   |
-| `anthropic`   | Beta   |
-| `azure`       | Beta   |
-| `groq`        | Beta   |
-| `grok`        | Alpha  |
+- See [Bugs](https://github.com/spiceai/spiceai/labels/bug). Feel free to [file a new Issue](https://github.com/spiceai/spiceai/issues/new?template=bug_report.md) if you see a bug and let us know on Discord.
 
 ## v1.1 (Feb 2025)
 
-- Bugfixes
-- Enterprise Search improvements
-  - [#3006](https://github.com/spiceai/spiceai/issues/3006) Search with keyword filtering
-  - [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (DB + Vector)
-  - [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion Search
+- [#3320](https://github.com/spiceai/spiceai/issues/3320) Eval datasets
+- [#3318](https://github.com/spiceai/spiceai/issues/3318) AI/LLM benchmarks in CI
+- Model Providers: HuggingFace, File (Release Candidate)
+- Spice Cloud Catalog Connector (Beta)
 
 ## v1.2 (Mar 2025)
 
-## v1.3 (April 2025)
+- Enterprise Search and Retrieval improvements
+  - [#3006](https://github.com/spiceai/spiceai/issues/3006) Search with keyword filtering
+  - [#3016](https://github.com/spiceai/spiceai/issues/3016) Hybrid-Search (DB + Vector)
+  - [#3015](https://github.com/spiceai/spiceai/issues/3015) DataFusion Search
+- AWS Glue Catalog Connector (Alpha)
+- [#3018](https://github.com/spiceai/spiceai/issues/3018) Results caching for embeddings and search
+- Spice Cloud Data Connector (Stable)
 
-## v2 (2025)
+## v1.3 (Apr 2025)
 
+- Data Accelerators: PostgreSQL (Stable)
 - Ingestion
+  - PostgreSQL write
   - Delta Lake write
   - Iceberg write
+
+## v2 (H2 2025)
+
 - Policy
   - Security
   - Data Access
 - Extensible Middleware
-  - AuthN Providers
+- AuthN Providers
 
 ## Features being considered
 
 - Data Connectors
+
+  - S3 Tables
+  - ElasticSearch
   - MotherDuck
   - BigQuery
   - Kafka
   - Google Docs
-- Catalog Providers
-
-  - AWS Glue
 
 - APIs
+
   - GraphQL API
   - Key/Value API
     - SlateDB data accelerator
     - RocksDB data accelerator
   - PostgreSQL API
+
+- AI
+  - Vision

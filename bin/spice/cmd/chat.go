@@ -1,3 +1,19 @@
+/*
+Copyright 2024-2025 The Spice.ai OSS Authors
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+     https://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
 package cmd
 
 import (
@@ -111,7 +127,9 @@ spice chat --model <model> --cloud
 			rtcontext.SetUserAgentClient("chat")
 		}
 
-		rtcontext.RequireModelsFlavor(cmd)
+		if !cloud {
+			rtcontext.RequireModelsFlavor(cmd)
+		}
 
 		model, err := cmd.Flags().GetString(modelKeyFlag)
 		if err != nil {
@@ -119,21 +137,21 @@ spice chat --model <model> --cloud
 			os.Exit(1)
 		}
 		if model == "" {
-			models, err := api.GetData[api.Model](rtcontext, "/v1/models?status=true")
+			models, err := api.GetDataSingle[api.ModelResponse](rtcontext, "/v1/models?status=true")
 			if err != nil {
 				slog.Error("could not list models", "error", err)
 				os.Exit(1)
 			}
 
-			if len(models) == 0 {
+			if len(models.Data) == 0 {
 				slog.Error("No models found")
 				os.Exit(1)
 			}
 
 			availableModels := []string{}
-			for _, model := range models {
+			for _, model := range models.Data {
 				if model.Status == "Ready" {
-					availableModels = append(availableModels, model.Name)
+					availableModels = append(availableModels, model.Id)
 				}
 			}
 
@@ -199,7 +217,9 @@ spice chat --model <model> --cloud
 				Stream:        true,
 				StreamOptions: &StreamOptions{IncludeUsage: true},
 			}
-
+			var timeAtCompletion time.Time
+			var timeAtFirstToken time.Time
+			startTime := time.Now()
 			response, err := sendChatRequest(rtcontext, body)
 			if err != nil {
 				slog.Error("failed to send chat request to spiced", "error", err)
@@ -211,13 +231,13 @@ spice chat --model <model> --cloud
 
 			/// Usage for the entire stream, and related timing.
 			var usage Usage
-			startTime := time.Now()
-			var endTime time.Time
-
 			doneLoading := false
 
 			for scanner.Scan() {
 				chunk := scanner.Text()
+				if timeAtFirstToken.IsZero() {
+					timeAtFirstToken = time.Now()
+				}
 
 				errorEvent, err := maybeErrorEvent(chunk, scanner)
 
@@ -250,7 +270,7 @@ spice chat --model <model> --cloud
 
 				if chatResponse.Usage != nil {
 					usage = *chatResponse.Usage
-					endTime = time.Now()
+					timeAtCompletion = time.Now()
 				}
 
 				if len(chatResponse.Choices) == 0 {
@@ -275,7 +295,11 @@ spice chat --model <model> --cloud
 				messages = append(messages, Message{Role: "assistant", Content: responseMessage})
 			}
 			if usage != (Usage{}) {
-				cmd.Printf("\n\n%s\n\n", generateUsageMessage(&usage, endTime.Sub(startTime).Abs()))
+				cmd.Printf("\n\n%s\n\n", generateUsageMessage(
+					&usage,
+					timeAtFirstToken.Sub(startTime).Abs(),
+					timeAtCompletion.Sub(timeAtFirstToken).Abs(),
+				))
 			} else {
 				cmd.Print("\n\n")
 			}
@@ -286,24 +310,23 @@ spice chat --model <model> --cloud
 // `generateUsageMessage` generates a boxed summary of the usage statistics.
 //
 // ```shell
-// +-----------------------------------------------------------+
-// | Total tokens: 229 (53.60/s). Completion: 219. Prompt: 10. |
-// +-----------------------------------------------------------+
+// Time: 3.36s (first token 0.45s). Tokens: 1652. Prompt: 1475. Completion: 177 (292.25/s).
 // ```
-func generateUsageMessage(u *Usage, dur time.Duration) string {
+// If no usage data provided:
+// ```shell
+// Time: 3.36s (first token 0.45s).
+// ```
+func generateUsageMessage(u *Usage, timeToFirst time.Duration, streamDuration time.Duration) string {
+	totalTime := (streamDuration + timeToFirst)
+	times := fmt.Sprintf("Time: %.2fs (first token %.2fs).", totalTime.Seconds(), timeToFirst.Seconds())
 	if u == nil {
-		return ""
+		return times
 	}
 
-	tps := float32(dur.Milliseconds()) / 1000.0
-	usage_line := fmt.Sprintf(
-		"Total tokens: %d (%.2f/s). Completion: %d. Prompt: %d.",
-		u.TotalTokens, tps, u.CompletionTokens, u.PromptTokens,
+	tps := float64(u.CompletionTokens) / (streamDuration.Seconds())
+	return fmt.Sprintf(
+		"%s Tokens: %d. Prompt: %d. Completion: %d (%.2f/s).", times, u.TotalTokens, u.PromptTokens, u.CompletionTokens, tps,
 	)
-
-	// Dynamically generate a line of the same length as the usage line
-	line := strings.Repeat("-", len(usage_line)+2)
-	return fmt.Sprintf("+%s+\n| %s |\n+%s+", line, usage_line, line)
 }
 
 func sendChatRequest(rtcontext *context.RuntimeContext, body *ChatRequestBody) (*http.Response, error) {
@@ -355,7 +378,6 @@ func init() {
 	chatCmd.Flags().String(modelKeyFlag, "", "Model to chat with")
 	chatCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for chat (default: http://localhost:8090)")
 	chatCmd.Flags().String(userAgentKeyFlag, "", "User agent to use in all requests")
-	chatCmd.Flags().String("api-key", "", "The API key to use for authentication")
 
 	RootCmd.AddCommand(chatCmd)
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@ limitations under the License.
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
+use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::common::DFSchema;
 use datafusion::datasource::listing::PartitionedFile;
@@ -42,20 +43,24 @@ use delta_kernel::scan::state::{DvInfo, GlobalScanState, Stats};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::Table;
+use indexmap::IndexMap;
+use object_store::ObjectMeta;
+use pruning::{can_be_evaluted_for_partition_pruning, prune_partitions};
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
-use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 use url::Url;
 
 use crate::Read;
 
+mod pruning;
+
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Delta Lake Table connection failed.\n{source}\n"))]
+    #[snafu(display("Failed to connect to the Delta Lake Table.\nVerify the Delta Lake Table configuration is valid, and try again.\nReceived the following error while connecting: {source}"))]
     DeltaTableError { source: delta_kernel::Error },
 
-    #[snafu(display("Delta Lake Table checkpoint files are missing or incorrect.\n{source}\nRecreate checkpoint for the Delta Lake Table and try again."))]
+    #[snafu(display("Delta Lake Table checkpoint files are missing or incorrect.\nRecreate the checkpoint for the Delta Lake Table and try again.\n{source}"))]
     DeltaCheckpointError { source: delta_kernel::Error },
 }
 
@@ -296,6 +301,7 @@ impl TableProvider for DeltaTable {
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -309,9 +315,6 @@ impl TableProvider for DeltaTable {
             .map_err(map_delta_error_to_datafusion_err)?;
 
         let df_schema = DFSchema::try_from(Arc::clone(&self.arrow_schema))?;
-
-        let filter = conjunction(filters.to_vec()).unwrap_or_else(|| lit(true));
-        let physical_expr = state.create_physical_expr(filter, &df_schema)?;
 
         let store = self
             .engine
@@ -359,20 +362,53 @@ impl TableProvider for DeltaTable {
             return Err(err);
         }
 
+        // In Delta Lake, all files must have the same partition columns,
+        // but Delta allows NULL values for the partition columns, represented in the filesystem as `__HIVE_DEFAULT_PARTITION__`.
+        //
+        // user_id=__HIVE_DEFAULT_PARTITION__/
+        //   day=2024-01-01/
+        //     part-00000.parquet
+        // user_id=123/
+        //   day=2024-01-01/
+        //     part-00001.parquet
+        //
+        // In the above example, the partition columns are `user_id` and `day`.
+        // The `user_id` column has a NULL value for the first file and a value of `123` for the second file.
+        //
+        // The `delta_kernel` library skips returning the partition columns for files that have a NULL value for the partition columns.
+        // Which means that the partition columns will not be returned in the `partition_values` field of the `PartitionedFile` object.
+        // We handle this by keeping track of all the partition columns we find in the `all_partition_columns` variable and if one
+        // doesn't have a value, we add a NULL value for that field to the `partition_values` field of the `PartitionedFile` object.
         let mut partitioned_files: Vec<PartitionedFile> = vec![];
-        let mut uniq_partition_columns = HashSet::new();
-        let mut partition_cols = HashSet::new();
+        let all_partition_columns = scan_context
+            .files
+            .iter()
+            .flat_map(|file| {
+                file.partition_values.iter().filter_map(|(k, _)| {
+                    let schema = self.schema();
+                    schema.field_with_name(k).ok().cloned()
+                })
+            })
+            // Use an IndexMap to preserve insertion order
+            .fold(IndexMap::new(), |mut acc, field| {
+                acc.insert(field, ());
+                acc
+            });
         for file in scan_context.files {
             let mut partitioned_file = file.partitioned_file;
-            uniq_partition_columns.insert(file.partition_values.len());
-            partitioned_file.partition_values = file
-                .partition_values
+            partitioned_file.partition_values = all_partition_columns
                 .iter()
-                .map(|(k, v)| {
-                    let schema = self.schema();
-                    let field = schema.field_with_name(k)?;
-                    partition_cols.insert(field.clone());
-                    ScalarValue::try_from_string(v.clone(), field.data_type())
+                .map(|(field, ())| {
+                    if let Some((_, value)) = file
+                        .partition_values
+                        .iter()
+                        .find(|(k, _)| *k == field.name())
+                    {
+                        ScalarValue::try_from_string(value.clone(), field.data_type())
+                    } else {
+                        // This will create a null value typed for the field
+                        Ok(ScalarValue::try_from(field.data_type())?)
+                    }
                 })
                 .collect::<Result<Vec<_>, DataFusionError>>()?;
 
@@ -390,16 +426,36 @@ impl TableProvider for DeltaTable {
             partitioned_files.push(partitioned_file);
         }
 
-        if !uniq_partition_columns.is_empty()
-            && (uniq_partition_columns.len() != 1
-                || !uniq_partition_columns.contains(&partition_cols.len()))
-        {
-            return Err(DataFusionError::Execution(format!(
-                "various number of partition values from the partitioned files: {uniq_partition_columns:?}"
-            )));
-        }
+        let partition_cols = all_partition_columns
+            .into_iter()
+            .map(|(field, ())| field)
+            .collect::<Vec<_>>();
 
-        let partition_cols = &partition_cols.into_iter().collect::<Vec<_>>();
+        let table_partition_col_names = partition_cols
+            .iter()
+            .map(|field| field.name().as_str())
+            .collect::<Vec<_>>();
+
+        // Split the filters into partition filters and the rest
+        let (partition_filters, filters): (Vec<_>, Vec<_>) =
+            filters.iter().cloned().partition(|filter| {
+                can_be_evaluted_for_partition_pruning(&table_partition_col_names, filter)
+            });
+        tracing::trace!("partition_filters: {partition_filters:?}");
+        tracing::trace!("filters: {filters:?}");
+
+        let num_partition_files = partitioned_files.len();
+        let filtered_partitioned_files =
+            prune_partitions(partitioned_files, &partition_filters, &partition_cols)?;
+
+        tracing::debug!(
+            "Partition pruning yielded {} files (out of {num_partition_files})",
+            filtered_partitioned_files.len(),
+        );
+
+        let filter = conjunction(filters).unwrap_or_else(|| lit(true));
+        let physical_expr = state.create_physical_expr(filter, &df_schema)?;
+
         let schema = self.arrow_schema.project(
             &self
                 .arrow_schema
@@ -414,9 +470,9 @@ impl TableProvider for DeltaTable {
             projection,
             limit,
             &Arc::new(schema),
-            partition_cols,
+            &partition_cols,
             &parquet_file_reader_factory,
-            &partitioned_files,
+            &filtered_partitioned_files,
             &physical_expr,
         ))
     }
@@ -468,6 +524,7 @@ struct PartitionFileContext {
 
 #[allow(clippy::needless_pass_by_value)]
 #[allow(clippy::cast_sign_loss)]
+#[allow(clippy::cast_possible_truncation)]
 fn handle_scan_file(
     scan_context: &mut ScanContext,
     path: &str,
@@ -487,9 +544,36 @@ fn handle_scan_file(
             return;
         }
     };
-    let path = format!("{}/{path}", root_url.path());
 
-    let partitioned_file = PartitionedFile::new(path.clone(), size as u64);
+    let path = if root_url.path().ends_with('/') {
+        format!("{}{}", root_url.path(), path)
+    } else {
+        format!("{}/{}", root_url.path(), path)
+    };
+
+    let partitioned_file_path = match object_store::path::Path::from_url_path(&path) {
+        Ok(path) => path,
+        Err(e) => {
+            scan_context
+                .errs
+                .push(datafusion::error::DataFusionError::Execution(format!(
+                    "Error parsing file path: {e}",
+                )));
+            return;
+        }
+    };
+
+    tracing::trace!("partitioned_file_path: {partitioned_file_path:?}");
+
+    let partitioned_file_object_meta = ObjectMeta {
+        location: partitioned_file_path,
+        last_modified: chrono::Utc.timestamp_nanos(0),
+        size: size as usize,
+        e_tag: None,
+        version: None,
+    };
+
+    let partitioned_file = PartitionedFile::from(partitioned_file_object_meta);
 
     // Get the selection vector (i.e. inverse deletion vector)
     let selection_vector =

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -114,6 +114,7 @@ mod tests {
                                 function_call: None,
                                 tool_calls: None,
                                 refusal: None,
+                                audio: None,
                             },
                             finish_reason: Some(FinishReason::Stop),
                             logprobs: None,
@@ -130,6 +131,7 @@ mod tests {
                                 function_call: None,
                                 tool_calls: None,
                                 refusal: None,
+                                audio: None,
                             },
                             finish_reason: Some(FinishReason::Stop),
                             logprobs: None,

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,7 +23,9 @@ use std::sync::Arc;
 mod chat;
 mod embed;
 mod eval;
+mod metrics;
 mod tool_use;
+mod wrapper;
 
 pub use chat::{try_to_chat_model, LLMModelStore};
 pub use embed::{try_to_embedding, EmbeddingModelStore};

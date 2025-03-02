@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -20,10 +20,11 @@ use app::App;
 use tokio::sync::RwLock;
 
 use crate::{
-    dataaccelerator, dataconnector,
+    catalogconnector, dataaccelerator, dataconnector,
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
     extension::{Extension, ExtensionFactory},
+    flight::RateLimits,
     metrics, podswatcher,
     secrets::{self, Secrets},
     status,
@@ -41,6 +42,7 @@ pub struct RuntimeBuilder {
     prometheus_registry: Option<prometheus::Registry>,
     datafusion: Option<Arc<DataFusion>>,
     runtime_status: Option<Arc<status::RuntimeStatus>>,
+    rate_limits: Option<Arc<RateLimits>>,
 }
 
 impl RuntimeBuilder {
@@ -55,6 +57,7 @@ impl RuntimeBuilder {
             datafusion: None,
             autoload_extensions: HashMap::new(),
             runtime_status: None,
+            rate_limits: None,
         }
     }
 
@@ -122,8 +125,14 @@ impl RuntimeBuilder {
         self
     }
 
+    pub fn with_rate_limits(mut self, rate_limits: RateLimits) -> Self {
+        self.rate_limits = Some(Arc::new(rate_limits));
+        self
+    }
+
     pub async fn build(self) -> Runtime {
         dataconnector::register_all().await;
+        catalogconnector::register_all().await;
         dataaccelerator::register_all().await;
         tools::factory::register_all_factories().await;
         document_parse::register_all().await;
@@ -176,6 +185,7 @@ impl RuntimeBuilder {
             datasets_health_monitor,
             metrics_endpoint: self.metrics_endpoint,
             prometheus_registry: self.prometheus_registry,
+            rate_limits: self.rate_limits.unwrap_or_default(),
             status,
         };
 

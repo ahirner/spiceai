@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -59,18 +59,15 @@ impl Serialize for IcebergErrorType {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Copy, Clone)]
 pub enum InternalServerErrorCode {
-    CatalogNotFound,
-    SchemaNotFound,
+    InvalidSchema,
 }
 
 impl std::fmt::Display for InternalServerErrorCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            InternalServerErrorCode::CatalogNotFound => write!(f, "DF_CATALOG_NOT_FOUND"),
-            InternalServerErrorCode::SchemaNotFound => write!(f, "DF_SCHEMA_NOT_FOUND"),
+            InternalServerErrorCode::InvalidSchema => write!(f, "DF_INVALID_SCHEMA"),
         }
     }
 }

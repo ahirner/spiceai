@@ -54,3 +54,9 @@ venv
 
 .env
 .spice
+.data/
+data/
+./testoperator
+!test/spicepods/
+!test/nsql_bench/spicepod.yaml
+!test/nsql_bench/data

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -32,6 +32,7 @@ use tracing::{Instrument, Span};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{retry, RetryError};
 
+use crate::datafusion::builder::get_df_default_config;
 use crate::datafusion::error::{find_datafusion_root, get_spice_df_error, SpiceExternalError};
 use crate::datafusion::is_spice_internal_dataset;
 use crate::datafusion::schema::BaseSchema;
@@ -64,7 +65,6 @@ use datafusion::{
     error::DataFusionError,
     logical_expr::{cast, col, Expr, Operator},
     physical_plan::stream::RecordBatchStreamAdapter,
-    prelude::SessionConfig,
     sql::TableReference,
 };
 
@@ -83,6 +83,7 @@ pub struct RefreshTask {
     runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
     federated: Arc<FederatedTable>,
+    federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
     sink: Arc<RwLock<AccelerationSink>>,
 }
@@ -93,12 +94,14 @@ impl RefreshTask {
         runtime_status: Arc<status::RuntimeStatus>,
         dataset_name: TableReference,
         federated: Arc<FederatedTable>,
+        federated_source: Option<String>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
         Self {
             runtime_status,
             dataset_name,
             federated,
+            federated_source,
             accelerator: Arc::clone(&accelerator),
             sink: Arc::new(RwLock::new(AccelerationSink::new(accelerator))),
         }
@@ -122,8 +125,6 @@ impl RefreshTask {
         let retry_strategy = FibonacciBackoffBuilder::new()
             .max_retries(max_retries)
             .build();
-
-        let dataset_name = self.dataset_name.clone();
 
         let mut spans = vec![];
         let mut parent_span = Span::current();
@@ -150,7 +151,13 @@ impl RefreshTask {
         .instrument(span.clone())
         .await
         .inspect_err(|e| {
-            tracing::error!("Failed to refresh dataset {}: {e}", dataset_name);
+            tracing::error!(
+                "Failed to refresh dataset {}: {e}",
+                include_source_to_dataset_name(
+                    &self.dataset_name,
+                    self.federated_source.as_deref()
+                )
+            );
             for span in &spans {
                 tracing::error!(target: "task_history", parent: span, "{e}");
             }
@@ -201,6 +208,16 @@ impl RefreshTask {
             refresh.sql.as_deref(),
         )
         .await
+        .inspect_err(|e| {
+            tracing::warn!(
+                "Failed to load data for dataset {}: {}",
+                include_source_to_dataset_name(
+                    &self.dataset_name,
+                    self.federated_source.as_deref()
+                ),
+                inner_err_from_retry_ref(e)
+            );
+        })
     }
 
     async fn write_streaming_data_update(
@@ -325,7 +342,7 @@ impl RefreshTask {
             || data_update
                 .data
                 .first()
-                .map_or(false, |x| x.columns().is_empty())
+                .is_some_and(|x| x.columns().is_empty())
         {
             if let Some(start_time) = start_time {
                 self.trace_dataset_loaded(start_time, 0, 0).await;
@@ -455,18 +472,25 @@ impl RefreshTask {
         let schema = self.federated.schema();
         let column = refresh.time_column.as_deref().unwrap_or_default();
         let field = schema.column_with_name(column).map(|(_, f)| f).cloned();
+        let time_partition_column = refresh.time_partition_column.as_deref();
+        let partition_field = schema
+            .column_with_name(time_partition_column.unwrap_or_default())
+            .map(|(_, f)| f)
+            .cloned();
 
-        TimestampFilterConvert::create(field, refresh.time_column.clone(), refresh.time_format)
+        TimestampFilterConvert::create(
+            field,
+            refresh.time_column.clone(),
+            refresh.time_format,
+            partition_field,
+            refresh.time_partition_column.clone(),
+            refresh.time_partition_format,
+        )
     }
 
     fn refresh_df_context(&self, federated_provider: Arc<dyn TableProvider>) -> SessionContext {
-        let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::new().set_bool(
-                "datafusion.execution.listing_table_ignore_subdirectory",
-                false,
-            ),
-            default_runtime_env(),
-        );
+        let ctx =
+            SessionContext::new_with_config_rt(get_df_default_config(), default_runtime_env());
 
         let ctx_state = ctx.state();
         let default_catalog = &ctx_state.config_options().catalog.default_catalog;
@@ -640,7 +664,12 @@ impl RefreshTask {
                 Some(TimeFormat::UnixSeconds) => {
                     value *= 1_000_000_000;
                 }
-                Some(TimeFormat::ISO8601 | TimeFormat::Timestamp | TimeFormat::Timestamptz)
+                Some(
+                    TimeFormat::ISO8601
+                    | TimeFormat::Timestamp
+                    | TimeFormat::Timestamptz
+                    | TimeFormat::Date,
+                )
                 | None => unreachable!("refresh.validate_time_format should've returned error"),
             }
         };
@@ -748,10 +777,17 @@ impl RefreshTask {
 
         tracing::warn!(
             "Failed to load data for dataset {}: {error}",
-            self.dataset_name
+            include_source_to_dataset_name(&self.dataset_name, self.federated_source.as_deref()),
         );
         self.mark_dataset_status(refresh_sql, status::ComponentStatus::Error)
             .await;
+    }
+}
+
+fn include_source_to_dataset_name(dataset_name: &TableReference, source: Option<&str>) -> String {
+    match source {
+        Some(source) => format!("{dataset_name} ({source})"),
+        None => dataset_name.to_string(),
     }
 }
 

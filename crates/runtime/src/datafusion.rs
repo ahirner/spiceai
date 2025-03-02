@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -209,7 +209,7 @@ pub enum Error {
     InvalidTimeColumnTimeFormat { source: refresh::Error },
 
     #[snafu(display(
-         "Acceleration mode `append` requires `time_column` parameter for source {from}.\nConfigure `time_column` parameter and try again.\nFor details, visit: https://docs.spiceai.org/reference/spicepod/datasets#time_column"
+         "Acceleration mode `append` requires `time_column` parameter for source {from}.\nConfigure `time_column` parameter and try again.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#time_column"
     ))]
     AppendRequiresTimeColumn { from: String },
 
@@ -588,7 +588,57 @@ impl DataFusion {
         Ok(())
     }
 
-    pub async fn get_arrow_schema(&self, dataset: &str) -> Result<Schema> {
+    pub async fn write_streaming_data(
+        &self,
+        table_reference: &TableReference,
+        streaming_update: StreamingDataUpdate,
+    ) -> Result<()> {
+        if !self.is_writable(table_reference) {
+            TableNotWritableSnafu {
+                table_name: table_reference.to_string(),
+            }
+            .fail()?;
+        }
+
+        let update_schema = streaming_update.data.schema();
+
+        self.ensure_sink_dataset(table_reference.clone(), Arc::clone(&update_schema))
+            .await?;
+
+        let table_provider = self.get_table_provider(table_reference).await?;
+
+        verify_schema(table_provider.schema().fields(), update_schema.fields())
+            .context(SchemaMismatchSnafu)?;
+
+        let overwrite = match streaming_update.update_type {
+            UpdateType::Overwrite => InsertOp::Overwrite,
+            UpdateType::Append => InsertOp::Append,
+            UpdateType::Changes => InsertOp::Replace,
+        };
+
+        let insert_plan = table_provider
+            .insert_into(
+                &self.ctx.state(),
+                Arc::new(StreamingDataUpdateExecutionPlan::new(streaming_update.data)),
+                overwrite,
+            )
+            .await
+            .map_err(find_datafusion_root)
+            .context(UnableToPlanTableInsertSnafu {
+                table_name: table_reference.to_string(),
+            })?;
+
+        let _ = collect(insert_plan, self.ctx.task_ctx())
+            .await
+            .map_err(find_datafusion_root)
+            .context(UnableToExecuteTableInsertSnafu {
+                table_name: table_reference.to_string(),
+            })?;
+
+        Ok(())
+    }
+
+    pub async fn get_arrow_schema(&self, dataset: impl Into<TableReference>) -> Result<Schema> {
         let data_frame = self
             .ctx
             .table(dataset)
@@ -739,6 +789,12 @@ impl DataFusion {
         if let Some(time_col) = &dataset.time_column {
             refresh = refresh.time_column(time_col.clone());
         }
+        if let Some(time_partition_column) = &dataset.time_partition_column {
+            refresh = refresh.time_partition_column(time_partition_column.clone());
+        }
+        if let Some(time_partition_format) = dataset.time_partition_format {
+            refresh = refresh.time_partition_format(time_partition_format);
+        }
         if let Some(check_interval) = dataset.refresh_check_interval() {
             refresh = refresh.check_interval(check_interval);
         }
@@ -748,7 +804,11 @@ impl DataFusion {
         if let Some(append_overlap) = acceleration_settings.refresh_append_overlap {
             refresh = refresh.append_overlap(append_overlap);
         }
-        if let Some(refresh_data_window) = dataset.refresh_data_window() {
+
+        // we must not fetch data older than the explicitly set refresh data window or retention period
+        let refresh_data_window = dataset.refresh_data_window().or(dataset.retention_period());
+
+        if let Some(refresh_data_window) = refresh_data_window {
             refresh = refresh.period(refresh_data_window);
         }
         refresh
@@ -759,12 +819,16 @@ impl DataFusion {
             Arc::clone(&self.runtime_status),
             dataset.name.clone(),
             Arc::clone(&source_table_provider),
+            dataset.source().to_string(),
             accelerated_table_provider,
             refresh,
         );
+
         accelerated_table_builder.retention(Retention::new(
             dataset.time_column.clone(),
             dataset.time_format,
+            dataset.time_partition_column.clone(),
+            dataset.time_partition_format,
             dataset.retention_period(),
             dataset.retention_check_interval(),
             acceleration_settings.retention_check_enabled,
@@ -1215,6 +1279,21 @@ impl DataFusion {
 
     pub fn query_builder<'a>(self: &Arc<Self>, sql: &'a str) -> QueryBuilder<'a> {
         QueryBuilder::new(sql, Arc::clone(self))
+    }
+
+    /// Performs `DataFusion` cleanup during shutdown.
+    /// Currently performs cleanup of accelerated tables only.
+    pub async fn shutdown(&self) {
+        // Don't block self.accelerated_tables as it needs to be modified during table removal
+        // and will be cleaned up authomatically by removing accelerated tables.
+
+        let accelerated_tables = self.accelerated_tables.read().await.clone();
+
+        for table in &accelerated_tables {
+            if let Err(err) = self.remove_table(table).await {
+                tracing::error!("Failed to clean up '{table}' during shutdown: {err}");
+            }
+        }
     }
 }
 

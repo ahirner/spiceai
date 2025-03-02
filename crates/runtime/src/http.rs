@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -36,11 +36,13 @@ use crate::{
     Runtime,
 };
 
+#[cfg(feature = "openapi")]
+pub use routes::ApiDoc;
 mod metrics;
 mod routes;
 mod traceparent;
 
-mod v1;
+pub mod v1;
 
 #[derive(Debug, Snafu)]
 pub enum Error {

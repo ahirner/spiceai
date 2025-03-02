@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,12 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{
-    collections::HashMap,
-    fs,
-    path::{self, Path, PathBuf},
-};
-
 use crate::embeddings::{
     candle::ModelConfig, Error, FailedToInstantiateEmbeddingModelSnafu, FailedWithHFApiSnafu,
     Result,
@@ -31,6 +25,11 @@ use hf_hub::{
 };
 use serde::Deserialize;
 use snafu::ResultExt;
+use std::{
+    collections::HashMap,
+    fs,
+    path::{self, Path, PathBuf},
+};
 use tei_backend::Pool;
 use tei_core::{
     download::{download_artifacts, download_pool_config, download_st_config, ST_CONFIG_NAMES},
@@ -41,6 +40,10 @@ use tempfile::tempdir;
 use tokenizers::Tokenizer;
 
 pub(crate) fn load_tokenizer(model_root: &Path) -> Result<Tokenizer> {
+    tracing::trace!(
+        "Loading model tokenizer from {:?}",
+        model_root.join("tokenizer.json")
+    );
     let tokenizer = Tokenizer::from_file(model_root.join("tokenizer.json"))
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
 
@@ -192,14 +195,15 @@ pub(crate) fn max_seq_length_from_st_config(
 ///
 /// ```rust
 /// use std::collections::HashMap;
-/// use std::path::Path;
+/// use std::path::PathBuf;
+/// use llms::embeddings::candle::link_files_into_tmp_dir;
 ///
-/// let files: HashMap<String, &Path> = vec![
-///    ("model.safetensors".to_string(), Path::new("path/to/model.safetensors")),
-///   ("config.json".to_string(), Path::new("path/to/irrelevant_filename.json")),
+/// let files: HashMap<String, PathBuf> = vec![
+///    ("model.safetensors".to_string(), PathBuf::from("path/to/model.safetensors")),
+///   ("config.json".to_string(), PathBuf::from("path/to/irrelevant_filename.json")),
 /// ].into_iter().collect();
 ///
-/// let temp_dir = link_files_into_tmp_dir(files).unwrap();
+/// let temp_dir = link_files_into_tmp_dir(files);
 ///
 /// ```
 ///

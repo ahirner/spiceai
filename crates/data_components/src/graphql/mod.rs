@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -63,7 +63,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        r#"GraphQL Query Error:
+        "GraphQL Query Error:
 Details:
 - Error: {message}
 - Location: Line {line}, Column {column}
@@ -71,7 +71,7 @@ Details:
 
 {query}
 
-Please verify the syntax of your GraphQL query."#
+Verify the syntax of your GraphQL query."
     ))]
     InvalidGraphQLQuery {
         message: String,
@@ -113,7 +113,7 @@ pub trait GraphQLContext: Send + Sync + std::fmt::Debug {
     fn inject_parameters(
         &self,
         _filters: &[FilterPushdownResult],
-        _query: &mut GraphQLQuery<'_>,
+        _query: &mut GraphQLQuery,
     ) -> Result<(), datafusion::error::DataFusionError> {
         Ok(())
     }

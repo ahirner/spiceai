@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -48,6 +48,22 @@ impl Acceleration {
                 if schema.field_with_name(index_column).is_err() {
                     return dataset::IndexColumnNotFoundSnafu {
                         index: index_column.to_string(),
+                        valid_columns: Self::valid_columns(schema),
+                    }
+                    .fail();
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn validate_primary_key(&self, schema: &SchemaRef) -> dataset::Result<()> {
+        if let Some(columns) = &self.primary_key {
+            for column in columns.iter() {
+                if schema.field_with_name(column).is_err() {
+                    return dataset::PrimaryKeyColumnNotFoundSnafu {
+                        invalid_column: column.to_string(),
                         valid_columns: Self::valid_columns(schema),
                     }
                     .fail();

@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,7 +17,13 @@ limitations under the License.
 package api
 
 type Model struct {
-	Name   string `json:"name,omitempty" csv:"name" yaml:"name,omitempty"`
-	From   string `json:"from,omitempty" csv:"from" yaml:"from,omitempty"`
-	Status string `json:"status,omitempty" csv:"status,omitempty" yaml:"status,omitempty"`
+	Id      string `json:"id,omitempty" csv:"id" yaml:"id,omitempty"`
+	Object  string `json:"object,omitempty" csv:"object" yaml:"object,omitempty"`
+	OwnedBy string `json:"owned_by,omitempty" csv:"owned_by" yaml:"owned_by,omitempty"`
+	Status  string `json:"status,omitempty" csv:"status,omitempty" yaml:"status,omitempty"`
+}
+
+type ModelResponse struct {
+	Object string  `json:"object,omitempty" csv:"object" yaml:"object,omitempty"`
+	Data   []Model `json:"data,omitempty" csv:"data" yaml:"data,omitempty"`
 }

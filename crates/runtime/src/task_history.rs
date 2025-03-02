@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -92,6 +92,8 @@ impl TaskSpan {
         let retention = Retention::new(
             time_column.clone(),
             time_format,
+            None,
+            None,
             Some(Duration::from_secs(retention_period_secs)), // 1 day
             Some(Duration::from_secs(retention_check_interval_secs)),
             true,

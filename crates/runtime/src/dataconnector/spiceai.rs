@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,15 +15,13 @@ limitations under the License.
 */
 
 use super::ConnectorComponent;
+use super::ConnectorParams;
 use super::DataConnector;
 use super::DataConnectorError;
 use super::DataConnectorFactory;
-use super::DataConnectorParams;
 use super::ParameterSpec;
-use crate::component::catalog::Catalog;
 use crate::component::dataset::Dataset;
 use crate::federated_table::FederatedTable;
-use crate::Runtime;
 use arrow_flight::decode::DecodedPayload;
 use async_stream::stream;
 use async_trait::async_trait;
@@ -33,7 +31,6 @@ use data_components::cdc::{
 use data_components::flight::FlightFactory;
 use data_components::flight::FlightTable;
 use data_components::{Read, ReadWrite};
-use datafusion::catalog::CatalogProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
@@ -57,7 +54,7 @@ use tonic::metadata::MetadataValue;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://docs.spiceai.org/components/data-connectors/spiceai#configuration"))]
+    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"))]
     MissingRequiredParameter { parameter: String },
 
     #[snafu(display(r#"Failed to connect to SpiceAI endpoint "{endpoint}".\n{source}\nEnsure the endpoint is valid and reachable"#))]
@@ -86,6 +83,38 @@ pub struct SpiceAI {
     flight_factory: FlightFactory,
 }
 
+impl SpiceAI {
+    pub fn flight_factory(
+        &self,
+        dataset_path: SpiceAIDatasetPath,
+    ) -> (FlightFactory, TableReference) {
+        let (flight_factory, table_reference) = match dataset_path {
+            SpiceAIDatasetPath::OrgAppPath { org, app, path } => {
+                let mut map = MetadataMap::new();
+
+                let spiceai_context = format!(
+                    "org={},app={}",
+                    org.to_str().unwrap_or_default(),
+                    app.to_str().unwrap_or_default()
+                );
+
+                map.insert(HEADER_ORG, org);
+                map.insert(HEADER_APP, app);
+                (
+                    self.flight_factory
+                        .clone()
+                        .with_metadata(map)
+                        .with_extra_compute_context(spiceai_context.as_str()),
+                    path,
+                )
+            }
+            SpiceAIDatasetPath::Path(path) => (self.flight_factory.clone(), path),
+        };
+
+        (flight_factory, table_reference)
+    }
+}
+
 pub struct SpiceCloudPlatformDialect {}
 
 impl Dialect for SpiceCloudPlatformDialect {
@@ -94,7 +123,7 @@ impl Dialect for SpiceCloudPlatformDialect {
     }
 
     fn interval_style(&self) -> IntervalStyle {
-        IntervalStyle::SQLStandard
+        IntervalStyle::PostgresVerbose
     }
 
     fn identifier_quote_style(&self, identifier: &str) -> Option<char> {
@@ -127,9 +156,13 @@ const HEADER_ORG: &str = "spiceai-org";
 const HEADER_APP: &str = "spiceai-app";
 
 impl DataConnectorFactory for SpiceAIFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
     fn create(
         &self,
-        params: DataConnectorParams,
+        params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         let default_flight_url: Arc<str> = if cfg!(feature = "dev") {
             "https://dev-flight.spiceai.io".into()
@@ -165,6 +198,7 @@ impl DataConnectorFactory for SpiceAIFactory {
                 "spice.ai",
                 flight_client,
                 Arc::new(SpiceCloudPlatformDialect {}),
+                false,
             );
             let spiceai = SpiceAI { flight_factory };
             Ok(Arc::new(spiceai) as Arc<dyn DataConnector>)
@@ -203,15 +237,7 @@ impl DataConnector for SpiceAI {
             }
         };
 
-        let (flight_factory, table_reference) = match dataset_path {
-            SpiceAIDatasetPath::OrgAppPath { org, app, path } => {
-                let mut map = MetadataMap::new();
-                map.insert(HEADER_ORG, org);
-                map.insert(HEADER_APP, app);
-                (self.flight_factory.clone().with_metadata(map), path)
-            }
-            SpiceAIDatasetPath::Path(path) => (self.flight_factory.clone(), path),
-        };
+        let (flight_factory, table_reference) = self.flight_factory(dataset_path);
 
         match Read::table_provider(&flight_factory, table_reference, dataset_schema).await {
             Ok(provider) => Ok(provider),
@@ -304,34 +330,10 @@ impl DataConnector for SpiceAI {
             }
         }))
     }
-
-    async fn catalog_provider(
-        self: Arc<Self>,
-        runtime: &Runtime,
-        catalog: &Catalog,
-    ) -> Option<super::DataConnectorResult<Arc<dyn CatalogProvider>>> {
-        if catalog.catalog_id.is_some() {
-            return Some(Err(
-                super::DataConnectorError::InvalidConfigurationNoSource {
-                    dataconnector: "spice.ai".into(),
-                    message: "A Catalog Name is not supported for the Spice.ai catalog connector.\nRemove the Catalog Name, and use only 'spice.ai' in the 'from' parameter.\nFor details, visit: https://docs.spiceai.org/components/catalogs/spiceai#from".into(),
-                    connector_component: ConnectorComponent::from(catalog),
-                },
-            ));
-        }
-
-        let spice_extension = runtime.extension("spice_cloud").await?;
-        let catalog_provider = spice_extension
-            .catalog_provider(self, catalog.include.clone())
-            .await?
-            .ok()?;
-
-        Some(Ok(catalog_provider))
-    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum SpiceAIDatasetPath {
+pub enum SpiceAIDatasetPath {
     OrgAppPath {
         org: MetadataValue<Ascii>,
         app: MetadataValue<Ascii>,

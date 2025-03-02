@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -276,7 +276,7 @@ impl DisplayAs for SparkConnectExecutionPlan {
 }
 
 impl ExecutionPlan for SparkConnectExecutionPlan {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "SparkConnectExecutionPlan"
     }
 

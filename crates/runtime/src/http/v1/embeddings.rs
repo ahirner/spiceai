@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -27,6 +27,8 @@ use axum::{
 };
 use tokio::sync::RwLock;
 
+/// Create Embeddings
+///
 /// Creates an embedding vector representing the input text.
 ///
 /// Get a vector representation of a given input that can be easily consumed by machine learning models and algorithms.
@@ -37,7 +39,6 @@ use tokio::sync::RwLock;
     tag = "AI",
     request_body(
         description = "Embedding creation request parameters",
-        required = true,
         content((
             CreateEmbeddingRequest = "application/json",
             example = json!({

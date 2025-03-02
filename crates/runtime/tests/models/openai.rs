@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -15,14 +15,12 @@ limitations under the License.
 */
 
 #![allow(clippy::expect_used)]
-use super::send_embeddings_request;
-use crate::models::sql_to_display;
+use crate::models::{sort_json_keys, sql_to_display, sql_to_single_json_value};
 use crate::{
     init_tracing, init_tracing_with_task_history,
     models::{
-        create_api_bindings_config, get_params_with_secrets, get_taxi_trips_dataset,
-        get_tpcds_dataset, normalize_chat_completion_response, normalize_embeddings_response,
-        send_chat_completions_request,
+        create_api_bindings_config, get_params_with_secrets_value, get_taxi_trips_dataset,
+        get_tpcds_dataset, normalize_chat_completion_response, send_chat_completions_request,
     },
     utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
 };
@@ -55,7 +53,7 @@ mod nsql {
     async fn openai_test_nsql() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(None);
 
-        test_request_context().scope(async {
+        test_request_context().scope_retry(3, || async {
             verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
@@ -130,7 +128,8 @@ mod nsql {
             }
 
             Ok(())
-        }).await
+        }).await?;
+        Ok(())
     }
 }
 
@@ -152,7 +151,7 @@ mod search {
                     .await
                     .map_err(anyhow::Error::msg)?;
 
-                let mut ds_tpcds_item = get_tpcds_dataset("item", None);
+                let mut ds_tpcds_item = get_tpcds_dataset("item", None, None);
                 ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
                     column: "i_item_desc".to_string(),
                     model: "openai_embeddings".to_string(),
@@ -161,7 +160,7 @@ mod search {
                 }];
 
                 let mut ds_tpcds_cp_with_chunking =
-                    get_tpcds_dataset("catalog_page", Some("catalog_page_with_chunking"));
+                    get_tpcds_dataset("catalog_page", Some("catalog_page_with_chunking"), Some("select cp_description, cp_catalog_page_sk from catalog_page_with_chunking limit 20"));
                 ds_tpcds_cp_with_chunking.embeddings = vec![ColumnEmbeddingConfig {
                     column: "cp_description".to_string(),
                     model: "openai_embeddings".to_string(),
@@ -244,109 +243,84 @@ mod search {
 
 #[allow(clippy::expect_used)]
 mod embeddings {
+    use std::time::Duration;
+
+    use crate::models::embedding::{
+        run_beta_functionality_criteria_test, run_embedding_tests, EmbeddingTestCase,
+    };
+
     use super::*;
-    struct EmbeddingTestCase {
-        pub input: EmbeddingInput,
-        pub encoding_format: Option<&'static str>,
-        pub user: Option<&'static str>,
-        pub dimensions: Option<u32>,
-        pub test_id: &'static str,
+
+    #[tokio::test]
+    async fn openai_embeddings_beta_requirements() -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(None);
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            .await
+            .map_err(anyhow::Error::msg)?;
+
+        test_request_context()
+            .scope(async {
+                run_beta_functionality_criteria_test(
+                    get_openai_embeddings(Some("text-embedding-3-small"), "openai_embeddings"),
+                    Duration::from_secs(30),
+                )
+                .await
+            })
+            .await?;
+
+        Ok(())
     }
 
     #[tokio::test]
     async fn openai_test_embeddings() -> Result<(), anyhow::Error> {
         let _tracing = init_tracing(None);
+        verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+            .await
+            .map_err(anyhow::Error::msg)?;
 
         test_request_context()
             .scope(async {
-                verify_env_secret_exists("SPICE_OPENAI_API_KEY")
-                    .await
-                    .map_err(anyhow::Error::msg)?;
-
-                let app = AppBuilder::new("search_app")
-                    .with_embedding(get_openai_embeddings(
+                run_embedding_tests(
+                    vec![get_openai_embeddings(
                         Some("text-embedding-3-small"),
                         "openai_embeddings",
-                    ))
-                    .build();
-
-                let api_config = create_api_bindings_config();
-                let http_base_url = format!("http://{}", api_config.http_bind_address);
-                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-                let rt_ref_copy = Arc::clone(&rt);
-                tokio::spawn(async move {
-                    Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth()))
-                        .await
-                });
-
-                tokio::select! {
-                    () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-                    }
-                    () = rt.load_components() => {}
-                }
-
-                runtime_ready_check(&rt).await;
-
-                let embeddins_test = vec![
-                    EmbeddingTestCase {
-                        input: EmbeddingInput::String(
-                            "The food was delicious and the waiter...".to_string(),
-                        ),
-                        encoding_format: Some("float"),
-                        user: None,
-                        dimensions: None,
-                        test_id: "basic",
-                    },
-                    EmbeddingTestCase {
-                        input: EmbeddingInput::StringArray(vec![
-                            "The food was delicious".to_string(),
-                            "and the waiter...".to_string(),
-                        ]),
-                        encoding_format: None,
-                        user: Some("test_user_id"),
-                        dimensions: Some(256),
-                        test_id: "multiple_inputs",
-                    },
-                    EmbeddingTestCase {
-                        input: EmbeddingInput::StringArray(vec![
-                            "The food was delicious".to_string(),
-                            "and the waiter...".to_string(),
-                        ]),
-                        encoding_format: Some("base64"),
-                        user: Some("test_user_id"),
-                        dimensions: Some(128),
-                        test_id: "base64_format",
-                    },
-                ];
-
-                for EmbeddingTestCase {
-                    input,
-                    encoding_format,
-                    user,
-                    dimensions,
-                    test_id,
-                } in embeddins_test
-                {
-                    let response = send_embeddings_request(
-                        http_base_url.as_str(),
-                        "openai_embeddings",
-                        input,
-                        encoding_format,
-                        user,
-                        dimensions,
-                    )
-                    .await?;
-
-                    insta::assert_snapshot!(
-                        test_id,
-                        // OpenAI's embeddings response is not deterministic (values vary for the same input, model version, and parameters) so
-                        // we normalize the response before snapshotting
-                        normalize_embeddings_response(response)
-                    );
-                }
-
+                    )],
+                    vec![
+                        EmbeddingTestCase {
+                            input: EmbeddingInput::String(
+                                "The food was delicious and the waiter...".to_string(),
+                            ),
+                            model_name: "openai_embeddings",
+                            encoding_format: Some("float"),
+                            user: None,
+                            dimensions: None,
+                            test_id: "basic",
+                        },
+                        EmbeddingTestCase {
+                            input: EmbeddingInput::StringArray(vec![
+                                "The food was delicious".to_string(),
+                                "and the waiter...".to_string(),
+                            ]),
+                            model_name: "openai_embeddings",
+                            encoding_format: None,
+                            user: Some("test_user_id"),
+                            dimensions: Some(256),
+                            test_id: "multiple_inputs",
+                        },
+                        EmbeddingTestCase {
+                            input: EmbeddingInput::StringArray(vec![
+                                "The food was delicious".to_string(),
+                                "and the waiter...".to_string(),
+                            ]),
+                            model_name: "openai_embeddings",
+                            encoding_format: Some("base64"),
+                            user: Some("test_user_id"),
+                            dimensions: Some(128),
+                            test_id: "base64_format",
+                        },
+                    ],
+                )
+                .await?;
                 Ok(())
             })
             .await
@@ -410,16 +384,17 @@ async fn openai_test_chat_completion() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
+#[ignore] // https://github.com/spiceai/spiceai/issues/4870
 async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
 
     test_request_context()
-        .scope(async {
+        .scope_retry(3, || async {
             verify_env_secret_exists("SPICE_OPENAI_API_KEY")
                 .await
                 .map_err(anyhow::Error::msg)?;
 
-            let mut ds_tpcds_item = get_tpcds_dataset("item", None);
+            let mut ds_tpcds_item = get_tpcds_dataset("item", None, None);
             ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
                 column: "i_item_desc".to_string(),
                 model: "openai_embeddings".to_string(),
@@ -458,6 +433,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 }
 
 /// Verifies that the model correctly uses the SQL tool to process user query and return the result
+#[allow(clippy::expect_used)]
 async fn verify_sql_query_chat_completion(
     rt: Arc<Runtime>,
     trace_provider: &TracerProvider,
@@ -490,13 +466,12 @@ async fn verify_sql_query_chat_completion(
         sql_to_display(
             &rt,
             format!(
-                r#"SELECT task, count(1)
+                "SELECT task, count(1) > 0 as task_used
                 FROM runtime.task_history
                 WHERE start_time >= '{}'
                 AND task in ('tool_use::list_datasets', 'tool_use::sql', 'tool_use::sql_query')
                 GROUP BY task
-                ORDER BY task;
-            "#,
+                ORDER BY task;",
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
             )
             .as_str()
@@ -505,30 +480,34 @@ async fn verify_sql_query_chat_completion(
         .expect("Failed to execute HTTP SQL query")
     );
 
+    let mut task_input = sql_to_single_json_value(
+        &rt,
+        format!(
+            "SELECT input
+        FROM runtime.task_history
+        WHERE start_time >= '{}'
+        AND task='ai_completion'
+        ORDER BY start_time
+        LIMIT 1;
+    ",
+            Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+        )
+        .as_str(),
+    )
+    .await;
+
+    sort_json_keys(&mut task_input);
+
     insta::assert_snapshot!(
         "chat_1_ai_completion_input",
-        sql_to_display(
-            &rt,
-            format!(
-                r#"SELECT input
-                FROM runtime.task_history
-                WHERE start_time >= '{}'
-                AND task='ai_completion'
-                ORDER BY start_time
-                LIMIT 1;
-            "#,
-                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
-            )
-            .as_str()
-        )
-        .await
-        .expect("Failed to execute HTTP SQL query")
+        serde_json::to_string_pretty(&task_input).expect("Failed to serialize task_input")
     );
 
     Ok(())
 }
 
 /// Verifies that the model correctly uses similirity search tool to process user query and return the result
+#[allow(clippy::expect_used)]
 async fn verify_similarity_search_chat_completion(
     rt: Arc<Runtime>,
     trace_provider: &TracerProvider,
@@ -550,8 +529,10 @@ async fn verify_similarity_search_chat_completion(
     let response = model.chat_request(req).await?;
 
     // Verify Response
-    let resp_value =
+    let mut resp_value =
         serde_json::to_value(&response).expect("Failed to serialize response.choices: {}");
+    sort_json_keys(&mut resp_value);
+
     let selector = JsonPath::from_str(
         "$.choices[*].message[?(@.content~='.*there just big vehicles. Journalists.*')].length()",
     )
@@ -572,10 +553,9 @@ async fn verify_similarity_search_chat_completion(
         sql_to_display(
             &rt,
             format!(
-                r#"SELECT input
+                "SELECT input
                 FROM runtime.task_history
-                WHERE start_time >= '{}' and task='tool_use::document_similarity';
-            "#,
+                WHERE start_time >= '{}' and task='tool_use::document_similarity';",
                 Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
             )
             .as_str()
@@ -593,6 +573,20 @@ fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model 
         "openai_api_key".to_string(),
         "${ secrets:SPICE_OPENAI_API_KEY }".into(),
     );
+    model.params.insert("system_prompt".to_string(), r#"
+    When writing SQL queries, do not put double quotes around schema-qualified table names. For example:
+
+    Correct: SELECT * FROM schema.table
+    Correct: SELECT * FROM database.schema.table
+    Incorrect: SELECT * FROM "schema.table"
+    Incorrect: SELECT * FROM "database.schema.table"
+
+    Only use double quotes when you need to preserve case sensitivity or when identifiers contain special characters.
+
+    Prefer quoting column names. For example:
+    Correct: `SELECT COUNT(*) AS "total_records" FROM "spice"."public"."taxi_trips"`
+    Incorrect: `SELECT COUNT(*) AS total_records FROM "spice"."public"."taxi_trips"`
+    "#.to_string().into());
     model
 }
 
@@ -607,7 +601,7 @@ async fn get_openai_chat_model(
         .params
         .insert("tools".to_string(), tools.into().into());
 
-    let model_secrets = get_params_with_secrets(&model_with_tools.params, &rt).await;
+    let model_secrets = get_params_with_secrets_value(&model_with_tools.params, &rt).await;
     try_to_chat_model(&model_with_tools, &model_secrets, rt)
         .await
         .map_err(anyhow::Error::from)

@@ -44,9 +44,14 @@ on:
           - 'odbc-databricks connector'
           - 'odbc-athena connector'
           - 'delta_lake connector'
+          - 'dremio connector'
+          - 'spark connector'
           - 'arrow accelerator (memory mode)'
+          - 'arrow accelerator append (memory mode)'
           - 'duckdb accelerator (memory mode)'
+          - 'duckdb accelerator append (memory mode)'
           - 'duckdb accelerator (file mode)'
+          - 'duckdb accelerator append (file mode)'
           - 'sqlite accelerator (memory mode)'
           - 'sqlite accelerator (file mode)'
           - 'postgres accelerator'
@@ -60,7 +65,7 @@ on:
           - 'no'
 
 env:
-  FEATURES: 'postgres,spark,mysql,mssql,odbc,delta_lake,databricks,duckdb,sqlite'
+  FEATURES: 'postgres,spark,mysql,mssql,odbc,delta_lake,databricks,duckdb,sqlite,dremio'
 
 jobs:
   build-database-bench-binary:
@@ -173,6 +178,9 @@ jobs:
           - cmd: '-c spice.ai'
             name: 'spice.ai connector'
             bench: 'tpch'
+          - cmd: '-c spice.ai -b tpcds'
+            name: 'spice.ai connector'
+            bench: 'tpcds'
           - cmd: '-c s3'
             name: 's3 connector'
             bench: 'tpch'
@@ -191,6 +199,9 @@ jobs:
           - cmd: '-c spark'
             name: 'spark connector'
             bench: 'tpch'
+          - cmd: '-c spark -b tpcds'
+            name: 'spark connector'
+            bench: 'tpcds'
           - cmd: '-c postgres'
             name: 'postgres connector'
             bench: 'tpch'
@@ -226,6 +237,12 @@ jobs:
             bench: 'tpch'
           - cmd: '-c delta_lake -b tpcds'
             name: 'delta_lake connector'
+            bench: 'tpcds'
+          - cmd: '-c dremio'
+            name: 'dremio connector'
+            bench: 'tpch'
+          - cmd: '-c dremio -b tpcds'
+            name: 'dremio connector'
             bench: 'tpcds'
           - cmd: '-a arrow'
             name: 'arrow accelerator (memory mode)'
@@ -330,7 +347,7 @@ jobs:
         run: |
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }} 
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
           mc cp spice-bench-minio/benchmarks/duckdb/tpch.db ./
 
       - name: Download DuckDB Connector Data
@@ -338,7 +355,7 @@ jobs:
         run: |
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }} 
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
           mc cp spice-bench-minio/benchmarks/duckdb/tpcds.db ./
 
       - name: Download File Connector TPCH Data
@@ -346,7 +363,7 @@ jobs:
         run: |
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }} 
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
           mc cp spice-bench-minio/benchmarks/tpch_sf1/customer/ ./ --recursive
           mc cp spice-bench-minio/benchmarks/tpch_sf1/lineitem/ ./ --recursive
           mc cp spice-bench-minio/benchmarks/tpch_sf1/nation/ ./ --recursive
@@ -361,7 +378,7 @@ jobs:
         run: |
           sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
           sudo chmod +x /usr/local/bin/mc
-          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }} 
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
           mc cp spice-bench-minio/benchmarks/tpcds_sf1/call_center/ ./ --recursive
           mc cp spice-bench-minio/benchmarks/tpcds_sf1/catalog_page/ ./ --recursive
           mc cp spice-bench-minio/benchmarks/tpcds_sf1/catalog_returns/ ./ --recursive
@@ -392,7 +409,7 @@ jobs:
         run: INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" INSTA_UPDATE=${{ github.event.inputs.update_snapshots}} ./spice_bench --bench ${{ matrix.cmd }}
         continue-on-error: true
         env:
-          UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
+          # UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
           PG_BENCHMARK_PG_HOST: localhost
           PG_BENCHMARK_PG_USER: postgres
           PG_BENCHMARK_PG_PASS: postgres
@@ -416,10 +433,16 @@ jobs:
           DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           DATABRICKS_ODBC_PATH: ${{ secrets.DATABRICKS_ODBC_PATH }}
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_ENDPOINT: ${{ secrets.DATABRICKS_ENDPOINT }}
+          DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
+          SPICEAI_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCDS_BENCHMARK_KEY }}
+          DREMIO_PASSWORD: ${{secrets.DREMIO_PASSWORD}}
+          DREMIO_USERNAME: ${{secrets.DREMIO_USERNAME}}
 
       - name: Remove spice_bench file
         run: |
@@ -444,10 +467,24 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  run-clickbench:
-    name: Run ${{ matrix.name }} Clickbench
+  run-large-bench:
+    name: Run ${{ matrix.name }} ${{ matrix.bench }}
     runs-on: spiceai-large-runners
     needs: build-database-bench-binary
+
+    services:
+      postgres_acc:
+        image: ${{( matrix.cmd == '-a postgres' || matrix.cmd == '-a postgres -b clickbench') && 'ghcr.io/cloudnative-pg/postgresql:16-bookworm' || '' }}
+        options: >-
+          --shm-size=2gb
+          --health-cmd="pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+        env:
+          POSTGRES_PASSWORD: postgres
 
     strategy:
       fail-fast: false
@@ -460,8 +497,47 @@ jobs:
           - cmd: '-a duckdb -m file -b clickbench'
             name: 'duckdb accelerator (file mode)'
             bench: 'clickbench'
+          - cmd: '-a arrow -b tpch --refresh-mode append'
+            name: 'arrow accelerator append (memory mode)'
+            bench: 'tpch'
+          - cmd: '-a arrow -b tpcds --refresh-mode append'
+            name: 'arrow accelerator append (memory mode)'
+            bench: 'tpcds'
+          - cmd: '-a arrow -b clickbench --refresh-mode append'
+            name: 'arrow accelerator append (memory mode)'
+            bench: 'clickbench'
+          - cmd: '-a duckdb -m file -b tpch --refresh-mode append'
+            name: 'duckdb accelerator append (file mode)'
+            bench: 'tpch'
+          - cmd: '-a duckdb -m memory -b tpch --refresh-mode append'
+            name: 'duckdb accelerator append (memory mode)'
+            bench: 'tpch'
+          - cmd: '-a duckdb -m file -b tpcds --refresh-mode append'
+            name: 'duckdb accelerator append (file mode)'
+            bench: 'tpcds'
+          - cmd: '-a duckdb -m memory -b tpcds --refresh-mode append'
+            name: 'duckdb accelerator append (memory mode)'
+            bench: 'tpcds'
+          - cmd: '-a duckdb -m file -b clickbench --refresh-mode append'
+            name: 'duckdb accelerator append (file mode)'
+            bench: 'clickbench'
+          - cmd: '-a duckdb -m memory -b clickbench --refresh-mode append'
+            name: 'duckdb accelerator append (memory mode)'
+            bench: 'clickbench'
           - cmd: '-a duckdb -m memory -b clickbench'
             name: 'duckdb accelerator (memory mode)'
+            bench: 'clickbench'
+          - cmd: '-a sqlite -m memory -b clickbench'
+            name: 'sqlite accelerator (memory mode)'
+            bench: 'clickbench'
+          - cmd: '-a sqlite -m file -b clickbench'
+            name: 'sqlite accelerator (file mode)'
+            bench: 'clickbench'
+          - cmd: '-a postgres -b clickbench'
+            name: 'postgres accelerator'
+            bench: 'clickbench'
+          - cmd: '-c s3 -b clickbench'
+            name: 's3 connector'
             bench: 'clickbench'
 
     steps:
@@ -483,6 +559,13 @@ jobs:
         with:
           name: spice_bench
 
+      - name: Download File Connector Data
+        run: |
+          sudo wget https://dl.min.io/client/mc/release/linux-amd64/mc -O /usr/local/bin/mc
+          sudo chmod +x /usr/local/bin/mc
+          mc alias set spice-bench-minio ${{ secrets.CLICKBENCH_S3_ENDPOINT }} ${{ secrets.CLICKBENCH_S3_KEY }} ${{ secrets.CLICKBENCH_S3_SECRET }}
+          mc cp spice-bench-minio/benchmarks/clickbench/hits/hits.parquet ./
+
       - name: Make benchmark binary executable
         if: (github.event.inputs.selected_benchmark == matrix.name && (github.event.inputs.bench_name == matrix.bench || github.event.inputs.bench_name == 'all')) || github.event.inputs.run_all == 'true' || github.event_name == 'schedule'
         run: chmod +x ./spice_bench
@@ -492,10 +575,16 @@ jobs:
         run: INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./spice_bench --bench ${{ matrix.cmd }}
         continue-on-error: true
         env:
-          UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
+          # UPLOAD_RESULTS_DATASET: 'spiceai.tests.oss_benchmarks'
           S3_ENDPOINT: ${{ secrets.CLICKBENCH_S3_ENDPOINT}}
           S3_KEY: ${{ secrets.CLICKBENCH_S3_KEY}}
           S3_SECRET: ${{ secrets.CLICKBENCH_S3_SECRET}}
+          PG_BENCHMARK_PG_HOST: localhost
+          PG_BENCHMARK_PG_USER: postgres
+          PG_BENCHMARK_PG_PASS: postgres
+          PG_BENCHMARK_PG_SSLMODE: disable
+          PG_BENCHMARK_ACC_PG_DBNAME: postgres
+          SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
 
   create-pr:
     runs-on: ubuntu-latest

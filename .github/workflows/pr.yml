@@ -83,6 +83,23 @@ jobs:
         with:
           os: 'linux'
       
+      - name: Check if sccache can be set up
+        run: |
+          if [ -z "${{ secrets.MINIO_ENDPOINT }}" ]; then
+            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          fi
+        
+      - name: Set up sccache
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' &&  env.SCCACHE_SETUP == 'true' }}
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
+          os: 'linux'
+      
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: arduino/setup-protoc@v3
@@ -97,6 +114,15 @@ jobs:
 
       - run: make lint
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          CARGO_INCREMENTAL: 0
+      
+      - name: Show sccache stats
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        run: sccache --show-stats
 
       - name: Check if Cargo.lock is updated
         if: needs.check_changes.outputs.relevant_changes == 'true'
@@ -128,6 +154,23 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
+      
+      - name: Check if sccache can be set up
+        run: |
+          if [ -z "${{ secrets.MINIO_ENDPOINT }}" ]; then
+            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          fi
+      
+      - name: Set up sccache
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
+          os: 'linux'
 
       - name: Set up make
         uses: ./.github/actions/setup-make
@@ -137,6 +180,15 @@ jobs:
 
       - run: make ci test
         if: needs.check_changes.outputs.relevant_changes == 'true'
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          CARGO_INCREMENTAL: 0
+      
+      - name: Show sccache stats
+        if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
+        run: sccache --show-stats
 
   build-docker:
     name: Build Docker Image

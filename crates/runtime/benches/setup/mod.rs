@@ -1,5 +1,5 @@
 /*
-Copyright 2024 The Spice.ai OSS Authors
+Copyright 2024-2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -28,7 +28,7 @@ use runtime::{
 };
 use spicepod::component::{
     dataset::{
-        acceleration::{Acceleration, IndexType},
+        acceleration::{Acceleration, IndexType, ZeroResultsAction},
         replication::Replication,
         Dataset, Mode,
     },
@@ -124,7 +124,7 @@ fn build_app(
         });
 
     app_builder = match connector {
-        "spice.ai" => Ok(crate::bench_spicecloud::build_app(app_builder)),
+        "spice.ai" => crate::bench_spicecloud::build_app(app_builder, bench_name),
         // Run both S3, ABFS and any other object store benchmarks
         "s3" | "abfs" | "file" => {
             // SQLite acceleration does not support default TPC-DS source scale so we use a smaller scale
@@ -133,13 +133,23 @@ fn build_app(
                     .as_ref()
                     .is_some_and(|a| a.engine == Some("sqlite".to_string()))
             {
-                crate::bench_object_store::build_app(connector, app_builder, "tpcds_sf0_01")
+                crate::bench_object_store::build_app(
+                    connector,
+                    app_builder,
+                    "tpcds_sf0_01",
+                    acceleration.clone(),
+                )
             } else {
-                crate::bench_object_store::build_app(connector, app_builder, bench_name)
+                crate::bench_object_store::build_app(
+                    connector,
+                    app_builder,
+                    bench_name,
+                    acceleration.clone(),
+                )
             }
         }
         #[cfg(feature = "spark")]
-        "spark" => Ok(crate::bench_spark::build_app(app_builder)),
+        "spark" => crate::bench_spark::build_app(app_builder, bench_name),
         #[cfg(feature = "postgres")]
         "postgres" => crate::bench_postgres::build_app(app_builder, bench_name),
         #[cfg(feature = "mysql")]
@@ -154,6 +164,8 @@ fn build_app(
         "delta_lake" => crate::bench_delta::build_app(app_builder, bench_name),
         #[cfg(feature = "mssql")]
         "mssql" => crate::bench_mssql::build_app(app_builder, bench_name),
+        #[cfg(feature = "dremio")]
+        "dremio" => crate::bench_dremio::build_app(app_builder, bench_name),
         _ => Err(format!("Unknown connector: {connector}")),
     }?;
 
@@ -170,6 +182,7 @@ fn build_app(
         app.datasets.iter_mut().for_each(|ds| {
             let mut accel = accel.clone();
             let indexes = get_accelerator_indexes(accel.engine.clone(), &ds.name, bench_name);
+            accel.refresh_sql = get_accelerator_refresh_sql(&accel, &ds.name, bench_name);
             if let Some(indexes) = indexes {
                 accel.indexes = indexes;
             }
@@ -180,6 +193,28 @@ fn build_app(
     }
 
     Ok(app)
+}
+
+fn get_accelerator_refresh_sql(
+    acceleration: &Acceleration,
+    dataset: &str,
+    bench_name: &str,
+) -> Option<String> {
+    match (
+        acceleration.engine.as_deref(),
+        &acceleration.on_zero_results,
+        bench_name,
+    ) {
+        (Some("sqlite" | "postgres"), &ZeroResultsAction::ReturnEmpty, "clickbench") => {
+            // SQLite has troubles loading the whole ClickBench set with indexes enabled
+            // remove this refresh SQL when we support index creation after table load.
+            //
+            // Postgres also can't load the full dataset within the 3 hour time limit
+            Some(format!("SELECT * FROM {dataset} LIMIT 10000000"))
+        }
+        (_, &ZeroResultsAction::UseSource, _) => Some(format!("SELECT * FROM {dataset} LIMIT 0")),
+        _ => None,
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -291,6 +326,29 @@ fn get_accelerator_indexes(
                         let mut indexes: HashMap<String, IndexType> = HashMap::new();
                         indexes.insert("ws_bill_customer_sk".to_string(), IndexType::Enabled);
                         indexes.insert("ws_sold_date_sk".to_string(), IndexType::Enabled);
+                        Some(indexes)
+                    }
+                    _ => None,
+                },
+                "clickbench" => match dataset {
+                    "hits" => {
+                        let mut indexes: HashMap<String, IndexType> = HashMap::new();
+                        indexes
+                            .insert("(ClientIP, SearchEngineID)".to_string(), IndexType::Enabled);
+                        indexes.insert("(ClientIP, WatchID)".to_string(), IndexType::Enabled);
+                        indexes.insert(
+                            "(MobilePhone, MobilePhoneModel)".to_string(),
+                            IndexType::Enabled,
+                        );
+                        indexes.insert(
+                            "(SearchEngineID, SearchPhrase)".to_string(),
+                            IndexType::Enabled,
+                        );
+                        indexes.insert("(SearchPhrase, UserID)".to_string(), IndexType::Enabled);
+                        indexes.insert("AdvEngineID".to_string(), IndexType::Enabled);
+                        indexes.insert("MobilePhoneModel".to_string(), IndexType::Enabled);
+                        indexes.insert("SearchPhrase".to_string(), IndexType::Enabled);
+                        indexes.insert("UserID".to_string(), IndexType::Enabled);
                         Some(indexes)
                     }
                     _ => None,
