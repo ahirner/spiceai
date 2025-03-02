@@ -102,4 +102,4 @@ metal = [
     "mistralrs/metal",
 ]
 
-default = ["local_llm", "local_embed"]
+default = []
