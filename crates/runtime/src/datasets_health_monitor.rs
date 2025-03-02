@@ -363,7 +363,9 @@ async fn test_connectivity(
     df: Arc<DataFusion>,
 ) -> std::result::Result<(), DataFusionError> {
     let plan = table_provider
-        .scan(&df.ctx.state(), None, &[], Some(1))
+        // select * ... limit 1 is overloading some sensitive views
+        // todo: schema check or something instead of 0 results?
+        .scan(&df.ctx.state(), None, &[], Some(0))
         .await
         .map_err(find_datafusion_root)?;
 
