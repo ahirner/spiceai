@@ -43,9 +43,12 @@ use async_openai::{
     },
 };
 
+#[cfg(feature = "mistralrs")]
 pub mod mistral;
 pub mod nsql;
+#[cfg(feature = "mistralrs")]
 use indexmap::IndexMap;
+#[cfg(feature = "mistralrs")]
 use mistralrs::MessageContent;
 
 static WEIGHTS_EXTENSIONS: [&str; 7] = [
@@ -267,6 +270,7 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 }
 
 /// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequestMessage`] type.
+#[cfg(feature = "mistralrs")]
 #[must_use]
 #[allow(clippy::too_many_lines)]
 pub fn message_to_mistral(
@@ -677,6 +681,7 @@ pub trait Chat: Sync + Send {
 ///    be inferred from the `.model_type` key in a HF's `config.json`, or from the GGUF metadata.
 /// `from_gguf` is a path to a GGUF file within the huggingface model repo. If provided, the model will be loaded from this GGUF. This is useful for loading quantized models.
 /// `hf_token_literal` is a literal string of the Huggingface API token. If not provided, the token will be read from the HF token cache (i.e. `~/.cache/huggingface/token` or set via `HF_TOKEN_PATH`).
+#[cfg(feature = "mistralrs")]
 pub fn create_hf_model(
     model_id: &str,
     model_type: Option<&str>,
@@ -687,6 +692,7 @@ pub fn create_hf_model(
         .map(|x| Box::new(x) as Box<dyn Chat>)
 }
 
+#[cfg(feature = "mistralrs")]
 #[allow(unused_variables)]
 pub fn create_local_model(
     model_weights: &[String],

@@ -205,7 +205,8 @@ fn huggingface(
             path.display()
         );
     };
-    llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token)
+    return Err(LlmError::UnknownModelSource{ from: "mistral: (purposefully unsupported create_hf_model)".to_string() });
+    //llms::chat::create_hf_model(&id, model_type, gguf_path, hf_token)
 }
 
 fn openai(
@@ -319,6 +320,8 @@ fn file(
         .get("chat_template")
         .map(|s| s.expose_secret().as_str());
 
+    return Err(LlmError::UnknownModelSource{ from: "mistral: (purposefully unsupported create_local_model)".to_string() });
+    /*
     llms::chat::create_local_model(
         model_weights.as_slice(),
         config_path.as_deref(),
@@ -326,5 +329,5 @@ fn file(
         tokenizer_config_path.as_deref(),
         generation_config.as_deref(),
         chat_template_literal,
-    )
+    )*/
 }
