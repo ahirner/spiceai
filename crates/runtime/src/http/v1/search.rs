@@ -13,15 +13,21 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::embeddings::vector_search::{
-    self, to_matches_sorted, Match, SearchRequest, SearchRequestAIJson, SearchRequestHTTPJson,
-    VectorSearch,
+use crate::{
+    request::{AsyncMarker, RequestContext},
+    search::{
+        Error as VectorSearchError,
+        request::{SearchRequest, SearchRequestAIJson, SearchRequestHTTPJson},
+        types::{Match, to_matches_sorted},
+        vector_search::VectorSearch,
+    },
 };
 use axum::{
+    Extension, Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Extension, Json,
 };
+use http::HeaderMap;
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Instant};
 
@@ -29,7 +35,7 @@ use std::{sync::Arc, time::Instant};
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 struct SearchResponse {
     /// List of matches that were found in the datasets
-    pub matches: Vec<Match>,
+    pub results: Vec<Match>,
 
     /// Total time taken to execute the search, in milliseconds
     pub duration_ms: u128,
@@ -65,24 +71,34 @@ struct SearchResponse {
         (status = 200, description = "Search completed successfully", content((
             SearchResponse = "application/json",
                 example = json!({
-                    "matches": [
+                    "results": [
                         {
-                            "value": "I booked use some tickets",
+                            "matches": {
+                                "message": "I booked use some tickets"
+                            },
                             "dataset": "app_messages",
                             "primary_key": { "id": "6fd5a215-0881-421d-ace0-b293b83452b5" },
-                            "metadata": { "timestamp": 1_724_716_542 }
+                            "data": { "timestamp": 1_724_716_542 },
+                            "score": 0.914_321
                         },
                         {
-                            "value": "direct to Narata",
+                            "matches": {
+                                "message": "direct to Narata"
+                            },
                             "dataset": "app_messages",
                             "primary_key": { "id": "8a25595f-99fb-4404-8c82-e1046d8f4c4b" },
-                            "metadata": { "timestamp": 1_724_715_881 }
+                            "data": { "timestamp": 1_724_715_881 },
+                            "score": 0.83221
                         },
                         {
-                            "value": "Yes, we're sitting together",
+                            "matches": {
+                                "message": "Yes, we're sitting together"
+                            },
                             "dataset": "app_messages",
                             "primary_key": { "id": "8421ed84-b86d-4b10-b4da-7a432e8912c0" },
-                            "metadata": { "timestamp": 1_724_716_123 }
+                            "data": { "timestamp": 1_724_716_123 },
+                            "score": 0.787_654_321
+
                         }
                     ],
                     "duration_ms": 42
@@ -133,22 +149,39 @@ pub(crate) async fn post(
         }
     };
 
-    match vs.search(&search_request).await {
-        Ok(resp) => match to_matches_sorted(&resp, search_request.limit) {
-            Ok(m) => (
-                StatusCode::OK,
-                Json(SearchResponse {
-                    matches: m,
-                    duration_ms: start_time.elapsed().as_millis(),
-                }),
-            )
-                .into_response(),
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let cache_provider = vs.df.search_cache_provider();
+    match vs
+        .search_with_cache(&search_request, cache_provider, context.cache_control())
+        .await
+    {
+        Ok((resp, cache_status)) => match to_matches_sorted(resp, search_request.limit).await {
+            Ok(m) => {
+                let mut headers = HeaderMap::new();
+
+                if let Some(val) = cache_status.to_header_string().and_then(|v| v.parse().ok()) {
+                    headers.insert("Search-Results-Cache-Status", val);
+                }
+
+                (
+                    StatusCode::OK,
+                    headers,
+                    Json(SearchResponse {
+                        results: m,
+                        duration_ms: start_time.elapsed().as_millis(),
+                    }),
+                )
+                    .into_response()
+            }
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
         },
         Err(e) => {
             let error_type = match e {
-                vector_search::Error::NoTablesWithEmbeddingsFound {}
-                | vector_search::Error::CannotVectorSearchDataset { .. } => StatusCode::BAD_REQUEST,
+                VectorSearchError::NoTablesWithEmbeddingsFound {}
+                | VectorSearchError::CannotVectorSearchDataset { .. } => StatusCode::BAD_REQUEST,
+                VectorSearchError::SearchPipelineError { ref source } if source.is_user_error() => {
+                    StatusCode::BAD_REQUEST
+                }
                 _ => StatusCode::INTERNAL_SERVER_ERROR,
             };
 

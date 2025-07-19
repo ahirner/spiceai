@@ -28,8 +28,9 @@ use datafusion::error::{DataFusionError, Result as DataFusionResult};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::TableProviderFilterPushDown;
 use datafusion::physical_expr::EquivalenceProperties;
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionMode};
+use datafusion::physical_plan::{DisplayAs, DisplayFormatType};
 use datafusion::physical_plan::{Partitioning, PlanProperties};
 use datafusion::{
     datasource::{TableProvider, TableType},
@@ -42,8 +43,9 @@ use datafusion_table_providers::sql::sql_provider_datafusion::expr::{self, Engin
 use futures::Stream;
 use spark_connect_rs::errors::SparkError;
 use spark_connect_rs::{
-    client::ChannelBuilder, functions::col, DataFrame, SparkSession, SparkSessionBuilder,
+    DataFrame, SparkSession, SparkSessionBuilder, client::ChannelBuilder, functions::col,
 };
+use tokio::sync::RwLock;
 
 use std::error::Error;
 
@@ -51,7 +53,7 @@ pub mod federation;
 
 #[derive(Clone)]
 pub struct SparkConnect {
-    session: Arc<SparkSession>,
+    session: Arc<RwLock<SparkSession>>,
     join_push_down_context: String,
 }
 
@@ -64,9 +66,11 @@ impl SparkConnect {
     }
 
     pub async fn from_connection(connection: &str) -> Result<Self, Box<dyn Error + Send + Sync>> {
-        let session = Arc::new(SparkSessionBuilder::remote(connection)?.build().await?);
+        let session = SparkSessionBuilder::remote(connection)?.build().await?;
 
-        let (host, port, options) = ChannelBuilder::parse_connection_string(connection)?;
+        let session = Arc::new(RwLock::new(session));
+
+        let (host, port, options, _) = ChannelBuilder::parse_connection_string(connection)?;
         let options = options.unwrap_or_default();
 
         // it's safe to use default value here for options as session is already established.
@@ -88,6 +92,11 @@ impl SparkConnect {
             join_push_down_context,
         })
     }
+
+    pub async fn set_token(&self, token: &str) {
+        let session = self.session.write().await;
+        session.set_token(Some(token));
+    }
 }
 
 #[async_trait]
@@ -104,17 +113,13 @@ impl Read for SparkConnect {
             self.join_push_down_context.clone(),
         )
         .await?;
-        let provider = Arc::new(
-            provider
-                .create_federated_table_provider()
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
-        );
+        let provider = Arc::new(provider.create_federated_table_provider());
         Ok(provider)
     }
 }
 
 async fn get_table_provider(
-    spark_session: Arc<SparkSession>,
+    spark_session: Arc<RwLock<SparkSession>>,
     table_reference: TableReference,
     schema: Option<SchemaRef>,
     join_push_down_context: String,
@@ -133,7 +138,11 @@ async fn get_table_provider(
             format!("`{catalog}`.`{schema}`.`{table}`")
         }
     };
-    let dataframe = spark_session.table(spark_table_reference.as_str())?;
+
+    let session_guard = spark_session.read().await;
+    let session = Arc::new(session_guard.clone());
+    let dataframe = session.table(spark_table_reference.as_str())?;
+
     let arrow_schema = match schema {
         Some(schema) => schema,
         None => dataframe.clone().limit(0).collect().await?.schema(),
@@ -247,7 +256,8 @@ impl SparkConnectExecutionPlan {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             ),
         })
     }

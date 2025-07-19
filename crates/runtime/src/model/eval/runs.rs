@@ -196,7 +196,7 @@ pub async fn update_eval_run_status(
 
     if let Some(err) = err_msg {
         updates.insert("error_message", Arc::new(StringArray::from(vec![err])));
-    };
+    }
     update_eval_run(df, id, updates).await
 }
 
@@ -311,10 +311,9 @@ async fn update_eval_run(
     })?;
 
     // Invalidate cache so subsequent calls to [`update_eval_run`] get the most up to date table.
-    if let Some(cache) = df.cache_provider() {
+    if let Some(cache) = df.results_cache_provider() {
         cache
             .invalidate_for_table(EVAL_RUNS_TABLE_REFERENCE.clone())
-            .await
             .boxed()
             .context(FailedToUpdateEvalRunTableSnafu {
                 eval_run_id: id.clone(),
@@ -331,7 +330,7 @@ fn eval_runs_record(id: &str, model: &str, eval: &Eval) -> Result<RecordBatch, A
     let arrays: Vec<ArrayRef> = vec![
         Arc::new(StringArray::from(vec![id.to_string()])),
         Arc::new(TimestampSecondArray::from(vec![
-            chrono::Utc::now().timestamp()
+            chrono::Utc::now().timestamp(),
         ])),
         Arc::new(TimestampSecondArray::from(vec![None])),
         Arc::new(StringArray::from(vec![eval.dataset.clone()])),

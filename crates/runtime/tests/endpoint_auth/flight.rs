@@ -27,8 +27,8 @@ use crate::{
 use arrow_flight::{error::FlightError, flight_service_client::FlightServiceClient};
 use flightrepl::cache_control;
 use rand::Rng;
-use runtime::{auth::EndpointAuth, config::Config, Runtime};
-use runtime_auth::{api_key::ApiKeyAuth, FlightBasicAuth};
+use runtime::{Runtime, auth::EndpointAuth, config::Config};
+use runtime_auth::{FlightBasicAuth, api_key::ApiKeyAuth};
 use spicepod::component::runtime::ApiKey;
 use tonic::transport::Channel;
 
@@ -42,8 +42,8 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
         let span = tracing::info_span!("test_flight_auth");
         let _span_guard = span.enter();
 
-        let mut rng = rand::thread_rng();
-        let http_port: u16 = rng.gen_range(50000..60000);
+        let mut rng = rand::rng();
+        let http_port: u16 = rng.random_range(50000..60000);
         let flight_port: u16 = http_port + 1;
         let otel_port: u16 = http_port + 2;
         let metrics_port: u16 = http_port + 3;
@@ -59,17 +59,22 @@ async fn test_flight_auth() -> Result<(), anyhow::Error> {
 
         let registry = prometheus::Registry::new();
 
+        let app = app::AppBuilder::new("test_app").build();
+
         let rt = Runtime::builder()
             .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
+            .with_app(app)
             .build()
             .await;
+
+        let cloned_rt = Arc::new(rt.clone());
 
         let api_key_auth = Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid")]))
             as Arc<dyn FlightBasicAuth + Send + Sync>;
 
         // Start the servers
         tokio::spawn(async move {
-            Box::pin(Arc::new(rt).start_servers(
+            Box::pin(Arc::clone(&cloned_rt).start_servers(
                 api_config,
                 None,
                 EndpointAuth::default().with_flight_basic_auth(api_key_auth),

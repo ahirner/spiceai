@@ -36,18 +36,20 @@ use async_openai::types::{
 
 use async_trait::async_trait;
 use futures::{Stream, StreamExt};
+use pin_project::pin_project;
 use serde_json::Value;
 
 use tokio::sync::mpsc;
+use tools::SpiceModelTool;
 use tracing::{Instrument, Span};
 
+use crate::Runtime;
 use crate::request::{AsyncMarker, RequestContext};
 use crate::tools::builtin::list_datasets::ListDatasetsTool;
-use crate::tools::SpiceModelTool;
-use crate::Runtime;
+use llms::progress::Progress;
 
 pub struct ToolUsingChat {
-    inner_chat: Arc<Box<dyn Chat>>,
+    inner_chat: Arc<dyn Chat>,
     rt: Arc<Runtime>,
     tools: Vec<Arc<dyn SpiceModelTool>>,
     recursion_limit: Option<usize>,
@@ -56,7 +58,7 @@ pub struct ToolUsingChat {
 impl ToolUsingChat {
     #[must_use]
     pub fn new(
-        inner_chat: Arc<Box<dyn Chat>>,
+        inner_chat: Arc<dyn Chat>,
         rt: Arc<Runtime>,
         tools: Vec<Arc<dyn SpiceModelTool>>,
         recursion_limit: Option<usize>,
@@ -77,7 +79,7 @@ impl ToolUsingChat {
                 r#type: ChatCompletionToolType::Function,
                 function: FunctionObject {
                     strict: t.strict(),
-                    name: t.name().to_string(),
+                    name: encode_tool_name(t.name().to_string().as_str()),
                     description: t.description().map(|d| d.to_string()),
                     parameters: t.parameters(),
                 },
@@ -85,22 +87,17 @@ impl ToolUsingChat {
             .collect_vec()
     }
 
-    #[must_use]
-    pub fn tool_exists(&self, name: &str) -> bool {
-        self.tools.iter().any(|t| t.name() == name)
-    }
-
     /// Create a new [`CreateChatCompletionRequest`] with the system prompt injected as the first message.
     async fn prepare_req(
         &self,
         mut req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionRequest, OpenAIError> {
-        if self.tool_exists("list_datasets") {
+        if self.tools.iter().any(|t| t.name() == "list_datasets") {
             // Add messages to start of message list to pretend it has already asked to list the available datasets.
             let mut list_dataset_messages = self.create_list_dataset_messages().await?;
             list_dataset_messages.extend_from_slice(req.messages.as_slice());
             req.messages = list_dataset_messages;
-        };
+        }
 
         Ok(req)
     }
@@ -110,9 +107,9 @@ impl ToolUsingChat {
     async fn create_list_dataset_messages(
         &self,
     ) -> Result<Vec<ChatCompletionRequestMessage>, OpenAIError> {
-        let t = ListDatasetsTool::default();
+        let t = ListDatasetsTool::from(&self.rt);
         let t_resp = t
-            .call("", Arc::<Runtime>::clone(&self.rt))
+            .call("")
             .await
             .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
         Ok(vec![
@@ -136,28 +133,60 @@ impl ToolUsingChat {
     }
 
     /// Check if a tool call is a spiced runtime tool.
-    fn is_spiced_tool(&self, t: &ChatCompletionMessageToolCall) -> bool {
-        self.tools.iter().any(|tool| tool.name() == t.function.name)
+    fn as_spiced_tool(&self, t: &ChatCompletionMessageToolCall) -> Option<Arc<dyn SpiceModelTool>> {
+        self.tools
+            .iter()
+            .find(|tool| encode_tool_name(tool.name().as_ref()) == t.function.name)
+            .cloned()
     }
 
     /// Call a spiced runtime tool.
     ///
     /// Return the result as a JSON value.
-    async fn call_tool(&self, func: &FunctionCall) -> Value {
-        match self.tools.iter().find(|t| t.name() == func.name) {
-            Some(t) => {
-                match t
-                    .call(&func.arguments, Arc::<Runtime>::clone(&self.rt))
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(e) => Value::String(format!(
+    async fn call_tool(&self, tool_call: &ChatCompletionMessageToolCall) -> Value {
+        match self.as_spiced_tool(tool_call) {
+            Some(t) => match t.call(&tool_call.function.arguments).await {
+                Ok(v) => {
+                    tracing::info!(
+                        target: "task_history",
+                        progress = Progress::log()
+                            .id(tool_call.id.clone())
+                            .title(format!("'{}' tool completed successfully", tool_call.function.name))
+                            .json_content(v.clone())
+                            .to_jsonl(),
+                    );
+                    v
+                }
+                Err(e) => {
+                    tracing::info!(
+                        target: "task_history",
+                        progress = Progress::error()
+                            .id(tool_call.id.clone())
+                            .title(format!("'{}' tool completed unsuccessfully", tool_call.function.name))
+                            .content(e.to_string())
+                            .to_jsonl(),
+                    );
+                    Value::String(format!(
                         "Failed to call the tool {}.\nAn error occurred: {e}",
                         t.name()
-                    )),
+                    ))
+                }
+            },
+            None => {
+                // All calls to `call_tool` should have previously checked that `tool_call` has an associated tool.
+                if cfg!(feature = "dev") {
+                    panic!(
+                        "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
+                        tool_call.function.name
+                    );
+                } else {
+                    tracing::warn!(
+                        "Tool '{}' was provided to LLM, but now no longer exists. This should not be possible.",
+                        tool_call.function.name
+                    );
+                    Value::Null
                 }
             }
-            None => Value::Null,
         }
     }
 
@@ -167,9 +196,9 @@ impl ToolUsingChat {
     ///
     /// Returns
     /// - `None` if no spiced runtime tools were used. Note: external tools may still have been
-    ///     requested.
+    ///   requested.
     /// - `Some(messages)` if spiced runtime tools were used. The returned messages are ready to be
-    ///     reprocessed by the model.
+    ///   reprocessed by the model.
     async fn process_tool_calls_and_run_spice_tools(
         &self,
         original_messages: Vec<ChatCompletionRequestMessage>,
@@ -177,7 +206,7 @@ impl ToolUsingChat {
     ) -> Result<Option<Vec<ChatCompletionRequestMessage>>, OpenAIError> {
         let spiced_tools = requested_tools
             .iter()
-            .filter(|&t| self.is_spiced_tool(t))
+            .filter(|&t| self.as_spiced_tool(t).is_some())
             .cloned()
             .collect_vec();
 
@@ -201,10 +230,20 @@ impl ToolUsingChat {
                 .into();
 
         let mut tool_and_response_content = vec![];
-        for t in spiced_tools {
-            let content = self.call_tool(&t.function).await;
+        for t in spiced_tools.clone() {
+            tracing::info!(
+                target: "task_history",
+                progress = Progress::log()
+                    .id(t.id.clone())
+                    .title(format!("Calling '{}' tool", t.function.name))
+                    .content(t.function.arguments.clone())
+                    .to_jsonl(),
+            );
+
+            let content = self.call_tool(&t).await;
             tool_and_response_content.push((t, content));
         }
+
         tracing::debug!(
             "Ran tools, and retrieved responses: {:?}",
             tool_and_response_content
@@ -226,6 +265,14 @@ impl ToolUsingChat {
         messages.push(assistant_message);
         messages.extend(tool_messages);
 
+        if !messages.is_empty() {
+            let used_tools = spiced_tools.len();
+            if used_tools > 0 {
+                let context = RequestContext::current(AsyncMarker::new().await);
+                crate::model::add_tools_used(&context, used_tools);
+            }
+        }
+
         Ok(Some(messages))
     }
 
@@ -243,14 +290,14 @@ impl ToolUsingChat {
             {
                 tracing::debug!("User asked for no tools, calling inner chat model");
                 return self.inner_chat.chat_request(req).await;
-            };
+            }
 
             if recursion_limit.is_some_and(|f| f == 0) {
                 tracing::debug!(
                     "Tool-use recursion limit reached. Will call model, but not process further"
                 );
                 return self.inner_chat.chat_request(req).await;
-            };
+            }
 
             // Append spiced runtime tools to the request.
             let inner_req = self.add_runtime_tools(&req);
@@ -314,14 +361,14 @@ impl ToolUsingChat {
             .is_some_and(|c| *c == ChatCompletionToolChoiceOption::None)
         {
             return self.inner_chat.chat_stream(req).await;
-        };
+        }
 
         if self.recursion_limit.is_some_and(|f| f == 0) {
             tracing::debug!(
                 "Tool-use recursion limit reached. Will call model, but not process further"
             );
             return self.inner_chat.chat_stream(req).await;
-        };
+        }
 
         // Append spiced runtime tools to the request. Avoid clone if no runtime tools.
         let updated_req = self.add_runtime_tools(&req);
@@ -359,8 +406,12 @@ impl Chat for ToolUsingChat {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+        let context = RequestContext::current(AsyncMarker::new().await);
         let inner_req = self.prepare_req(req).await?;
-        self.chat_stream_inner(inner_req).await
+
+        // wrap the completion stream to track the `ai_inferences_with_spice_count` when it is ready.
+        let stream = self.chat_stream_inner(inner_req).await?;
+        Ok(Box::pin(InferenceTrackingStream::new(stream, context)))
     }
 
     async fn chat_request(
@@ -368,8 +419,15 @@ impl Chat for ToolUsingChat {
         req: CreateChatCompletionRequest,
     ) -> Result<CreateChatCompletionResponse, OpenAIError> {
         let inner_req = self.prepare_req(req).await?;
-        self.chat_request_inner(inner_req, self.recursion_limit)
-            .await
+        let response = self
+            .chat_request_inner(inner_req, self.recursion_limit)
+            .await;
+
+        // track ai_inferences_with_spice_count metric
+        let context = RequestContext::current(AsyncMarker::new().await);
+        crate::model::track_ai_inferences_with_spice_count(&context);
+
+        response
     }
 
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
@@ -655,7 +713,7 @@ fn make_a_stream(
                                         }
                                         return;
                                     }
-                                };
+                                }
                             } else if matches!(finish_reason, FinishReason::Stop)
                                 || matches!(finish_reason, FinishReason::Length)
                             {
@@ -694,4 +752,45 @@ fn make_a_stream(
             .instrument(span),
     );
     Box::pin(CustomStream { receiver }) as ChatCompletionResponseStream
+}
+
+// OpenAI tools must satisfy '^[a-zA-Z0-9_-]+$'. Commonly external tools may have '/' in their name.
+fn encode_tool_name(name: &str) -> String {
+    if name.contains('/') {
+        name.replace('_', "__").replace('/', "_")
+    } else {
+        name.to_string()
+    }
+}
+
+#[pin_project]
+struct InferenceTrackingStream<S> {
+    #[pin]
+    stream: S,
+    context: Arc<RequestContext>,
+}
+
+impl<S: Stream> InferenceTrackingStream<S> {
+    pub fn new(stream: S, context: Arc<RequestContext>) -> Self {
+        InferenceTrackingStream { stream, context }
+    }
+}
+
+impl<S: Stream> Stream for InferenceTrackingStream<S> {
+    type Item = S::Item;
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        let stream = &mut this.stream;
+        let context = this.context;
+
+        match stream.as_mut().poll_next(cx) {
+            Poll::Ready(None) => {
+                let context = Arc::clone(context);
+                crate::model::track_ai_inferences_with_spice_count(&context);
+                Poll::Ready(None)
+            }
+            Poll::Ready(Some(item)) => Poll::Ready(Some(item)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
 }

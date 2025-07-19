@@ -15,16 +15,20 @@ limitations under the License.
 */
 
 use crate::{
-    get_test_datafusion, init_tracing, run_query_and_check_results,
+    ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
     utils::{runtime_ready_check, test_request_context},
-    ValidateFn,
 };
 use app::AppBuilder;
-use runtime::{status, Runtime};
-use spicepod::component::{catalog::Catalog, params::Params};
+
+use runtime::Runtime;
+use spicepod::{component::catalog::Catalog, param::Params};
 use std::sync::Arc;
 
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn databricks_spark_connect_integration_test_catalog() -> Result<(), anyhow::Error> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(None);
@@ -43,21 +47,20 @@ async fn databricks_spark_connect_integration_test_catalog() -> Result<(), anyho
                 .with_catalog(db_catalog)
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let mut rt =
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
+                    .build()
+                    .await;
 
-            let mut rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
-                .build()
-                .await;
+            let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(120)) => {
                     panic!("Timeout waiting for components to load");
                 }
-                () = rt.load_components() => {}
+() = cloned_rt.load_components() => {}
             }
 
             runtime_ready_check(&rt).await;
@@ -128,15 +131,15 @@ fn get_params() -> Params {
         vec![
             (
                 "databricks_endpoint".to_string(),
-                "${ env:DATABRICKS_HOST }".to_string(),
+                "${ env:TEST_DATABRICKS_HOST }".to_string(),
             ),
             (
                 "databricks_token".to_string(),
-                "${ env:DATABRICKS_TOKEN }".to_string(),
+                "${ env:TEST_DATABRICKS_TOKEN }".to_string(),
             ),
             (
                 "databricks_cluster_id".to_string(),
-                "${ env:DATABRICKS_CLUSTER_ID }".to_string(),
+                "${ env:TEST_DATABRICKS_CLUSTER_ID }".to_string(),
             ),
             ("mode".to_string(), "spark_connect".to_string()),
         ]

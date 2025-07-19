@@ -15,17 +15,18 @@ limitations under the License.
 */
 
 use arrow::{
-    array::{new_null_array, Array, ArrayRef, ListArray, RecordBatch, StructArray},
+    array::{Array, ArrayRef, ListArray, RecordBatch, StructArray, new_null_array},
     buffer::{Buffer, OffsetBuffer},
     datatypes::{DataType, Field, SchemaRef},
     error::ArrowError,
 };
 use arrow_cast::cast;
 use arrow_schema::Schema;
-use snafu::prelude::*;
+use datafusion::{common::ParamValues, error::DataFusionError, scalar::ScalarValue};
+use snafu::{ResultExt, prelude::*};
 use std::sync::Arc;
 
-use crate::format::{format_column_data, FormatOperation};
+use crate::format::{FormatOperation, format_column_data};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -36,6 +37,19 @@ pub enum Error {
 
     #[snafu(display("Field is not nullable: {field}"))]
     FieldNotNullable { field: String },
+}
+
+impl From<Error> for DataFusionError {
+    fn from(e: Error) -> Self {
+        match e {
+            Error::UnableToConvertRecordBatch {
+                source: arrow_error,
+            } => DataFusionError::ArrowError(arrow_error, None),
+            Error::FieldNotNullable { .. } => {
+                DataFusionError::ArrowError(ArrowError::SchemaError(e.to_string()), None)
+            }
+        }
+    }
 }
 
 /// Cast a given record batch into a new record batch with the given schema.
@@ -208,6 +222,47 @@ pub fn truncate_numeric_column_length(
     RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
 }
 
+/// Converts a record batch with a single row into `ParamValues`
+///
+/// # Errors
+/// Returns an error when a value in an array cannot be converted into a scalar.
+pub fn record_to_param_values(batch: &RecordBatch) -> Result<ParamValues, DataFusionError> {
+    let mut param_values: Vec<(String, Option<usize>, ScalarValue)> = Vec::new();
+
+    let mut is_list = true;
+    for col_index in 0..batch.num_columns() {
+        let array = batch.column(col_index);
+        let scalar = ScalarValue::try_from_array(array, 0)?;
+        let name = batch
+            .schema_ref()
+            .field(col_index)
+            .name()
+            .trim_start_matches('$')
+            .to_string();
+        let index = name.parse().ok();
+        is_list &= index.is_some();
+        param_values.push((name, index, scalar));
+    }
+    if is_list {
+        let mut values: Vec<(Option<usize>, ScalarValue)> = param_values
+            .into_iter()
+            .map(|(_name, index, value)| (index, value))
+            .collect();
+        values.sort_by_key(|(index, _value)| *index);
+        Ok(values
+            .into_iter()
+            .map(|(_index, value)| value)
+            .collect::<Vec<ScalarValue>>()
+            .into())
+    } else {
+        Ok(param_values
+            .into_iter()
+            .map(|(name, _index, value)| (name, value))
+            .collect::<Vec<(String, ScalarValue)>>()
+            .into())
+    }
+}
+
 fn is_numeric_list(field: &Arc<Field>) -> bool {
     match field.data_type() {
         DataType::LargeListView(inner)
@@ -221,6 +276,7 @@ fn is_numeric_list(field: &Arc<Field>) -> bool {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
 
     use arrow::{
         array::{Int32Array, StringArray},
@@ -377,5 +433,154 @@ mod test {
         let expected_batch = parse_json_to_batch(expected_batch_json_data, schema);
 
         assert_eq!(processed_batch, expected_batch);
+    }
+
+    fn create_record_batch(
+        schema: Vec<(&str, DataType)>,
+        columns: Vec<Arc<dyn arrow::array::Array>>,
+    ) -> RecordBatch {
+        let fields = schema
+            .into_iter()
+            .map(|(name, dt)| Field::new(name, dt, true))
+            .collect::<Vec<_>>();
+        let schema = Arc::new(Schema::new(fields));
+        RecordBatch::try_new(schema, columns).expect("new RecordBatch")
+    }
+
+    fn assert_param_values_eq(result: ParamValues, expected: ParamValues) {
+        match (result, expected) {
+            (ParamValues::List(result_vec), ParamValues::List(expected_vec)) => {
+                assert_eq!(result_vec.len(), expected_vec.len(), "List lengths differ");
+                for (r, e) in result_vec.iter().zip(expected_vec.iter()) {
+                    assert_eq!(r, e, "ScalarValue mismatch");
+                }
+            }
+            (ParamValues::Map(result_map), ParamValues::Map(expected_map)) => {
+                assert_eq!(result_map.len(), expected_map.len(), "Map lengths differ");
+                for (key, expected_value) in expected_map {
+                    let result_value = result_map.get(&key).expect("key in result map");
+                    assert_eq!(
+                        result_value, &expected_value,
+                        "ScalarValue mismatch for key {key}",
+                    );
+                }
+            }
+            (result, expected) => {
+                panic!("Mismatched ParamValues variants: got {result:?}, expected {expected:?}",)
+            }
+        }
+    }
+
+    #[test]
+    fn record_to_param_values_list_parameters() {
+        let batch = create_record_batch(
+            vec![("$1", DataType::Int32), ("$2", DataType::Utf8)],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(42)])),
+                Arc::new(StringArray::from(vec![Some("hello")])),
+            ],
+        );
+
+        let result = record_to_param_values(&batch).expect("record to param values");
+        let expected = ParamValues::List(vec![
+            ScalarValue::Int32(Some(42)),
+            ScalarValue::Utf8(Some("hello".to_string())),
+        ]);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_named_parameters() {
+        let batch = create_record_batch(
+            vec![("param1", DataType::Int32), ("param2", DataType::Utf8)],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(100)])),
+                Arc::new(StringArray::from(vec![Some("world")])),
+            ],
+        );
+
+        let result = record_to_param_values(&batch).expect("record to param values");
+        let mut expected_map = HashMap::new();
+        expected_map.insert("param1".to_string(), ScalarValue::Int32(Some(100)));
+        expected_map.insert(
+            "param2".to_string(),
+            ScalarValue::Utf8(Some("world".to_string())),
+        );
+        let expected = ParamValues::Map(expected_map);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_mixed_parameters() {
+        let batch = create_record_batch(
+            vec![("$1", DataType::Int32), ("param2", DataType::Utf8)],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(10)])),
+                Arc::new(StringArray::from(vec![Some("test")])),
+            ],
+        );
+
+        let result = record_to_param_values(&batch).expect("record to param values");
+        let mut expected_map = HashMap::new();
+        expected_map.insert("1".to_string(), ScalarValue::Int32(Some(10)));
+        expected_map.insert(
+            "param2".to_string(),
+            ScalarValue::Utf8(Some("test".to_string())),
+        );
+        let expected = ParamValues::Map(expected_map);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_list_parameters_out_of_order() {
+        let batch = create_record_batch(
+            vec![("$2", DataType::Int32), ("$1", DataType::Utf8)],
+            vec![
+                Arc::new(Int32Array::from(vec![Some(200)])),
+                Arc::new(StringArray::from(vec![Some("first")])),
+            ],
+        );
+
+        let result = record_to_param_values(&batch).expect("record to param values");
+        let expected = ParamValues::List(vec![
+            ScalarValue::Utf8(Some("first".to_string())),
+            ScalarValue::Int32(Some(200)),
+        ]);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_single_column_list() {
+        let batch = create_record_batch(
+            vec![("$1", DataType::Int32)],
+            vec![Arc::new(Int32Array::from(vec![Some(1)]))],
+        );
+
+        let result = record_to_param_values(&batch).expect("record to param values");
+        let expected = ParamValues::List(vec![ScalarValue::Int32(Some(1))]);
+
+        assert_param_values_eq(result, expected);
+    }
+
+    #[test]
+    fn record_to_param_values_single_column_named() {
+        let batch = create_record_batch(
+            vec![("x", DataType::Utf8)],
+            vec![Arc::new(StringArray::from(vec![Some("value")]))],
+        );
+
+        let result = record_to_param_values(&batch).expect("record to param values");
+        let mut expected_map = HashMap::new();
+        expected_map.insert(
+            "x".to_string(),
+            ScalarValue::Utf8(Some("value".to_string())),
+        );
+        let expected = ParamValues::Map(expected_map);
+
+        assert_param_values_eq(result, expected);
     }
 }

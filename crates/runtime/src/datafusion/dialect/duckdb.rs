@@ -63,10 +63,9 @@ pub(crate) fn cosine_distance_to_sql(
         .try_collect()?;
 
     let ast_fn = ast::Expr::Function(Function {
-        name: ObjectName(vec![Ident {
-            value: "array_cosine_distance".to_string(),
-            quote_style: None,
-        }]),
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
+            "array_cosine_distance",
+        ))]),
         args: ast::FunctionArguments::List(ast::FunctionArgumentList {
             duplicate_treatment: None,
             args: ast_args
@@ -80,19 +79,44 @@ pub(crate) fn cosine_distance_to_sql(
         over: None,
         within_group: vec![],
         parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
     });
 
     Ok(Some(ast_fn))
 }
+
+#[allow(clippy::unnecessary_wraps)] // Required to match the signature of the `ScalarFnToSqlHandler` trait
+pub(crate) fn rand_to_random(
+    _unparser: &datafusion::sql::unparser::Unparser,
+    _args: &[Expr],
+) -> Result<Option<datafusion::sql::sqlparser::ast::Expr>, DataFusionError> {
+    let ast_fn = ast::Expr::Function(Function {
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new("random"))]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: None,
+            args: vec![],
+            clauses: vec![],
+        }),
+        filter: None,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    });
+
+    Ok(Some(ast_fn))
+}
+
 #[cfg(test)]
 mod tests {
     use datafusion::{
-        common::Column,
+        common::{Column, Spans},
         functions_array::make_array::make_array_udf,
         logical_expr::expr::ScalarFunction,
         prelude::lit,
         scalar::ScalarValue,
-        sql::{unparser::Unparser, TableReference},
+        sql::{TableReference, unparser::Unparser},
     };
 
     use crate::datafusion::dialect::new_duckdb_dialect;
@@ -137,6 +161,7 @@ mod tests {
             Expr::Column(Column {
                 relation: Some(TableReference::from("table_name")),
                 name: "column_name".to_string(),
+                spans: Spans::new(),
             }),
             Expr::ScalarFunction(ScalarFunction::new_udf(
                 make_array_udf(),

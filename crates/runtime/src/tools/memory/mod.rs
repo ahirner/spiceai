@@ -19,16 +19,15 @@ use std::sync::Arc;
 use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampSecondArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
 use datafusion::sql::TableReference;
-use once_cell::sync::Lazy;
 use uuid::Uuid;
 
-use crate::{component::validate_identifier, Runtime};
+use crate::{Runtime, component::validate_identifier};
 
 pub mod catalog;
 pub mod load;
 pub mod store;
 
-pub static MEMORY_TABLE_SCHEMA: Lazy<SchemaRef> = Lazy::new(|| {
+pub static MEMORY_TABLE_SCHEMA: std::sync::LazyLock<SchemaRef> = std::sync::LazyLock::new(|| {
     Schema::new(vec![
         Field::new("id", DataType::Utf8, false),
         Field::new("value", DataType::Utf8, false),

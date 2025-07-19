@@ -16,9 +16,11 @@ limitations under the License.
 
 use std::{collections::HashMap, fmt::Display};
 
+use crate::metric::Metrics;
+
 use super::{
-    model::{ModelFile, ModelFileType, HUGGINGFACE_PATH_REGEX},
     Nameable, WithDependsOn,
+    model::{HUGGINGFACE_PATH_REGEX, ModelFile, ModelFileType},
 };
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
@@ -43,6 +45,9 @@ pub struct Embeddings {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<Metrics>,
 }
 
 impl Nameable for Embeddings {
@@ -70,6 +75,7 @@ impl Embeddings {
             params: HashMap::default(),
             datasets: Vec::default(),
             depends_on: Vec::default(),
+            metrics: None,
         }
     }
 
@@ -137,6 +143,14 @@ impl Embeddings {
                 let from = &self.from;
                 from.strip_prefix("file:").map(ToString::to_string)
             }
+            Some(EmbeddingPrefix::Databricks) => {
+                let from = &self.from;
+                from.strip_prefix("databricks:").map(ToString::to_string)
+            }
+            Some(EmbeddingPrefix::Bedrock) => {
+                let from = &self.from;
+                from.strip_prefix("bedrock:").map(ToString::to_string)
+            }
             None => None,
         }
     }
@@ -147,6 +161,8 @@ pub enum EmbeddingPrefix {
     Azure,
     HuggingFace,
     File,
+    Databricks,
+    Bedrock,
 }
 
 impl TryFrom<&str> for EmbeddingPrefix {
@@ -161,6 +177,10 @@ impl TryFrom<&str> for EmbeddingPrefix {
             Ok(EmbeddingPrefix::OpenAi)
         } else if value.starts_with("azure") {
             Ok(EmbeddingPrefix::Azure)
+        } else if value.starts_with("databricks") {
+            Ok(EmbeddingPrefix::Databricks)
+        } else if value.starts_with("bedrock") {
+            Ok(EmbeddingPrefix::Bedrock)
         } else {
             Err("Unknown prefix")
         }
@@ -174,6 +194,8 @@ impl Display for EmbeddingPrefix {
             EmbeddingPrefix::Azure => write!(f, "azure"),
             EmbeddingPrefix::HuggingFace => write!(f, "huggingface"),
             EmbeddingPrefix::File => write!(f, "file"),
+            EmbeddingPrefix::Databricks => write!(f, "databricks"),
+            EmbeddingPrefix::Bedrock => write!(f, "bedrock"),
         }
     }
 }

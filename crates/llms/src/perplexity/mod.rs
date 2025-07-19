@@ -17,7 +17,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 
-use async_openai::{error::OpenAIError, Client};
+use async_openai::{Client, error::OpenAIError};
 use futures::{StreamExt, TryStreamExt};
 use reqwest_eventsource::Error as SseError;
 use secrecy::{ExposeSecret, SecretString};
@@ -45,7 +45,7 @@ impl PerplexitySonar {
         model: Option<&str>,
         params: &HashMap<String, SecretString>,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let Some(auth_token) = params.get("perplexity_auth_token") else {
+        let Some(auth_token) = params.get("auth_token") else {
             return Err(Box::from(
                 "No `perplexity_auth_token` provided for Perplexity model.",
             ));
@@ -54,18 +54,16 @@ impl PerplexitySonar {
         let overrides: Vec<(String, String)> = params
             .iter()
             .filter_map(|(k, v)| {
-                if k != "perplexity_auth_token" {
-                    if let Some(p) = k.strip_prefix("perplexity_") {
-                        return Some((p.to_string(), v.expose_secret().clone()));
-                    }
-                };
+                if k != "auth_token" {
+                    return Some((k.to_string(), v.expose_secret().to_string()));
+                }
                 None
             })
             .collect();
 
-        let cfg = HostedModelConfig::default()
-            .with_auth(GenericAuthMechanism::BearerToken(auth_token.clone()))
-            .with_base_url(PERPLEXITY_SONAR_API_BASE);
+        let cfg = HostedModelConfig::from_url(PERPLEXITY_SONAR_API_BASE).with_auth(
+            GenericAuthMechanism::from_bearer_token(auth_token.expose_secret()),
+        );
 
         Ok(Self {
             client: Client::<HostedModelConfig>::with_config(cfg),

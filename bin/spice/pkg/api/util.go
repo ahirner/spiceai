@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -33,39 +34,24 @@ const (
 )
 
 func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, method, path string, body *string) (T, error) {
-	url := fmt.Sprintf("%s%s", rtcontext.HttpEndpoint(), path)
 	var resp *http.Response
 	var err error
 
 	switch method {
 	case GET:
-		var request *http.Request
-		request, err = http.NewRequest("GET", url, nil)
-		if err != nil {
-			return *new(T), fmt.Errorf("error creating request: %w", err)
-		}
-		headers := rtcontext.GetHeaders()
-		for key, value := range headers {
-			request.Header.Set(key, value)
-		}
-		request.Header.Set("Content-Type", "application/json")
-		resp, err = rtcontext.Client().Do(request)
+		resp, err = rtcontext.Do("GET", path, nil, "Content-Type", "application/json")
+
 	case POST:
 		var reader io.Reader
-		var request *http.Request
 		if body != nil {
 			reader = strings.NewReader(*body)
 		}
-		request, err = http.NewRequest("POST", url, reader)
-		if err != nil {
-			return *new(T), fmt.Errorf("error creating request: %w", err)
+
+		if body != nil {
+			resp, err = rtcontext.Do("POST", path, reader, "Content-Type", "application/json")
+		} else {
+			resp, err = rtcontext.Do("POST", path, reader)
 		}
-		headers := rtcontext.GetHeaders()
-		for key, value := range headers {
-			request.Header.Set(key, value)
-		}
-		request.Header.Set("Content-Type", "application/json")
-		resp, err = rtcontext.Client().Do(request)
 	default:
 		return *new(T), fmt.Errorf("unsupported method: %s", method)
 	}
@@ -74,12 +60,26 @@ func doRuntimeApiRequest[T interface{}](rtcontext *context.RuntimeContext, metho
 		if strings.HasSuffix(err.Error(), "connection refused") {
 			return *new(T), rtcontext.RuntimeUnavailableError()
 		}
-		return *new(T), fmt.Errorf("error performing request to %s: %w", url, err)
+		return *new(T), fmt.Errorf("error performing request to %s%s: %w", rtcontext.HttpEndpoint(), path, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			slog.Error("closing response body", "error", err)
+		}
+	}()
 
 	if resp.StatusCode == http.StatusUnauthorized {
-		return *new(T), fmt.Errorf("Unauthorized")
+		return *new(T), fmt.Errorf("unauthorized: invalid or missing Spice API key")
+	}
+
+	if resp.StatusCode == http.StatusNotFound {
+		bodyBytes, err := io.ReadAll(resp.Body)
+		bodyString := ""
+		if err == nil {
+			bodyString = string(bodyBytes)
+		}
+
+		return *new(T), fmt.Errorf("not found: %s", bodyString)
 	}
 
 	var result T

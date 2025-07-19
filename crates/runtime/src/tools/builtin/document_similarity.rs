@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use arrow_schema::ArrowError;
 use async_trait::async_trait;
 use serde_json::Value;
 use snafu::ResultExt;
@@ -21,32 +20,32 @@ use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
 use crate::{
-    embeddings::vector_search::{
-        parse_explicit_primary_keys, SearchRequest, SearchRequestAIJson, VectorSearch,
-    },
-    tools::{utils::parameters, SpiceModelTool},
     Runtime,
+    request::{CacheControl, CacheKeyType},
+    search::{
+        request::{SearchRequest, SearchRequestAIJson},
+        types::to_pretty,
+        util::parse_explicit_primary_keys,
+        vector_search::VectorSearch,
+    },
+    tools::{SpiceModelTool, utils::parameters},
 };
 
 pub struct DocumentSimilarityTool {
     name: String,
-    description: Option<String>,
+    description: String,
+    rt: Arc<Runtime>,
 }
 impl DocumentSimilarityTool {
     #[must_use]
-    pub fn new(name: &str, description: Option<String>) -> Self {
+    pub fn new(rt: Arc<Runtime>, name: Option<&str>, description: Option<&str>) -> Self {
         Self {
-            name: name.to_string(),
-            description,
+            name: name.unwrap_or("document_similarity").to_string(),
+            description: description
+                .unwrap_or("Search and retrieve documents from available datasets")
+                .to_string(),
+            rt,
         }
-    }
-}
-impl Default for DocumentSimilarityTool {
-    fn default() -> Self {
-        Self::new(
-            "document_similarity",
-            Some("Search and retrieve documents from available datasets".to_string()),
-        )
     }
 }
 
@@ -57,18 +56,14 @@ impl SpiceModelTool for DocumentSimilarityTool {
     }
 
     fn description(&self) -> Option<Cow<'_, str>> {
-        self.description.as_deref().map(Cow::Borrowed)
+        Some(Cow::Borrowed(self.description.as_str()))
     }
 
     fn parameters(&self) -> Option<Value> {
         parameters::<SearchRequestAIJson>()
     }
 
-    async fn call(
-        &self,
-        arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::document_similarity", tool = self.name().to_string(), input = arg);
 
         let tool_use_result = async {
@@ -76,23 +71,26 @@ impl SpiceModelTool for DocumentSimilarityTool {
             tracing::trace!("document_similarity tool use function call request: {req:?}");
 
             let vs = VectorSearch::new(
-                rt.datafusion(),
-                Arc::clone(&rt.embeds),
-                parse_explicit_primary_keys(Arc::clone(&rt.app)).await,
+                self.rt.datafusion(),
+                Arc::clone(&self.rt.embeds),
+                parse_explicit_primary_keys(Arc::clone(&self.rt.app)).await,
             );
 
             let search_request = SearchRequest::try_from(req)?;
-
-            let result = vs.search(&search_request).await.boxed()?;
-            let formatted = result
-                .iter()
-                .map(|(tbl, result)| {
-                    let displayed = result.to_pretty()?;
-                    Ok((tbl.to_string(), Value::String(displayed.to_string())))
-                })
-                .collect::<Result<serde_json::Map<String, Value>, ArrowError>>()
+            let (result, _) = vs
+                .search_with_cache(
+                    &search_request,
+                    self.rt.datafusion().search_cache_provider(),
+                    CacheControl::Cache(CacheKeyType::Default),
+                )
+                .await
                 .boxed()?;
 
+            let mut formatted = serde_json::Map::with_capacity(result.len());
+            for (tbl, result) in result {
+                let displayed = to_pretty(result).await?;
+                formatted.insert(tbl.to_string(), Value::String(displayed.to_string()));
+            }
             Ok(Value::Object(formatted))
         }
         .instrument(span.clone())

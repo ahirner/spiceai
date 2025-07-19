@@ -16,8 +16,8 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::delta_lake::DeltaTableFactory;
 use data_components::Read;
+use data_components::delta_lake::DeltaTableFactory;
 use datafusion::datasource::TableProvider;
 use snafu::prelude::*;
 use std::any::Any;
@@ -30,6 +30,7 @@ use super::{
     Parameters,
 };
 
+#[derive(Debug)]
 pub struct DeltaLake {
     delta_table_factory: DeltaTableFactory,
 }
@@ -74,6 +75,9 @@ const PARAMETERS: &[ParameterSpec] = &[
         .secret(),
     ParameterSpec::component("aws_endpoint")
         .description("The AWS endpoint to use for S3 storage.")
+        .secret(),
+    ParameterSpec::component("aws_allow_http")
+        .description("The AWS endpoint allow http scheme")
         .secret(),
     // Azure storage options
     ParameterSpec::component("azure_storage_account_name")

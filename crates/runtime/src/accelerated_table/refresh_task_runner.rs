@@ -22,7 +22,10 @@ use super::{
 use futures::future::BoxFuture;
 use tokio::{
     select,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Semaphore,
+        mpsc::{self, Receiver, Sender},
+    },
     task::JoinHandle,
 };
 
@@ -33,17 +36,18 @@ use datafusion::{datasource::TableProvider, sql::TableReference};
 
 use super::refresh::Refresh;
 
-/// `RefreshTaskRunner` is responsible for running all refresh tasks for a dataset. It is expected
-/// that only one [`RefreshTaskRunner`] is used per dataset, and that is is the only entity
-/// refreshing an `accelerator`.
-pub struct RefreshTaskRunner {
+pub struct RefreshTaskRunnerBuilder {
+    runtime_status: Arc<status::RuntimeStatus>,
     dataset_name: TableReference,
+    federated: Arc<FederatedTable>,
+    federated_source: Option<String>,
     refresh: Arc<RwLock<Refresh>>,
-    refresh_task: Arc<RefreshTask>,
-    task: Option<JoinHandle<()>>,
+    accelerator: Arc<dyn TableProvider>,
+    disable_federation: bool,
+    semaphore: Option<Arc<Semaphore>>,
 }
 
-impl RefreshTaskRunner {
+impl RefreshTaskRunnerBuilder {
     #[must_use]
     pub fn new(
         runtime_status: Arc<status::RuntimeStatus>,
@@ -53,20 +57,86 @@ impl RefreshTaskRunner {
         refresh: Arc<RwLock<Refresh>>,
         accelerator: Arc<dyn TableProvider>,
     ) -> Self {
-        let refresh_task = Arc::new(RefreshTask::new(
+        Self {
             runtime_status,
-            dataset_name.clone(),
+            dataset_name,
             federated,
             federated_source,
-            accelerator,
-        ));
-
-        Self {
-            dataset_name,
             refresh,
+            accelerator,
+            disable_federation: false,
+            semaphore: None,
+        }
+    }
+
+    /// Sets the `disable_federation` flag
+    #[must_use]
+    pub fn with_disable_federation(mut self, disable: bool) -> Self {
+        self.disable_federation = disable;
+        self
+    }
+
+    #[must_use]
+    pub fn with_semaphore(mut self, semaphore: Arc<Semaphore>) -> Self {
+        self.semaphore = Some(semaphore);
+        self
+    }
+
+    #[must_use]
+    pub fn build(self) -> RefreshTaskRunner {
+        let mut refresh_task_builder = RefreshTask::builder(
+            self.runtime_status,
+            self.dataset_name.clone(),
+            self.federated,
+            self.federated_source,
+            self.accelerator,
+        )
+        .with_disable_federation(self.disable_federation);
+
+        if let Some(semaphore) = self.semaphore {
+            refresh_task_builder = refresh_task_builder.with_semaphore(semaphore);
+        }
+
+        let refresh_task = Arc::new(refresh_task_builder.build());
+
+        RefreshTaskRunner {
+            dataset_name: self.dataset_name,
+            refresh: self.refresh,
             refresh_task,
             task: None,
         }
+    }
+}
+
+/// `RefreshTaskRunner` is responsible for running all refresh tasks for a dataset. It is expected
+/// that only one [`RefreshTaskRunner`] is used per dataset, and that is is the only entity
+/// refreshing an `accelerator`.
+#[derive(Debug)]
+pub struct RefreshTaskRunner {
+    dataset_name: TableReference,
+    refresh: Arc<RwLock<Refresh>>,
+    refresh_task: Arc<RefreshTask>,
+    task: Option<JoinHandle<()>>,
+}
+
+impl RefreshTaskRunner {
+    #[must_use]
+    pub fn builder(
+        runtime_status: Arc<status::RuntimeStatus>,
+        dataset_name: TableReference,
+        federated: Arc<FederatedTable>,
+        federated_source: Option<String>,
+        refresh: Arc<RwLock<Refresh>>,
+        accelerator: Arc<dyn TableProvider>,
+    ) -> RefreshTaskRunnerBuilder {
+        RefreshTaskRunnerBuilder::new(
+            runtime_status,
+            dataset_name,
+            federated,
+            federated_source,
+            refresh,
+            accelerator,
+        )
     }
 
     pub fn start(
@@ -97,13 +167,13 @@ impl RefreshTaskRunner {
                         res = task => {
                             match res {
                                 Ok(()) => {
-                                    tracing::debug!("Refresh task successfully completed for dataset {dataset_name}");
+                                    tracing::debug!("Dataset {dataset_name} refreshed successfully");
                                     if let Err(err) = notify_refresh_complete.send(Ok(())).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 },
                                 Err(err) => {
-                                    tracing::debug!("Refresh task for dataset {dataset_name} failed with error: {err}");
+                                    tracing::debug!("Dataset {dataset_name} failed to refresh with error: {err}");
                                     if let Err(err) = notify_refresh_complete.send(Err(err)).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }

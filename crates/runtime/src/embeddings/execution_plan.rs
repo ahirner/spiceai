@@ -29,7 +29,9 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use datafusion::physical_plan::{
+    DisplayAs, DisplayFormatType, ExecutionPlan, ExecutionPlanProperties, PlanProperties,
+};
 use futures::stream::{Stream, StreamExt};
 use itertools::Itertools;
 use llms::chunking::Chunker;
@@ -155,8 +157,9 @@ impl EmbeddingTableExec {
     ) -> PlanProperties {
         let eq_properties = EquivalenceProperties::new(Arc::clone(projected_schema));
         let partitioning = base_plan.properties().partitioning.clone();
-        let execution_mode = base_plan.properties().execution_mode();
-        PlanProperties::new(eq_properties, partitioning, execution_mode)
+        let emission_type = base_plan.pipeline_behavior();
+        let boundedness = base_plan.boundedness();
+        PlanProperties::new(eq_properties, partitioning, emission_type, boundedness)
     }
 }
 
@@ -190,7 +193,7 @@ fn to_sendable_stream(
                             yield Err(DataFusionError::External(e.to_string().into()));
 
                         },
-                    };
+                    }
                 },
                 Err(e) => {
                     tracing::debug!("Error in underlying base stream: {e:?}");
@@ -272,10 +275,10 @@ pub(crate) async fn compute_additional_embedding_columns(
 
         let Some(arr_iter) = convert_string_arrow_to_iterator!(raw_data) else {
             tracing::warn!(
-                    "Expected 'StringArray', 'StringViewArray' or 'LargeStringArray' for column '{}', but got {}",
-                    col,
-                    raw_data.data_type()
-                );
+                "Expected 'StringArray', 'StringViewArray' or 'LargeStringArray' for column '{}', but got {}",
+                col,
+                raw_data.data_type()
+            );
             continue;
         };
 
@@ -287,7 +290,7 @@ pub(crate) async fn compute_additional_embedding_columns(
 
             Arc::new(vectors) as ArrayRef
         } else {
-            let fixed_size_array = get_vectors(arr_iter, &**model).await?;
+            let fixed_size_array = get_vectors(arr_iter, &**model, cfg.vector_size).await?;
             tracing::trace!("Successfully embedded column '{col}'");
             Arc::new(fixed_size_array) as ArrayRef
         };
@@ -332,10 +335,15 @@ pub(crate) async fn compute_additional_embedding_columns(
 ///
 ///                 [`FixedSizeListArray`]
 /// ```
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-async fn get_vectors(
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_possible_wrap,
+    clippy::cast_sign_loss
+)]
+pub(super) async fn get_vectors(
     arr: impl Iterator<Item = Option<&str>>,
     model: &dyn Embed,
+    vector_length: i32,
 ) -> Result<FixedSizeListArray, Box<dyn std::error::Error + Send + Sync>> {
     // Filter out nulls or empty strings before calling [`Embed::embed`].
     let (null_pairs, values): (Vec<_>, Vec<_>) = arr
@@ -348,13 +356,12 @@ async fn get_vectors(
         .collect();
 
     let embedded_data = model.embed(EmbeddingInput::StringArray(column)).await?;
-    let vector_length = embedded_data.first().map(Vec::len).unwrap_or_default();
 
     let mut builder = FixedSizeListBuilder::with_capacity(
         PrimitiveBuilder::<Float32Type>::with_capacity(
-            (embedded_data.len() + nulls.len()) * vector_length,
+            (embedded_data.len() + nulls.len()) * (vector_length as usize),
         ),
-        vector_length as i32,
+        vector_length,
         embedded_data.len() + nulls.len(),
     )
     .with_field(Arc::new(Field::new("item", DataType::Float32, false)));
@@ -369,7 +376,7 @@ async fn get_vectors(
     for vector in embedded_data {
         // Keep inserting nulls until we reach the next non-null value.
         while nulls.get(null_ptr).is_some_and(|&idx| idx == output_ptr) {
-            builder.values().append_nulls(vector_length);
+            builder.values().append_nulls(vector_length as usize);
             null_ptr += 1;
             output_ptr += 1;
             builder.append(false);
@@ -382,7 +389,7 @@ async fn get_vectors(
 
     // Handle any trailing nulls/empty strings.
     while nulls.get(null_ptr).is_some_and(|&idx| idx == output_ptr) {
-        builder.values().append_nulls(vector_length);
+        builder.values().append_nulls(vector_length as usize);
         null_ptr += 1;
         output_ptr += 1;
         builder.append(false);
@@ -541,7 +548,7 @@ mod tests {
     use llms::embeddings::{self, Embed};
     use std::collections::HashMap;
 
-    #[derive(Default)]
+    #[derive(Default, Debug)]
     pub(crate) struct MockEmbedder {
         pub map: HashMap<String, Vec<f32>>,
     }
@@ -588,6 +595,7 @@ mod tests {
             &MockEmbedder::default()
                 .with_pair("hello", vec![0.1, 0.2])
                 .with_pair("world", vec![0.3, 0.4]),
+            2,
         )
         .await?;
 
@@ -603,13 +611,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_vectors_with_nulls_and_empty(
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn test_get_vectors_with_nulls_and_empty()
+    -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let result = get_vectors(
             vec![None, Some("world"), Some(""), Some("hello"), None].into_iter(),
             &MockEmbedder::default()
                 .with_pair("hello", vec![0.1, 0.2])
                 .with_pair("world", vec![0.3, 0.4]),
+            2,
         )
         .await?;
 

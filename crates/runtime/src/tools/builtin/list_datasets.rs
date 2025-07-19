@@ -22,39 +22,40 @@ use snafu::ResultExt;
 use std::{borrow::Cow, collections::HashMap, sync::Arc};
 
 use crate::{
+    Runtime,
     datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
     tools::SpiceModelTool,
-    Runtime,
 };
 
 pub struct ListDatasetsTool {
     name: String,
-    description: Option<String>,
+    description: String,
     table_allowlist: Option<Vec<String>>,
+    rt: Arc<Runtime>,
 }
 
 impl ListDatasetsTool {
     #[must_use]
     pub fn new(
-        name: &str,
-        description: Option<String>,
+        name: Option<&str>,
+        description: Option<&str>,
         table_allowlist: Option<Vec<&str>>,
+        rt: Arc<Runtime>,
     ) -> Self {
         Self {
-            name: name.to_string(),
-            description,
+            rt,
+            name: name.unwrap_or("list_datasets").to_string(),
+            description: description
+                .unwrap_or("List all SQL tables available.")
+                .to_string(),
             table_allowlist: table_allowlist.map(|t| t.iter().map(ToString::to_string).collect()),
         }
     }
 }
 
-impl Default for ListDatasetsTool {
-    fn default() -> Self {
-        Self::new(
-            "list_datasets",
-            Some("List all SQL tables available.".to_string()),
-            None,
-        )
+impl From<&Arc<Runtime>> for ListDatasetsTool {
+    fn from(rt: &Arc<Runtime>) -> Self {
+        Self::new(None, None, None, Arc::clone(rt))
     }
 }
 
@@ -65,21 +66,17 @@ impl SpiceModelTool for ListDatasetsTool {
     }
 
     fn description(&self) -> Option<Cow<'_, str>> {
-        self.description.as_deref().map(Cow::Borrowed)
+        Some(Cow::Borrowed(&self.description))
     }
 
     fn parameters(&self) -> Option<Value> {
         None
     }
 
-    async fn call(
-        &self,
-        arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name().to_string(), input = arg);
 
-        let elements = get_dataset_elements(Arc::clone(&rt), self.table_allowlist.as_deref())
+        let elements = get_dataset_elements(Arc::clone(&self.rt), self.table_allowlist.as_deref())
             .await
             .iter()
             .map(serde_json::value::to_value)
@@ -98,6 +95,19 @@ pub async fn get_dataset_elements(
     rt: Arc<Runtime>,
     opt_include: Option<&[String]>,
 ) -> Vec<ListDatasetElement> {
+    let mut tables = get_table_elements(Arc::clone(&rt), opt_include).await;
+    let views = get_view_elements(Arc::clone(&rt), opt_include).await;
+    let catalogs = get_catalog_elements(Arc::clone(&rt), opt_include).await;
+    tables.extend(views.into_iter());
+    tables.extend(catalogs.into_iter());
+
+    tables
+}
+
+pub async fn get_table_elements(
+    rt: Arc<Runtime>,
+    opt_include: Option<&[String]>,
+) -> Vec<ListDatasetElement> {
     let Some(app) = &*rt.app.read().await else {
         return vec![];
     };
@@ -112,6 +122,68 @@ pub async fn get_dataset_elements(
             can_search_documents: d.has_embeddings(),
             description: d.description.clone(),
             metadata: d.metadata.clone(),
+        })
+        .collect_vec()
+}
+
+pub async fn get_catalog_elements(
+    rt: Arc<Runtime>,
+    _opt_include: Option<&[String]>,
+) -> Vec<ListDatasetElement> {
+    let Some(ref app) = *rt.app.read().await else {
+        return vec![];
+    };
+
+    app.catalogs
+        .iter()
+        .flat_map(|c| {
+            let Some(ctlg) = rt.datafusion().ctx.catalog(c.name.as_str()) else {
+                return vec![];
+            };
+            ctlg.schema_names()
+                .iter()
+                .flat_map(|s| {
+                    let Some(schm) = ctlg.schema(s.as_str()) else {
+                        return vec![];
+                    };
+                    schm.table_names()
+                        .iter()
+                        .map(|t| ListDatasetElement {
+                            table: TableReference::Full {
+                                table: t.as_str().into(),
+                                schema: s.as_str().into(),
+                                catalog: c.name.as_str().into(),
+                            }
+                            .to_string(),
+                            can_search_documents: false,
+                            description: None,
+                            metadata: HashMap::new(),
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect()
+}
+
+pub async fn get_view_elements(
+    rt: Arc<Runtime>,
+    opt_include: Option<&[String]>,
+) -> Vec<ListDatasetElement> {
+    let Some(app) = &*rt.app.read().await else {
+        return vec![];
+    };
+
+    app.views
+        .iter()
+        .filter(|v| opt_include.is_none_or(|ts| ts.contains(&v.name)))
+        .map(|v| ListDatasetElement {
+            table: TableReference::parse_str(&v.name)
+                .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
+                .to_string(),
+            can_search_documents: false,
+            description: v.description.clone(),
+            metadata: v.metadata.clone(),
         })
         .collect_vec()
 }

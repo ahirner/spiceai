@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use async_openai::{
+    Client,
     config::OpenAIConfig,
     error::OpenAIError,
     types::{
@@ -22,16 +23,15 @@ use async_openai::{
         ChatCompletionRequestMessage, ChatCompletionResponseStream, CreateChatCompletionRequest,
         CreateChatCompletionResponse,
     },
-    Client,
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::chat::{nsql::SqlGeneration, Chat, Error};
+use crate::chat::{Chat, Error, nsql::SqlGeneration};
 
 static DEFAULT_ENDPOINT: &str = "https://api.x.ai/v1";
-static DEFAULT_MODEL: &str = "grok-beta";
+static DEFAULT_MODEL: &str = "grok-3";
 
 /// [`Xai`] is a chat model for xAI models. xAI is nearly `OpenAI` compatible.
 pub struct Xai {
@@ -61,7 +61,7 @@ impl Xai {
             if let ChatCompletionRequestMessage::Assistant(
                 ChatCompletionRequestAssistantMessage {
                     content,
-                    tool_calls: Some(ref mut tool_calls),
+                    tool_calls: Some(tool_calls),
                     ..
                 },
             ) = m
@@ -71,7 +71,7 @@ impl Xai {
                     content.replace(ChatCompletionRequestAssistantMessageContent::Text(
                         String::new(),
                     ));
-                };
+                }
 
                 // xAI requires tool calls with empty parameters used to be `{}` not ``.
                 for t in tool_calls.iter_mut() {

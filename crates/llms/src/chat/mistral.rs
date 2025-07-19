@@ -16,7 +16,7 @@ limitations under the License.
 
 use crate::chat::message_to_mistral;
 
-use super::{nsql::SqlGeneration, Chat, Error as ChatError, FailedToRunModelSnafu, Result};
+use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
 use async_openai::{
     error::{ApiError, OpenAIError},
     types::{
@@ -32,15 +32,15 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, TryStreamExt};
 use mistralrs::{
-    AutoDeviceMapParams, ChatCompletionChunkResponse, ChatCompletionResponse, ChunkChoice,
-    Constraint, Device, DeviceMapSetting, Function, GGMLLoaderBuilder, GGMLSpecificConfig,
-    GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs, MistralRsBuilder,
-    ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline,
+    AdapterPaths, AutoDeviceMapParams, ChatCompletionChunkResponse, ChatCompletionResponse,
+    ChunkChoice, Constraint, Device, DeviceMapSetting, Function, GGMLLoaderBuilder,
+    GGMLSpecificConfig, GGUFLoaderBuilder, GGUFSpecificConfig, Loader, LocalModelPaths, MistralRs,
+    MistralRsBuilder, ModelDType, ModelPaths, NormalLoaderBuilder, NormalRequest, Pipeline,
     Request as MistralRequest, RequestMessage, Response as MistralResponse, SamplingParams,
     TokenSource, Tool, ToolCallResponse, ToolChoice, ToolType,
 };
 
-use secrecy::{ExposeSecret, Secret};
+use secrecy::{ExposeSecret, SecretString};
 use snafu::ResultExt;
 use std::{
     collections::HashMap,
@@ -49,11 +49,11 @@ use std::{
     pin::Pin,
     str::FromStr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicUsize, Ordering},
     },
 };
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{Receiver, Sender, channel};
 
 pub struct MistralLlama {
     pipeline: Arc<MistralRs>,
@@ -68,7 +68,7 @@ fn to_openai_response(
 }
 
 impl MistralLlama {
-    pub fn from(
+    pub async fn from(
         model_weights: &[PathBuf],
         config: Option<&Path>,
         tokenizer: Option<&Path>,
@@ -136,7 +136,7 @@ impl MistralLlama {
             _ => Self::load_default_pipeline(paths, &device, &model_id, chat_template_literal)?,
         };
 
-        Ok(Self::from_pipeline(pipeline))
+        Ok(Self::from_pipeline(pipeline).await)
     }
 
     /// Create paths object, [`ModelPaths`], to create new [`MistralLlama`].
@@ -158,13 +158,8 @@ impl MistralLlama {
             config.map(Into::into).unwrap_or_default(),
             tokenizer_config.map(Into::into).unwrap_or_default(),
             model_weights.iter().map(Into::into).collect(),
-            None,
-            None,
-            None,
-            None,
-            None,
+            AdapterPaths::None,
             generation_config.map(Into::into),
-            None,
             None,
             None,
             None,
@@ -183,6 +178,8 @@ impl MistralLlama {
             chat_template_literal.map(ToString::to_string),
             None,
             model_parts.first().map(ToString::to_string),
+            false, // enable KV cache,
+            None,
         )
         .build(None) // Infer loader type
         .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?
@@ -218,12 +215,16 @@ impl MistralLlama {
         // Default to use file over string literal.
         if let Some(filename) = chat_template.as_ref() {
             if chat_template_literal.is_some() {
-                tracing::warn!("For GGUF model, both a template file was specific '{filename}' and a string literal chat_template. For GGUF only one can be provided, defaulting to the file.");
-            };
+                tracing::warn!(
+                    "For GGUF model, both a template file was specific '{filename}' and a string literal chat_template. For GGUF only one can be provided, defaulting to the file."
+                );
+            }
         } else {
-            tracing::debug!("For GGUF model, no chat template file provided. Using the provided chat template literal.");
+            tracing::debug!(
+                "For GGUF model, no chat template file provided. Using the provided chat template literal."
+            );
             chat_template = chat_template_literal.map(Into::into);
-        };
+        }
 
         let gguf_file: Vec<String> = paths
             .get_weight_filenames()
@@ -237,6 +238,8 @@ impl MistralLlama {
             model_id.to_string(),
             gguf_file,
             GGUFSpecificConfig::default(),
+            false,
+            None,
         )
         .build()
         .load_model_from_path(
@@ -265,6 +268,8 @@ impl MistralLlama {
             None,
             String::new(),
             model_id.to_string(),
+            false,
+            None,
         )
         .build()
         .load_model_from_path(
@@ -296,10 +301,10 @@ impl MistralLlama {
         }
     }
 
-    pub fn from_hf(
+    pub async fn from_hf(
         model_id: &str,
         arch: Option<&str>,
-        hf_token_literal: Option<&Secret<String>>,
+        hf_token_literal: Option<&SecretString>,
         gguf_filename: Option<PathBuf>,
     ) -> Result<Self> {
         let model_parts: Vec<&str> = model_id.split(':').collect();
@@ -312,6 +317,8 @@ impl MistralLlama {
                 model_parts[0].to_string(),
                 vec![gguf.to_string_lossy().to_string()],
                 GGUFSpecificConfig::default(),
+                false,
+                None,
             )
             .build())
         } else {
@@ -329,6 +336,8 @@ impl MistralLlama {
                 None,
                 None,
                 Some(model_parts[0].to_string()),
+                false,
+                None,
             );
 
             builder
@@ -339,7 +348,7 @@ impl MistralLlama {
         let device = Self::get_device();
         let token_source = hf_token_literal.map_or(TokenSource::CacheToken, |secret| {
             tracing::debug!("A HuggingFace token was specified in parameters. The specified token will be used instead of any system/environment defaults.");
-            TokenSource::Literal(secret.expose_secret().clone())
+            TokenSource::Literal(secret.expose_secret().to_string())
         });
 
         let pipeline = loader?
@@ -355,11 +364,11 @@ impl MistralLlama {
             )
             .map_err(|e| ChatError::FailedToLoadModel { source: e.into() })?;
 
-        Ok(Self::from_pipeline(pipeline))
+        Ok(Self::from_pipeline(pipeline).await)
     }
 
     #[allow(clippy::expect_used)]
-    fn from_pipeline(p: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>) -> Self {
+    async fn from_pipeline(p: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>) -> Self {
         Self {
             pipeline: MistralRsBuilder::new(
                 p,
@@ -368,8 +377,11 @@ impl MistralLlama {
                         NonZeroUsize::new(5).expect("unreachable 5 > 0"),
                     ),
                 },
+                false,
+                None,
             )
-            .build(),
+            .build()
+            .await,
             counter: AtomicUsize::new(0),
         }
     }
@@ -384,7 +396,7 @@ impl MistralLlama {
         tool_choice: Option<ToolChoice>,
         sampling: Option<SamplingParams>,
     ) -> MistralRequest {
-        MistralRequest::Normal(NormalRequest {
+        MistralRequest::Normal(Box::new(NormalRequest {
             messages: message,
             sampling_params: sampling.unwrap_or(SamplingParams::deterministic()),
             response: tx,
@@ -393,12 +405,13 @@ impl MistralLlama {
             id: self.counter.fetch_add(1, Ordering::SeqCst),
             constraint: Constraint::None,
             suffix: None,
-            adapters: None,
+            web_search_options: None,
             tools,
             tool_choice,
             logits_processors: None,
             return_raw_logits: false,
-        })
+            model_id: None, // Not actually needed.
+        }))
     }
 
     /// Prepares and sends a [`CreateChatCompletionRequest`] to the model pipeline.
@@ -407,12 +420,14 @@ impl MistralLlama {
         &self,
         req: CreateChatCompletionRequest,
     ) -> Result<Receiver<MistralResponse>> {
-        let message = RequestMessage::Chat(
-            req.messages
+        let message = RequestMessage::Chat {
+            messages: req
+                .messages
                 .iter()
                 .map(message_to_mistral)
                 .collect::<Vec<_>>(),
-        );
+            enable_thinking: None,
+        };
 
         let tools: Option<Vec<Tool>> = req.tools.map(|t| t.iter().map(convert_tool).collect());
         let tool_choice: Option<ToolChoice> = req.tool_choice.map(|s| convert_tool_choice(&s));
@@ -438,7 +453,7 @@ impl MistralLlama {
 
         tracing::trace!("Sending request to pipeline");
         self.pipeline
-            .get_sender()
+            .get_sender(None) // Only one model running in this pipeline.
             .boxed()
             .context(FailedToRunModelSnafu)?
             .send(self.to_mistralrs_request(
@@ -464,7 +479,12 @@ impl MistralLlama {
                 // mistralrs does not return "tool_calls" as a finish_reason correctly (like OpenAI spec).
                 // This is a workaround to set it correctly.
                 resp.choices.iter_mut().for_each(|c| {
-                    if c.finish_reason == "stop" && !c.message.tool_calls.is_empty() {
+                    if c.finish_reason == "stop"
+                        && c.message
+                            .tool_calls
+                            .as_ref()
+                            .is_some_and(|cc| !cc.is_empty())
+                    {
                         c.finish_reason = "tool_calls".to_string();
                     }
                 });
@@ -630,9 +650,17 @@ fn stream_from_response(
                         code: None,
                     }));
                 },
+                MistralResponse::Speech{..} => {
+                    yield Err(OpenAIError::ApiError(ApiError {
+                        message: "Speech generation is not supported".to_string(),
+                        r#type: None,
+                        param: None,
+                        code: None,
+                    }));
+                },
                 MistralResponse::ImageGeneration(_) => {
                     yield Err(OpenAIError::ApiError(ApiError {
-                        message: "image generation".to_string(),
+                        message: "image generation is not supported".to_string(),
                         r#type: None,
                         param: None,
                         code: None,

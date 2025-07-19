@@ -22,15 +22,15 @@ use super::ParameterSpec;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::DataConnectorError;
 use async_trait::async_trait;
-use data_components::flight::FlightFactory;
 use data_components::ReadWrite;
+use data_components::flight::FlightFactory;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::sqlparser::ast::TimezoneInfo;
 use datafusion::sql::sqlparser::ast::WindowFrameBound;
 use datafusion::sql::unparser::dialect::DefaultDialect;
 use datafusion::sql::unparser::dialect::Dialect;
 use datafusion::sql::unparser::dialect::IntervalStyle;
-use datafusion_federation::table_reference::parse_multi_part_table_reference;
+use datafusion_federation::sql::RemoteTableRef;
 use flight_client::Credentials;
 use flight_client::FlightClient;
 use ns_lookup::verify_endpoint_connection;
@@ -42,21 +42,28 @@ use std::sync::Arc;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/dremio#configuration"))]
+    #[snafu(display(
+        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/dremio#configuration"
+    ))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Failed to connect to endpoint '{endpoint}'.\nVerify the endpoint is valid/online, and try again.\n{source}"))]
+    #[snafu(display(
+        "Failed to connect to endpoint '{endpoint}'.\nVerify the endpoint is valid/online, and try again.\n{source}"
+    ))]
     UnableToVerifyEndpointConnection {
         source: ns_lookup::Error,
         endpoint: Arc<str>,
     },
 
-    #[snafu(display("Failed to connect to Dremio over Flight.\nVerify your connection configuration, and try again.\n{source}"))]
+    #[snafu(display(
+        "Failed to connect to Dremio over Flight.\nVerify your connection configuration, and try again.\n{source}"
+    ))]
     UnableToCreateFlightClient { source: flight_client::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Debug)]
 pub struct Dremio {
     flight_factory: FlightFactory,
 }
@@ -155,15 +162,15 @@ impl DataConnectorFactory for DremioFactory {
                 params
                     .parameters
                     .get("password")
-                    .expose()
                     .ok()
-                    .unwrap_or_default(),
+                    .cloned()
+                    .unwrap_or("".into()),
             );
             let flight_client = FlightClient::try_new(endpoint, credentials, None)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
             let flight_factory =
-                FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}), true);
+                FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}));
             Ok(Arc::new(Dremio { flight_factory }) as Arc<dyn DataConnector>)
         })
     }
@@ -187,7 +194,16 @@ impl DataConnector for Dremio {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let table_reference = parse_multi_part_table_reference(dataset.path());
+        let table_reference = match RemoteTableRef::parse_with_default_dialect(dataset.path()) {
+            Ok(table_reference) => table_reference.table_ref,
+            Err(e) => {
+                return Err(DataConnectorError::UnableToGetReadProvider {
+                    dataconnector: "dremio".to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: Box::new(e),
+                });
+            }
+        };
         match FlightFactory::table_provider(&self.flight_factory, table_reference, dataset.schema())
             .await
         {

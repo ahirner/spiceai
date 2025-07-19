@@ -24,11 +24,12 @@ const BACKOFF_INTERVALS_MS: [u64; 14] = [
     300_000,
 ];
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FibonacciBackoff {
     num_retries: usize,
     pub randomization_factor: f64,
     pub max_retries: Option<usize>,
+    pub max_duration: Option<Duration>,
 }
 
 impl Default for FibonacciBackoff {
@@ -37,6 +38,7 @@ impl Default for FibonacciBackoff {
             num_retries: 0,
             randomization_factor: 0.3,
             max_retries: None,
+            max_duration: None,
         }
     }
 }
@@ -67,7 +69,23 @@ impl Backoff for FibonacciBackoff {
             interval,
         );
 
-        Some(randomized_interval)
+        let final_interval = if let Some(max_duration) = self.max_duration {
+            if randomized_interval > max_duration {
+                max_duration
+            } else {
+                randomized_interval
+            }
+        } else {
+            randomized_interval
+        };
+
+        Some(final_interval)
+    }
+}
+
+impl FibonacciBackoff {
+    pub fn next_duration(&mut self) -> Option<Duration> {
+        self.next_backoff()
     }
 }
 
@@ -92,6 +110,7 @@ fn get_random_value_from_interval(
 pub struct FibonacciBackoffBuilder {
     randomization_factor: f64,
     max_retries: Option<usize>,
+    max_duration: Option<Duration>,
 }
 
 impl FibonacciBackoffBuilder {
@@ -100,6 +119,7 @@ impl FibonacciBackoffBuilder {
         Self {
             randomization_factor: 0.3,
             max_retries: None,
+            max_duration: None,
         }
     }
 
@@ -116,11 +136,20 @@ impl FibonacciBackoffBuilder {
         self
     }
 
+    /// Set the maximum duration for the backoff. If the backoff interval exceeds this duration,
+    /// the duration will be clamped to this value.
+    #[must_use]
+    pub fn max_duration(mut self, duration: Option<Duration>) -> Self {
+        self.max_duration = duration;
+        self
+    }
+
     #[must_use]
     pub fn build(self) -> FibonacciBackoff {
         FibonacciBackoff {
             randomization_factor: self.randomization_factor,
             max_retries: self.max_retries,
+            max_duration: self.max_duration,
             ..FibonacciBackoff::default()
         }
     }
@@ -148,6 +177,7 @@ fn nanos_to_duration(nanos: f64) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn test_backoff_interval_within_range() {
@@ -208,6 +238,21 @@ mod tests {
 
         for _ in 0..100 {
             assert!(backoff.next_backoff().is_some());
+        }
+    }
+
+    #[test]
+    fn test_max_duration_clamping() {
+        let max_duration = Duration::from_millis(2000);
+        let mut backoff = FibonacciBackoffBuilder::new()
+            .max_duration(Some(max_duration))
+            .build();
+        for _ in 0..10 {
+            let delay = backoff.next_backoff().expect("should get a duration");
+            assert!(
+                delay <= max_duration,
+                "delay {delay:?} exceeds max_duration {max_duration:?}",
+            );
         }
     }
 }

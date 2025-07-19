@@ -14,9 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, error::Error, sync::Arc};
+use std::{collections::HashMap, error::Error, sync::Arc, time::Duration};
 
-use super::is_default;
+use super::{
+    caching::{Caching, ResultsCache},
+    default_true, is_default, is_default_or_none,
+};
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -27,8 +30,10 @@ const TASK_HISTORY_RETENTION_MINIMUM: u64 = 60; // 1 minute
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Runtime {
+    #[serde(default, skip_serializing_if = "is_default_or_none")]
+    pub results_cache: Option<ResultsCache>,
     #[serde(default, skip_serializing_if = "is_default")]
-    pub results_cache: ResultsCache,
+    pub caching: Caching,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dataset_load_parallelism: Option<usize>,
@@ -55,29 +60,41 @@ pub struct Runtime {
 
     #[serde(default, skip_serializing_if = "is_default")]
     pub cors: CorsConfig,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flight: Option<Flight>,
+
+    /// Configures where the runtime will store temporary files needed for operations like
+    /// spilling to disk for queries & accelerations that are larger than memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temp_directory: Option<String>,
+
+    /// Specifies the runtime memory limit. When configured, will spill to disk
+    /// for supported queries larger than memory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_limit: Option<String>,
+
+    /// Configures how long the runtime waits for connections to be gracefully drained
+    /// and components to shut down cleanly during runtime termination
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shutdown_timeout: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-pub struct ResultsCache {
-    #[serde(default = "default_true")]
-    pub enabled: bool,
-    pub cache_max_size: Option<String>,
-    pub item_ttl: Option<String>,
-    pub eviction_policy: Option<String>,
-}
+impl Runtime {
+    pub fn shutdown_timeout(&self) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
+        if let Some(timeout_str) = &self.shutdown_timeout {
+            let duration = fundu::parse_duration(timeout_str)
+                .map_err(|e| format!("Failed to parse 'shutdown_timeout': {e}"))?;
 
-const fn default_true() -> bool {
-    true
-}
+            if duration.as_secs() == 0 {
+                return Err(
+                    "'shutdown_timeout' must be a positive duration greater than 0 seconds".into(),
+                );
+            }
 
-impl Default for ResultsCache {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            cache_max_size: None,
-            item_ttl: None,
-            eviction_policy: None,
+            Ok(Some(duration))
+        } else {
+            Ok(None)
         }
     }
 }
@@ -138,6 +155,30 @@ impl Default for TelemetryConfig {
             enabled: true,
             user_agent_collection: UserAgentCollection::default(),
             properties: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Default, Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct Flight {
+    pub max_message_size: Option<String>,
+}
+
+impl Flight {
+    pub fn max_message_size_bytes(&self) -> Result<Option<usize>, Box<dyn Error + Send + Sync>> {
+        if let Some(size_str) = &self.max_message_size {
+            let size_in_bytes = usize::try_from(
+                byte_unit::Byte::parse_str(size_str, true)
+                    .map_err(|e| {
+                        format!("Failed to parse 'max_message_size' value '{size_str}': {e}")
+                    })?
+                    .as_u64(),
+            )
+            .unwrap_or_default();
+            Ok(Some(size_in_bytes))
+        } else {
+            Ok(None)
         }
     }
 }

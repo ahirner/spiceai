@@ -14,23 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
+use crate::token_providers::github_app_token::GitHubAppTokenProvider;
+use crate::{component::dataset::Dataset, dataconnector::github::members::MembersTableArgs};
 use arrow::array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
-use chrono::{offset::LocalResult, SecondsFormat, TimeZone, Utc};
+use chrono::{SecondsFormat, TimeZone, Utc, offset::LocalResult};
 use commits::CommitsTableArgs;
 use data_components::{
     github::{self, GithubFilesTableProvider, GithubRestClient},
     graphql::{
-        self,
+        self, FilterPushdownResult, GraphQLContext,
         builder::GraphQLClientBuilder,
         client::{GraphQLClient, GraphQLQuery, PaginationParameters},
         provider::GraphQLTableProviderBuilder,
-        FilterPushdownResult, GraphQLContext,
     },
     rate_limit::RateLimiter,
-    token_provider::{StaticTokenProvider, TokenProvider},
 };
 use datafusion::{
     common::Column,
@@ -40,7 +39,6 @@ use datafusion::{
     prelude::Expr,
     scalar::ScalarValue,
 };
-use github_app_token_provider::GitHubAppTokenProvider;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use graphql_parser::query::{
     Definition, InlineFragment, OperationDefinition, Query, Selection, SelectionSet,
@@ -53,20 +51,22 @@ use stargazers::StargazersTableArgs;
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::{any::Any, future::Future, pin::Pin, str::FromStr, sync::Arc};
+use token_provider::{StaticTokenProvider, TokenProvider};
 use url::Url;
 
 use super::{
-    graphql::default_spice_client, ConnectorComponent, ConnectorParams, DataConnector,
-    DataConnectorError, DataConnectorFactory, ParameterSpec, Parameters,
+    ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
+    ParameterSpec, Parameters, graphql::default_spice_client,
 };
 
 mod commits;
-mod github_app_token_provider;
 mod issues;
+mod members;
 mod pull_requests;
 mod rate_limit;
 mod stargazers;
 
+#[derive(Debug)]
 pub struct Github {
     params: Parameters,
     token: Option<Arc<dyn TokenProvider>>,
@@ -137,10 +137,33 @@ impl Github {
         .boxed()
     }
 
+    fn get_health_check_for_owner_and_repo(owner: &str, repo: &str) -> String {
+        format!(
+            r#"{{
+            githubHealthCheck: repository(owner: "{owner}", name: "{repo}") {{
+                id
+                nameWithOwner
+            }}
+        }}"#
+        )
+    }
+
+    fn get_health_check_for_org(org: &str) -> String {
+        format!(
+            r#"{{
+            githubHealthCheck: organization(login: "{org}") {{
+                id
+                name
+            }}
+        }}"#
+        )
+    }
+
     async fn create_gql_table_provider(
         &self,
         table_args: Arc<dyn GitHubTableArgs>,
         context: Option<Arc<dyn GraphQLContext>>,
+        health_check_query_string: String,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
         let client = self.create_graphql_client(&table_args).context(
             super::UnableToGetReadProviderSnafu {
@@ -158,8 +181,18 @@ impl Github {
             provider_builder
         };
 
+        let query_arc = Arc::from(health_check_query_string);
+        let health_check_query = GraphQLQuery::try_from(query_arc)
+            .map_err(|e| DataConnectorError::InternalWithSource {
+                dataconnector: "github".to_string(),
+                connector_component: table_args.get_component(),
+                source: e.into(),
+            })?
+            .with_json_pointer(Arc::from("/data/githubHealthCheck"));
+
         Ok(Arc::new(
             provider_builder
+                .with_health_check_query(health_check_query)
                 .build(table_args.get_graphql_values().query.as_ref())
                 .await
                 .map_err(|e| {
@@ -281,7 +314,7 @@ fn github_gql_raw_schema_cast(
     RecordBatch::try_new(schema, columns).map_err(std::convert::Into::into)
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct GithubFactory {}
 
 impl GithubFactory {
@@ -331,27 +364,47 @@ impl DataConnectorFactory for GithubFactory {
         &self,
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        let token = params.parameters.get("token").expose().ok();
-        let client_id = params.parameters.get("client_id").expose().ok();
-        let private_key = params.parameters.get("private_key").expose().ok();
-        let installation_id = params.parameters.get("installation_id").expose().ok();
-
-        let token_provider: Option<Arc<dyn TokenProvider>> =
-            match (token, client_id, private_key, installation_id) {
-                (Some(token), _, _, _) => Some(Arc::new(StaticTokenProvider::new(token.into()))),
-
-                (None, Some(client_id), Some(private_key), Some(installation_id)) => {
-                    Some(Arc::new(GitHubAppTokenProvider::new(
-                        Arc::from(client_id),
-                        Arc::from(private_key),
-                        Arc::from(installation_id),
-                    )))
-                }
-
-                _ => None,
-            };
+        let token = params.parameters.get("token").ok().cloned();
+        let client_id = params
+            .parameters
+            .get("client_id")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
+        let private_key = params
+            .parameters
+            .get("private_key")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
+        let installation_id = params
+            .parameters
+            .get("installation_id")
+            .expose()
+            .ok()
+            .map(ToString::to_string);
 
         Box::pin(async move {
+            let token_provider: Option<Arc<dyn TokenProvider>> =
+                match (token, client_id, private_key, installation_id) {
+                    (Some(token), _, _, _) => {
+                        Some(Arc::new(StaticTokenProvider::new(token.clone())))
+                    }
+
+                    (None, Some(client_id), Some(private_key), Some(installation_id)) => {
+                        Some(Arc::new(
+                            GitHubAppTokenProvider::try_new(
+                                client_id.into(),
+                                private_key.into(),
+                                installation_id.into(),
+                            )
+                            .await?,
+                        ))
+                    }
+
+                    _ => None,
+                };
+
             Ok(Arc::new(Github {
                 params: params.parameters,
                 token: token_provider,
@@ -424,6 +477,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
+                    Github::get_health_check_for_owner_and_repo(owner, repo)
                 )
                 .await
             }
@@ -436,6 +490,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
+                    Github::get_health_check_for_owner_and_repo(owner, repo)
                 )
                 .await
             }
@@ -449,6 +504,7 @@ impl DataConnector for Github {
                 self.create_gql_table_provider(
                     Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
                     Some(table_args),
+                    Github::get_health_check_for_owner_and_repo(owner, repo)
                 )
                 .await
             }
@@ -458,11 +514,23 @@ impl DataConnector for Github {
                     repo: repo.to_string(),
                     component: ConnectorComponent::from(dataset),
                 });
-                self.create_gql_table_provider(table_args, None).await
+                self.create_gql_table_provider(table_args, None, Github::get_health_check_for_owner_and_repo(owner, repo)).await
             }
             (Some("github.com"), Some(owner), Some(repo), Some("files")) => {
                 self.create_files_table_provider(owner, repo, parts.next(), dataset)
                     .await
+            }
+            (Some("github.com"), Some(org), Some("members"), None) => {
+                let table_args = Arc::new(MembersTableArgs {
+                    org: org.to_string(),
+                    component: ConnectorComponent::from(dataset),
+                });
+                self.create_gql_table_provider(
+                    Arc::clone(&table_args) as Arc<dyn GitHubTableArgs>,
+                    None,
+                    Github::get_health_check_for_org(org)
+                )
+                .await
             }
             (Some("github.com"), Some(_), Some(_), Some(invalid_table)) => {
                 Err(DataConnectorError::UnableToGetReadProvider {
@@ -764,7 +832,7 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
                                     filter_pushdown: TableProviderFilterPushDown::Unsupported,
                                     expr: expr.clone(),
                                     context: None,
-                                }
+                                };
                             }
                         },
                         _ => {
@@ -772,7 +840,7 @@ pub(crate) fn filter_pushdown(expr: &Expr) -> FilterPushdownResult {
                                 filter_pushdown: TableProviderFilterPushDown::Unsupported,
                                 expr: expr.clone(),
                                 context: None,
-                            }
+                            };
                         }
                     }
                 }
@@ -950,7 +1018,7 @@ where
                     .iter_mut()
                     .for_each(|item| all_selections.push(item));
             }
-            graphql_parser::query::Selection::FragmentSpread(_) => continue,
+            graphql_parser::query::Selection::FragmentSpread(_) => {}
         }
     }
 

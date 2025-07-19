@@ -21,8 +21,13 @@ use arrow::array::BooleanBuilder;
 use arrow::compute::filter_record_batch;
 use datafusion::catalog::Session;
 use datafusion::dataframe::DataFrame;
+use datafusion::datasource::memory::MemorySourceConfig;
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
+use datafusion::datasource::source::DataSourceExec;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::scalar::ScalarValue;
+use datafusion_table_providers::util::column_reference::ColumnReference;
+use datafusion_table_providers::util::on_conflict::OnConflict;
 use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Debug};
@@ -32,13 +37,11 @@ use std::sync::{Arc, Mutex};
 use arrow::{datatypes::SchemaRef, record_batch::RecordBatch};
 use async_trait::async_trait;
 use datafusion::common::{Constraint, Constraints, SchemaExt};
-use datafusion::datasource::{provider_as_source, TableProvider, TableType};
+use datafusion::datasource::{TableProvider, TableType, provider_as_source};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::logical_expr::{is_not_true, Expr, LogicalPlanBuilder};
-use datafusion::physical_plan::insert::{DataSink, DataSinkExec};
-use datafusion::physical_plan::memory::MemoryExec;
+use datafusion::logical_expr::{Expr, LogicalPlanBuilder, is_not_true};
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use futures::StreamExt;
@@ -63,6 +66,8 @@ pub struct MemTable {
     /// Optional pre-known sort order(s). Must be `SortExpr`s.
     /// inserting data into this table removes the order
     pub sort_order: Arc<Mutex<Vec<Vec<Expr>>>>,
+
+    pub on_conflict: Option<OnConflict>,
 }
 
 impl MemTable {
@@ -95,7 +100,21 @@ impl MemTable {
             constraints: Constraints::empty(),
             column_defaults: HashMap::new(),
             sort_order: Arc::new(Mutex::new(vec![])),
+            on_conflict: None,
         })
+    }
+
+    #[must_use]
+    pub fn with_on_conflict(mut self, on_conflict: OnConflict) -> Self {
+        if !matches!(on_conflict, OnConflict::Upsert(_)) {
+            tracing::warn!(
+                "In-memory tables only support Upsert on_conflict, but got: {on_conflict:?}. Setting will be ignored."
+            );
+            return self;
+        }
+
+        self.on_conflict = Some(on_conflict);
+        self
     }
 
     pub async fn try_with_constraints(mut self, constraints: Constraints) -> Result<Self> {
@@ -156,6 +175,34 @@ impl MemTable {
         Ok(None)
     }
 
+    fn verify_on_conflict_matches_primary_key(
+        &self,
+        pk: &[usize],
+        on_conflict: &ColumnReference,
+    ) -> Result<()> {
+        let on_conflict_cols: Vec<_> = on_conflict.iter().collect();
+
+        if on_conflict_cols.len() != pk.len() {
+            return Err(DataFusionError::Execution(
+                "Primary key must match the on_conflict definition".to_string(),
+            ));
+        }
+
+        let schema = self.schema();
+
+        if on_conflict_cols
+            .iter()
+            .zip(pk.iter())
+            .any(|(c, pk)| c != schema.field(*pk).name())
+        {
+            return Err(DataFusionError::Execution(
+                "Primary key must match the on_conflict definition".to_string(),
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Assign column defaults
     #[must_use]
     pub fn with_column_defaults(mut self, column_defaults: HashMap<String, Expr>) -> Self {
@@ -194,11 +241,9 @@ impl TableProvider for MemTable {
             let inner_vec = arc_inner_vec.read().await;
             partitions.push(inner_vec.clone());
         }
-        Ok(Arc::new(MemoryExec::try_new(
-            &partitions,
-            self.schema(),
-            projection.cloned(),
-        )?))
+        Ok(Arc::new(DataSourceExec::new(Arc::new(
+            MemorySourceConfig::try_new(&partitions, self.schema(), projection.cloned())?,
+        ))))
     }
 
     /// Returns an ExecutionPlan that inserts the execution results of a given [`ExecutionPlan`] into this [`MemTable`].
@@ -221,24 +266,32 @@ impl TableProvider for MemTable {
     ) -> Result<Arc<dyn ExecutionPlan>> {
         // Create a physical plan from the logical plan.
         // Check that the schema of the plan matches the schema of this table.
-        if !self
+        if let Err(e) = self
             .schema()
             .logically_equivalent_names_and_types(&input.schema())
         {
-            return Err(DataFusionError::Execution(
-                "Inserting query must have the same schema with the table.".to_string(),
-            ));
+            return Err(DataFusionError::Execution(format!(
+                "Inserting query must have the same schema with the table. {e}"
+            )));
         }
 
         let primary_key = self.get_and_ensure_only_primary_keys()?;
 
-        let sink = Arc::new(MemSink::new(self.batches.clone(), overwrite, primary_key));
-        Ok(Arc::new(DataSinkExec::new(
-            input,
-            sink,
-            Arc::clone(&self.schema),
-            None,
-        )))
+        // In-memory tables only support primary keys constraints. Support for `OnConflict` is limited to `Upsert` matching the primary key.
+        // So we verify that the `on_conflict` and  the primary key matches
+        if let (Some(OnConflict::Upsert(on_conflict)), Some(pk)) = (&self.on_conflict, &primary_key)
+        {
+            self.verify_on_conflict_matches_primary_key(pk, on_conflict)?;
+        }
+
+        let sink = Arc::new(MemSink::new(
+            self.batches.clone(),
+            overwrite,
+            primary_key,
+            self.schema(),
+            self.on_conflict.clone(),
+        ));
+        Ok(Arc::new(DataSinkExec::new(input, sink, None)))
     }
 
     fn get_column_default(&self, column: &str) -> Option<&Expr> {
@@ -254,6 +307,8 @@ struct MemSink {
 
     /// Optional primary key columns. If present, primary key values must be unique, ordered ascendingly.
     primary_key: Option<Vec<usize>>,
+    schema: SchemaRef,
+    on_conflict: Option<OnConflict>,
 }
 
 impl Debug for MemSink {
@@ -267,7 +322,9 @@ impl Debug for MemSink {
 impl DisplayAs for MemSink {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 let partition_count = self.batches.len();
                 write!(f, "MemoryTable (partitions={partition_count})")
             }
@@ -280,6 +337,8 @@ impl MemSink {
         batches: Vec<PartitionData>,
         overwrite: InsertOp,
         primary_key: Option<Vec<usize>>,
+        schema: SchemaRef,
+        on_conflict: Option<OnConflict>,
     ) -> Self {
         Self {
             batches,
@@ -289,6 +348,8 @@ impl MemSink {
                 z.sort_unstable();
                 z
             }),
+            schema,
+            on_conflict,
         }
     }
 }
@@ -441,7 +502,9 @@ fn filter_existing(
             if let Some(k) = k {
                 keep_row_builder.append_value(!overwriting_primary_keys.contains(&k));
             } else {
-                unreachable!("Primary keys in `MemSink` record batch contain(s) null(s). This should be impossible, We check non-nullity of primary keys at insertion.");
+                unreachable!(
+                    "Primary keys in `MemSink` record batch contain(s) null(s). This should be impossible, We check non-nullity of primary keys at insertion."
+                );
             }
         }
         let filtered_batch = filter_record_batch(&batch, &keep_row_builder.finish())?;
@@ -478,6 +541,10 @@ impl DataSink for MemSink {
 
     fn metrics(&self) -> Option<MetricsSet> {
         None
+    }
+
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
     }
 
     async fn write_all(
@@ -522,6 +589,12 @@ impl DataSink for MemSink {
                 // Ensure no primary key conflicts between new data that is being appended, and existing data (since we are not replacing).
                 InsertOp::Append => {
                     if let Some(ref pks) = self.primary_key {
+                        // Mem-table only supports on_conflict upsert that matches primary keys, so we
+                        // remove existing data that collides with new primary keys similarly to `InsertOp::Replace`.
+                        if self.on_conflict.is_some() {
+                            filter_existing(&mut *target, &new_key_set, pks)?;
+                        }
+
                         for rb in &**target {
                             let batch_pks = extract_primary_keys_str(rb, pks)?;
                             let _ = check_and_filter_non_null_unique_primary_keys(
@@ -646,7 +719,7 @@ mod tests {
         physical_plan::collect,
         scalar::ScalarValue,
     };
-    use datafusion_table_providers::util::test::MockExec;
+    use datafusion_table_providers::util::{on_conflict::OnConflict, test::MockExec};
 
     use crate::{arrow::write::MemTable, delete::DeletionTableProvider};
 
@@ -1012,6 +1085,83 @@ mod tests {
             "insertion should fail due to primary key conflict"
         );
     }
+
+    #[tokio::test]
+    async fn test_write_all_append_primary_key_on_conflict_upsert() {
+        let (rb, schema) = create_batch_with_string_columns(&[
+            (
+                "primary_key",
+                vec!["1970-01-01", "2012-12-01T11:11:11Z", "2012-12-01T11:11:12Z"],
+            ),
+            ("value", vec!["a", "b", "c"]),
+        ]);
+        let table = MemTable::try_new(schema, vec![vec![rb]])
+            .expect("mem table should be created")
+            .try_with_constraints(Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0],
+            )]))
+            .await
+            .expect("satisfy primary key constraints")
+            .with_on_conflict(
+                OnConflict::try_from("upsert:primary_key").expect("create on_conflict"),
+            );
+        let ctx = SessionContext::new();
+        let state = ctx.state();
+
+        let (insert_rb, new_schema) = create_batch_with_string_columns(&[
+            ("primary_key", vec!["1970-01-01", "1970-01-02"]),
+            ("value", vec!["x", "y"]),
+        ]);
+        let exec = Arc::new(MockExec::new(vec![Ok(insert_rb)], new_schema));
+        let insertion = table
+            .insert_into(
+                &state,
+                exec,
+                datafusion::logical_expr::dml::InsertOp::Append,
+            )
+            .await
+            .expect("insertion should be successful");
+
+        let result = collect(insertion, ctx.task_ctx())
+            .await
+            .expect("insert successful")
+            .first()
+            .expect("result should have at least one batch")
+            .column(0)
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .expect("result should be UInt64Array")
+            .value(0)
+            .to_i64()
+            .expect("insert_into result should return i64");
+
+        assert_eq!(result, 2);
+
+        // Ensure new values have changed correctly.
+        let plan = table
+            .scan(&state, None, &[], None)
+            .await
+            .expect("Scan plan can be constructed");
+
+        let result = collect(plan, ctx.task_ctx())
+            .await
+            .expect("Query successful");
+
+        let mut results = vec![];
+        for rb in &result {
+            let values: Vec<_> = rb
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("result should be StringArray")
+                .into_iter()
+                .collect();
+            results.extend(values.clone());
+        }
+
+        assert_eq!(vec![Some("b"), Some("c"), Some("x"), Some("y")], results);
+    }
+
     #[tokio::test]
     async fn test_write_all_append_primary_key() {
         let (rb, schema) = create_batch_with_string_columns(&[

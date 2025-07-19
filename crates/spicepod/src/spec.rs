@@ -25,12 +25,14 @@ use crate::component::catalog::Catalog;
 use crate::component::embeddings::Embeddings;
 use crate::component::eval::Eval;
 use crate::component::is_default;
+use crate::component::management::Management;
 use crate::component::runtime::Runtime;
 use crate::component::secret::Secret;
 use crate::component::tool::Tool;
 use crate::component::{
-    dataset::Dataset, extension::Extension, model::Model, view::View, ComponentOrReference,
+    ComponentOrReference, dataset::Dataset, model::Model, view::View, worker::Worker,
 };
+use crate::extension::Extension;
 
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -65,6 +67,10 @@ pub struct SpicepodDefinition {
     /// Optional runtime configuration
     #[serde(default, skip_serializing_if = "is_default")]
     pub runtime: Runtime,
+
+    /// Optional management configuration
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub management: Option<Management>,
 
     /// Optional extensions configuration
     #[serde(skip_serializing_if = "HashMap::is_empty")]
@@ -112,6 +118,10 @@ pub struct SpicepodDefinition {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]
     pub tools: Vec<ComponentOrReference<Tool>>,
+
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
+    pub workers: Vec<ComponentOrReference<Worker>>,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(default)]

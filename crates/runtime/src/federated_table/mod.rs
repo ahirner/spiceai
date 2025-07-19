@@ -30,13 +30,17 @@ limitations under the License.
 use std::sync::Arc;
 
 use arrow::datatypes::SchemaRef;
+use arrow_tools::schema::schema_difference;
 use datafusion::catalog::TableProvider;
-use tokio::sync::{oneshot, Mutex};
-use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
+use tokio::sync::{RwLock, oneshot};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::{
-    component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
-    dataconnector::DataConnector,
+    component::dataset::Dataset,
+    dataaccelerator::spice_sys::dataset_checkpoint::{DatasetCheckpoint, DatasetCheckpointer},
+    dataconnector::{DataConnector, DataConnectorError},
+    tracers::OnceTracer,
+    warn_once,
 };
 
 #[derive(Debug)]
@@ -58,7 +62,7 @@ enum DeferredState {
 
 #[derive(Debug)]
 pub struct DeferredTableProvider {
-    state: Mutex<DeferredState>,
+    state: RwLock<DeferredState>,
     schema: SchemaRef,
 }
 
@@ -69,8 +73,37 @@ impl DeferredTableProvider {
 }
 
 impl FederatedTable {
-    pub fn new(table_provider: Arc<dyn TableProvider>) -> Self {
+    /// Creates a federated table without checking if the schema matches the existing acceleration checkpoint.
+    pub fn new_unchecked(table_provider: Arc<dyn TableProvider>) -> Self {
         Self::Immediate(table_provider)
+    }
+
+    /// Creates a federated table, and first checks if the schema matches the existing acceleration checkpoint.
+    pub async fn new(
+        dataset: Arc<Dataset>,
+        table_provider: Arc<dyn TableProvider>,
+        data_connector: Arc<dyn DataConnector>,
+    ) -> Self {
+        let Some(checkpoint) = Self::get_checkpoint(Arc::clone(&dataset)).await else {
+            // Either this is not an accelerated table or the checkpoint does not exist.
+            return Self::new_unchecked(table_provider);
+        };
+        let Ok(Some(accelerated_schema)) = checkpoint.get_schema().await else {
+            // The checkpoint exists but the schema is not available.
+            return Self::new_unchecked(table_provider);
+        };
+
+        let federated_schema = table_provider.schema();
+
+        if schema_difference(&accelerated_schema, &federated_schema).is_some() {
+            return Self::Deferred(Self::new_deferred_with_schema(
+                Arc::clone(&dataset),
+                data_connector,
+                accelerated_schema,
+            ));
+        }
+
+        Self::new_unchecked(table_provider)
     }
 
     /// If the table provider is not available immediately and this is an accelerated table with a previous acceleration checkpoint,
@@ -81,49 +114,30 @@ impl FederatedTable {
         dataset: Arc<Dataset>,
         data_connector: Arc<dyn DataConnector>,
     ) -> Option<Self> {
-        if !dataset.is_file_accelerated() {
-            return None;
+        let checkpoint = Self::get_checkpoint(Arc::clone(&dataset)).await?;
+        let accelerated_schema = checkpoint.get_schema().await.ok()??;
+
+        Some(Self::Deferred(Self::new_deferred_with_schema(
+            dataset,
+            data_connector,
+            accelerated_schema,
+        )))
+    }
+
+    /// Attempts to return the [`TableProvider`] without waiting for a deferred [`TableProvider`] that is not done (i.e. not in `DeferredState::Done`).
+    ///
+    /// Returns None if
+    ///   1. Active write on the [`DeferredTableProvider`]'s state.
+    ///   2. The [`DeferredTableProvider`] is not Ready.
+    pub fn try_table_provider_sync(&self) -> Option<Arc<dyn TableProvider>> {
+        let deferred_table_provider = match self {
+            Self::Immediate(table_provider) => return Some(Arc::clone(table_provider)),
+            Self::Deferred(deferred_table_provider) => deferred_table_provider,
+        };
+        match &*deferred_table_provider.state.try_read().ok()? {
+            DeferredState::Done(tbl) => Some(Arc::clone(tbl)),
+            _ => None,
         }
-
-        let checkpoint = DatasetCheckpoint::try_new(&dataset).await.ok()?;
-        let federated_schema = checkpoint.get_schema().await.ok()??;
-        let dataset_name = dataset.name.clone();
-
-        let (tx, rx) = oneshot::channel();
-        tokio::spawn(async move {
-            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
-
-            let data_connector = Arc::clone(&data_connector);
-            let table_provider_result = retry(retry_strategy, || async {
-                match data_connector.read_provider(&dataset).await {
-                    Ok(table_provider) => Ok(table_provider),
-                    Err(e) => Err(RetryError::transient(e)),
-                }
-            })
-            .await;
-
-            match table_provider_result {
-                Ok(table_provider) => {
-                    if tx.send(table_provider).is_err() {
-                        tracing::error!(
-                            "Failed to send deferred table provider for dataset '{}': Channel closed.",
-                            dataset.name,
-                        );
-                    }
-                    tracing::info!("Connection to source re-established for {dataset_name}.",);
-                }
-                Err(e) => {
-                    tracing::error!(
-                        "Failed to connect to table provider for dataset '{}': {e}",
-                        dataset.name,
-                    );
-                }
-            }
-        });
-        Some(Self::Deferred(DeferredTableProvider {
-            state: Mutex::new(DeferredState::Waiting(rx)),
-            schema: federated_schema,
-        }))
     }
 
     pub async fn table_provider(&self) -> Arc<dyn TableProvider> {
@@ -133,7 +147,7 @@ impl FederatedTable {
         };
 
         // If the table provider is not available immediately, see if we already have it from the deferred task.
-        let mut deferred_state_guard = deferred_table_provider.state.lock().await;
+        let mut deferred_state_guard = deferred_table_provider.state.write().await;
 
         // If the table provider is available now, return it.
         if let DeferredState::Done(table_provider) = &*deferred_state_guard {
@@ -167,5 +181,76 @@ impl FederatedTable {
             Self::Immediate(table_provider) => table_provider.schema(),
             Self::Deferred(deferred_table_provider) => Arc::clone(&deferred_table_provider.schema),
         }
+    }
+
+    fn new_deferred_with_schema(
+        dataset: Arc<Dataset>,
+        data_connector: Arc<dyn DataConnector>,
+        schema: SchemaRef,
+    ) -> DeferredTableProvider {
+        let dataset_name = dataset.name.clone();
+        let accelerated_schema = Arc::clone(&schema);
+
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
+
+            let tracer = OnceTracer::new();
+            let data_connector = Arc::clone(&data_connector);
+            let table_provider_result = retry(retry_strategy, || async {
+                match data_connector.read_provider(&dataset).await {
+                    Ok(table_provider) => {
+                        let federated_schema = table_provider.schema();
+
+                        if let Some(differences) =
+                            schema_difference(&accelerated_schema, &federated_schema)
+                        {
+                            let error = DataConnectorError::SchemaMismatch {
+                                dataset_name: dataset_name.to_string(),
+                                differences,
+                            };
+                            warn_once!(tracer, "{}", error);
+                            return Err(RetryError::transient(error));
+                        }
+
+                        Ok(table_provider)
+                    }
+                    Err(e) => Err(RetryError::transient(e)),
+                }
+            })
+            .await;
+
+            match table_provider_result {
+                Ok(table_provider) => {
+                    if tx.send(table_provider).is_err() {
+                        tracing::error!(
+                            "Failed to send deferred table provider for dataset '{}': Channel closed.",
+                            dataset.name,
+                        );
+                    }
+                    tracing::info!("Connection to source re-established for {dataset_name}.",);
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Failed to connect to table provider for dataset '{}': {e}",
+                        dataset.name,
+                    );
+                }
+            }
+        });
+
+        DeferredTableProvider {
+            state: RwLock::new(DeferredState::Waiting(rx)),
+            schema,
+        }
+    }
+
+    async fn get_checkpoint(dataset: Arc<Dataset>) -> Option<Arc<dyn DatasetCheckpointer>> {
+        if !dataset.is_file_accelerated() {
+            return None;
+        }
+
+        let checkpoint = DatasetCheckpoint::try_new(dataset.as_ref()).await.ok()?;
+        Some(checkpoint)
     }
 }

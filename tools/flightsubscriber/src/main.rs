@@ -15,13 +15,13 @@ limitations under the License.
 */
 
 use arrow_flight::{
+    FlightData, FlightDescriptor,
     decode::{DecodedPayload, FlightDataDecoder},
     error::FlightError,
     flight_service_client::FlightServiceClient,
-    FlightData, FlightDescriptor,
 };
 use clap::Parser;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use tonic::transport::{Channel, ClientTlsConfig};
 use tracing_subscriber::filter::Directive;
 
@@ -76,7 +76,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let stream = stream.into_inner();
 
-    let mut flight_decoder = FlightDataDecoder::new(stream.map(|r| r.map_err(FlightError::Tonic)));
+    let mut flight_decoder = FlightDataDecoder::new(
+        stream.map(|r| r.map_err(|status| FlightError::Tonic(Box::new(status)))),
+    );
 
     loop {
         let msg = flight_decoder.next().await;

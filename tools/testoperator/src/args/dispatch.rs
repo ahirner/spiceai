@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use test_framework::{queries::QuerySet, TestType};
+use test_framework::{TestType, queries::QuerySet};
 
 use super::dataset::QueryOverridesArg;
 
@@ -41,6 +41,12 @@ pub struct DispatchArgs {
 
     #[arg(long, env = "WORKFLOW_COMMIT", default_value = "trunk")]
     pub(crate) workflow_commit: String,
+
+    #[arg(long, default_value = "false", action = ArgAction::Set)]
+    pub(crate) update_snapshots: bool,
+
+    #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
+    pub(crate) validate: bool,
 }
 
 #[derive(Debug, Copy, Clone, ValueEnum)]
@@ -92,6 +98,43 @@ pub struct BenchArgs {
     pub query_overrides: Option<QueryOverridesArg>,
     pub ready_wait: Option<u64>,
     pub runner_type: RunnerType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_snapshots: Option<UpdateSnapshots>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub validate_results: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scale_factor: Option<f64>,
+}
+
+impl BenchArgs {
+    #[must_use]
+    pub fn with_update_snapshots(mut self, update_snapshots: UpdateSnapshots) -> Self {
+        self.update_snapshots = Some(update_snapshots);
+        self
+    }
+
+    #[must_use]
+    pub fn with_validate(mut self, validate: bool) -> Self {
+        self.validate_results = Some(validate);
+        self
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpdateSnapshots {
+    Always,
+    No,
+}
+
+impl From<bool> for UpdateSnapshots {
+    fn from(value: bool) -> Self {
+        if value {
+            UpdateSnapshots::Always
+        } else {
+            UpdateSnapshots::No
+        }
+    }
 }
 
 /// Load workflow arguments, defined in the test files
@@ -109,6 +152,10 @@ pub enum RunnerType {
     SelfHosted,
     #[serde(rename = "spiceai-large-runners")]
     LargeSelfHosted,
+    #[serde(rename = "spiceai-dev-runners")]
+    Dev,
+    #[serde(rename = "spiceai-dev-large-runners")]
+    DevLarge,
 }
 
 /// Payload sent to the GitHub Actions workflow request for HTTP consistency tests

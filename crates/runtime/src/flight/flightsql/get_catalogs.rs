@@ -15,18 +15,20 @@ limitations under the License.
 */
 
 use arrow_flight::{
+    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
     flight_service_server::FlightService,
     sql::{self, ProstMessageExt},
-    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
 };
 use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
+    datafusion::request_context_extension::get_current_datafusion,
     flight::{
-        metrics, record_batches_to_flight_stream, to_tonic_err, util::set_flightsql_protocol,
-        Service,
+        Service, metrics, record_batches_to_flight_stream, to_tonic_err,
+        util::set_flightsql_protocol,
     },
+    request::{AsyncMarker, RequestContext},
     timing::TimedStream,
 };
 
@@ -53,16 +55,18 @@ pub(crate) async fn get_flight_info(
 }
 
 pub(crate) async fn do_get(
-    flight_svc: &Service,
     query: sql::CommandGetCatalogs,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     let start = metrics::track_flight_request("do_get", Some("get_catalogs")).await;
     set_flightsql_protocol().await;
 
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let datafusion = get_current_datafusion(&context);
+
     tracing::trace!("do_get_catalogs: {query:?}");
     let mut builder = query.into_builder();
 
-    let catalog_names = flight_svc.datafusion.ctx.catalog_names();
+    let catalog_names = datafusion.ctx.catalog_names();
 
     for catalog in catalog_names {
         builder.append(catalog);

@@ -14,35 +14,38 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::{array::StringArray, util::pretty::pretty_format_batches};
+use arrow::{array::StringArray, compute::concat_batches, util::pretty::pretty_format_batches};
 use async_openai::types::EmbeddingInput;
 use futures::TryStreamExt;
 use rand::Rng;
-use reqwest::{header::HeaderMap, Client};
-use runtime::{config::Config, get_params_with_secrets, Runtime};
+use reqwest::{Client, header::HeaderMap};
+use runtime::{Runtime, config::Config, get_params_with_secrets};
 use secrecy::SecretString;
 use snafu::ResultExt;
-use spicepod::component::{
-    dataset::{acceleration::Acceleration, Dataset},
-    params::Params,
-};
+use spicepod::acceleration::Acceleration;
+use spicepod::{component::dataset::Dataset, param::Params};
 use std::sync::Arc;
 use std::{
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, SocketAddr},
 };
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
+mod bedrock;
 mod embedding;
 mod hf;
 mod local;
-mod openai;
+pub(crate) mod openai;
+#[cfg(feature = "s3_vectors")]
+mod s3_vectors;
+mod search;
+mod tools;
 
 mod nsql {
     use chrono::{DateTime, Utc};
     use http::{
-        header::{ACCEPT, CONTENT_TYPE},
         HeaderMap, HeaderValue,
+        header::{ACCEPT, CONTENT_TYPE},
     };
     use opentelemetry_sdk::trace::TracerProvider;
 
@@ -65,21 +68,22 @@ mod nsql {
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response = match http_post(
+        match http_post(
             format!("{base_url}/v1/nsql").as_str(),
             &ts.body.to_string(),
             headers,
         )
         .await
         {
-            Ok(response) => response,
+            Ok(response) => {
+                tracing::info!("run_nsql_test response: {}", response);
+                Some(response)
+            }
             Err(e) => {
                 tracing::error!("run_nsql_test error: {:?}", e);
-                insta::assert_snapshot!(format!("{}_error", ts.name), e.to_string());
-                return Ok(());
+                None
             }
         };
-        insta::assert_snapshot!(format!("{}_response", ts.name), &response);
 
         // ensure all spans are exported into task_history
         let _ = trace_provider.force_flush();
@@ -87,19 +91,39 @@ mod nsql {
         // Check task_history table for expected rows.
         let mut headers = HeaderMap::new();
         headers.insert(ACCEPT, HeaderValue::from_static("text/plain"));
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+
+        // With `sample_data_enabled`, tools run concurrently, so for deterministic results, order by task and input for verification instead of start time.
+        let query = if ts
+            .body
+            .get("sample_data_enabled")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            // Use `truncated` for `sql_query` task as the model is not guaranteed to return the same valid SQL query each time, depending on the model quality.
+            format!(
+                "SELECT task, CASE WHEN task = 'sql_query' THEN 'truncated' ELSE input END as input
+                FROM runtime.task_history
+                WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
+                AND start_time > '{}'
+                ORDER BY task, input;",
+                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+            )
+        } else {
+            // Use `truncated` for `sql_query` task as the model is not guaranteed to return the same valid SQL query each time, depending on the model quality.
+            format!(
+                "SELECT task, CASE WHEN task = 'sql_query' THEN 'truncated' ELSE input END as input
+                FROM runtime.task_history
+                WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
+                AND start_time > '{}'
+                ORDER BY start_time, task;",
+                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
+            )
+        };
 
         let response = http_post(
             format!("{base_url}/v1/sql").as_str(),
-            format!(
-                "SELECT task, input
-                        FROM runtime.task_history
-                        WHERE task NOT IN ('ai_completion', 'health', 'accelerated_refresh')
-                        AND start_time > '{}'
-                        ORDER BY start_time, task;",
-                Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
-            )
-            .as_str(),
+            query.as_str(),
             headers,
         )
         .await
@@ -111,48 +135,9 @@ mod nsql {
     }
 }
 
-mod search {
-    use http::{
-        header::{ACCEPT, CONTENT_TYPE},
-        HeaderMap, HeaderValue,
-    };
-
-    use crate::models::{http_post, normalize_search_response};
-
-    pub struct TestCase {
-        pub name: &'static str,
-        pub body: serde_json::Value,
-    }
-
-    pub async fn run_search_test(base_url: &str, ts: &TestCase) -> Result<(), anyhow::Error> {
-        tracing::info!("Running test cases {}", ts.name);
-
-        // Call /v1/search, check response
-        let mut headers = HeaderMap::new();
-        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        let response_str = http_post(
-            &format!("{base_url}/v1/search").to_string(),
-            &ts.body.to_string(),
-            headers,
-        )
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to execute HTTP POST: {}", e))?;
-
-        let response = serde_json::from_str(&response_str)
-            .map_err(|e| anyhow::anyhow!("Failed to parse HTTP response: {}", e))?;
-
-        insta::assert_snapshot!(
-            format!("{}_response", ts.name),
-            normalize_search_response(response)
-        );
-        Ok(())
-    }
-}
-
 fn create_api_bindings_config() -> Config {
-    let mut rng = rand::thread_rng();
-    let http_port: u16 = rng.gen_range(50000..60000);
+    let mut rng = rand::rng();
+    let http_port: u16 = rng.random_range(50000..60000);
     let flight_port: u16 = http_port + 1;
     let otel_port: u16 = http_port + 2;
     let metrics_port: u16 = http_port + 3;
@@ -189,7 +174,28 @@ fn get_taxi_trips_dataset() -> Dataset {
     dataset
 }
 
-fn get_tpcds_dataset(
+fn get_small_clickbench_dataset(name: &str) -> Dataset {
+    let mut dataset = Dataset::new(
+        "s3://spiceai-public-datasets/clickbench/hits_small.parquet",
+        name,
+    );
+    dataset.params = Some(Params::from_string_map(
+        vec![
+            ("file_format".to_string(), "parquet".to_string()),
+            ("client_timeout".to_string(), "120s".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        refresh_sql: Some(format!("SELECT * FROM {name} LIMIT 500")),
+        ..Default::default()
+    });
+    dataset
+}
+
+pub fn get_tpcds_dataset(
     ds_name: &str,
     spice_name: Option<&str>,
     refresh_sql: Option<&str>,
@@ -219,26 +225,6 @@ fn get_tpcds_dataset(
         ..Default::default()
     });
     dataset
-}
-
-/// Normalizes vector similarity search response for consistent snapshot testing by replacing dynamic
-/// values such as duration with placeholder.
-fn normalize_search_response(mut json: Value) -> String {
-    if let Some(matches) = json.get_mut("matches").and_then(|m| m.as_array_mut()) {
-        for m in matches {
-            if let Some(obj) = m.as_object_mut() {
-                obj.remove("score");
-            }
-        }
-    }
-
-    if let Some(duration) = json.get_mut("duration_ms") {
-        *duration = json!("duration_ms_val");
-    }
-
-    sort_json_keys(&mut json);
-
-    serde_json::to_string_pretty(&json).unwrap_or_default()
 }
 
 /// Normalizes embeddings response for consistent snapshot testing by replacing actual embedding arrays with a placeholder,
@@ -434,6 +420,29 @@ pub async fn http_post(url: &str, body: &str, headers: HeaderMap) -> Result<Stri
         .map_err(|e| anyhow::anyhow!("Error reading response body: {e}")) // Map body read error to anyhow
 }
 
+pub async fn http_get(url: &str, headers: HeaderMap) -> Result<Value, anyhow::Error> {
+    let response = Client::new()
+        .get(url)
+        .headers(headers)
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Request error: {e}"))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let message = response
+            .text()
+            .await
+            .unwrap_or_else(|_| "No error message".to_string());
+        return Err(anyhow::anyhow!("HTTP error: {status} - {message}"));
+    }
+
+    response
+        .json::<Value>()
+        .await
+        .map_err(|e| anyhow::anyhow!("Error reading response body: {e}"))
+}
+
 /// Returns a human-readable representation of the SQL query result against a [`Runtime`].
 async fn sql_to_display(
     rt: &Arc<Runtime>,
@@ -479,6 +488,46 @@ async fn sql_to_single_json_value(rt: &Arc<Runtime>, query: &str) -> Value {
             .value(0),
     )
     .expect("value is a JSON string")
+}
+
+#[allow(clippy::expect_used)]
+async fn sql_to_json_values(rt: &Arc<Runtime>, query: &str) -> Vec<Value> {
+    let data = rt
+        .datafusion()
+        .query_builder(query)
+        .build()
+        .run()
+        .await
+        .boxed()
+        .expect("Failed to collect data")
+        .data
+        .try_collect::<Vec<_>>()
+        .await
+        .boxed()
+        .expect("Failed to collect data");
+
+    // Data may be split into multiple batches, so we need to concatenate them
+    let concat_data = if data.len() > 1 {
+        concat_batches(&data[0].schema(), &data).expect("Failed to concatenate batches")
+    } else {
+        data[0].clone()
+    };
+
+    let mut json_values: Vec<Value> = Vec::new();
+
+    let string_column = concat_data
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .expect("column is a StringArray");
+
+    for row_idx in 0..concat_data.num_rows() {
+        let json_str = string_column.value(row_idx);
+        let json_val = serde_json::from_str(json_str).expect("value is a JSON string");
+
+        json_values.push(json_val);
+    }
+    json_values
 }
 
 async fn get_params_with_secrets_value(

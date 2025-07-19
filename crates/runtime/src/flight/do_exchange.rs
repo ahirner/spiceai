@@ -16,21 +16,23 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use arrow::array::{make_builder, ArrayBuilder, ListBuilder, RecordBatch, StringBuilder};
+use arrow::array::{ArrayBuilder, ListBuilder, RecordBatch, StringBuilder, make_builder};
 use arrow::array::{ListArray, StringArray, StructArray};
 use arrow::datatypes::{DataType, Field, SchemaRef};
-use arrow_flight::{flight_service_server::FlightService, FlightData, SchemaAsIpc};
+use arrow_flight::{FlightData, SchemaAsIpc, flight_service_server::FlightService};
 use arrow_ipc::writer::{self, DictionaryTracker, IpcDataGenerator};
 use data_components::cdc::changes_schema;
 use datafusion::common::{Constraint, Constraints};
 use datafusion::sql::TableReference;
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use tokio::sync::broadcast;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::datafusion::request_context_extension::get_current_datafusion;
 use crate::dataupdate::{DataUpdate, UpdateType};
+use crate::request::{AsyncMarker, RequestContext};
 
-use super::{metrics, Service};
+use super::{Service, metrics};
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn handle(
@@ -66,11 +68,14 @@ pub(crate) async fn handle(
         return Err(Status::invalid_argument(
             "Flight descriptor needs to specify a path to indicate which data to subscribe to",
         ));
-    };
+    }
 
     let data_path = TableReference::parse_str(&flight_descriptor.path.join("."));
 
-    let Some(table_provider) = flight_svc.datafusion.get_table(&data_path).await else {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let datafusion = get_current_datafusion(&context);
+
+    let Some(table_provider) = datafusion.get_table(&data_path).await else {
         return Err(Status::invalid_argument(format!(
             r#"Unknown dataset: "{data_path}""#,
         )));
@@ -170,7 +175,6 @@ pub(crate) async fn handle(
     })
     .flat_map(|x| x);
 
-    let datafusion = Arc::clone(&flight_svc.datafusion);
     let table_provider = Arc::clone(&table_provider);
     tokio::spawn(async move {
         let Ok(df) = datafusion.ctx.read_table(table_provider) else {

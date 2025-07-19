@@ -17,27 +17,34 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use bench_search::{
-    setup::{self, load_query_relevance_data, load_search_queries, setup_benchmark, Query},
     SearchBenchmarkResultBuilder,
+    setup::{self, Query, load_query_relevance_data, load_search_queries, setup_benchmark},
 };
 use clap::Parser;
-use futures::{stream, StreamExt, TryStreamExt};
+use futures::{StreamExt, TryStreamExt, stream};
 use runtime::{
     dataupdate::DataUpdate,
-    embeddings::vector_search::{
-        self, parse_explicit_primary_keys, SearchRequest, VectorSearch, VectorSearchResult,
-    },
     request::{Protocol, RequestContext, UserAgent},
+    search::{
+        request::SearchRequest,
+        types::{VectorSearchResult, to_matches},
+        util::parse_explicit_primary_keys,
+        vector_search::{self, VectorSearch},
+    },
 };
-use spicepod::component::{
-    dataset::acceleration::{self, Acceleration},
-    embeddings::EmbeddingChunkConfig,
+use spicepod::component::embeddings::{ColumnEmbeddingConfig, EmbeddingChunkConfig};
+use spicepod::{
+    acceleration::{self, Acceleration},
+    semantic::FullTextSearchConfig,
 };
 use tokio::time::Instant;
 use utils::runtime_ready_check;
 
 mod bench_search;
 mod utils;
+
+pub static EMBEDDING_MODEL_NAME: &str = "test_model";
+pub static MTEB_COLUMN_NAME: &str = "text";
 
 // Define command line arguments for running benchmark test
 #[derive(Parser, Debug)]
@@ -80,9 +87,12 @@ async fn main() -> Result<(), String> {
 pub struct SearchBenchmarkConfiguration {
     pub name: &'static str,
     pub test_dataset: &'static str,
+
+    // To be used in `from: embeddings_model`
     pub embeddings_model: &'static str,
     pub acceleration: Option<Acceleration>,
-    pub chunking: Option<EmbeddingChunkConfig>,
+    pub embedding: Option<ColumnEmbeddingConfig>,
+    pub text_search: Option<(String, FullTextSearchConfig)>,
 }
 
 impl SearchBenchmarkConfiguration {
@@ -91,13 +101,16 @@ impl SearchBenchmarkConfiguration {
         name: &'static str,
         test_dataset: &'static str,
         embeddings_model: &'static str,
+        embedding: Option<ColumnEmbeddingConfig>,
+        text_search: Option<(String, FullTextSearchConfig)>,
     ) -> Self {
         Self {
             name,
             test_dataset,
             embeddings_model,
+            embedding,
             acceleration: None,
-            chunking: None,
+            text_search,
         }
     }
     #[must_use]
@@ -105,13 +118,9 @@ impl SearchBenchmarkConfiguration {
         self.acceleration = Some(acceleration);
         self
     }
-    #[must_use]
-    fn with_chunking(mut self, chunking: EmbeddingChunkConfig) -> Self {
-        self.chunking = Some(chunking);
-        self
-    }
 }
 
+#[allow(clippy::too_many_lines)]
 fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
     let args = BenchArgs::parse();
 
@@ -120,6 +129,56 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
             "quora_minilm-l6-v2_arrow",
             "QuoraRetrieval",
             "huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
+            Some(ColumnEmbeddingConfig {
+                column: MTEB_COLUMN_NAME.to_string(),
+                model: EMBEDDING_MODEL_NAME.to_string(),
+                primary_keys: Some(vec!["_id".to_string()]),
+                chunking: None,
+            }),
+            None,
+        )
+        .with_acceleration(Acceleration {
+            enabled: true,
+            // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
+            refresh_sql: Some("select * from data limit 20000".into()),
+            ..Default::default()
+        }),
+        SearchBenchmarkConfiguration::new(
+            "quora_text_arrow",
+            "QuoraRetrieval",
+            "huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
+            None,
+            Some((
+                MTEB_COLUMN_NAME.to_string(),
+                FullTextSearchConfig {
+                    enabled: true,
+                    row_ids: Some(vec!["_id".to_string()]),
+                },
+            )),
+        )
+        .with_acceleration(Acceleration {
+            enabled: true,
+            // TODO: temporary limit amout of data to speed up developement/testing. This will be removed in the future.
+            refresh_sql: Some("select * from data limit 20000".into()),
+            ..Default::default()
+        }),
+        SearchBenchmarkConfiguration::new(
+            "quora_minilm-l6-v2_hybrid_arrow",
+            "QuoraRetrieval",
+            "huggingface:huggingface.co/sentence-transformers/all-MiniLM-L6-v2",
+            Some(ColumnEmbeddingConfig {
+                column: MTEB_COLUMN_NAME.to_string(),
+                model: EMBEDDING_MODEL_NAME.to_string(),
+                primary_keys: Some(vec!["_id".to_string()]),
+                chunking: None,
+            }),
+            Some((
+                MTEB_COLUMN_NAME.to_string(),
+                FullTextSearchConfig {
+                    enabled: true,
+                    row_ids: Some(vec!["_id".to_string()]),
+                },
+            )),
         )
         .with_acceleration(Acceleration {
             enabled: true,
@@ -131,6 +190,35 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
             "quora_openai-text-embedding-3-small_arrow",
             "QuoraRetrieval",
             "openai:text-embedding-3-small",
+            Some(ColumnEmbeddingConfig {
+                column: MTEB_COLUMN_NAME.to_string(),
+                model: EMBEDDING_MODEL_NAME.to_string(),
+                primary_keys: Some(vec!["_id".to_string()]),
+                chunking: None,
+            }),
+            None,
+        )
+        .with_acceleration(Acceleration {
+            enabled: true,
+            ..Default::default()
+        }),
+        SearchBenchmarkConfiguration::new(
+            "quora_openai-text-embedding-3-small_hybrid_arrow",
+            "QuoraRetrieval",
+            "openai:text-embedding-3-small",
+            Some(ColumnEmbeddingConfig {
+                column: MTEB_COLUMN_NAME.to_string(),
+                model: EMBEDDING_MODEL_NAME.to_string(),
+                primary_keys: Some(vec!["_id".to_string()]),
+                chunking: None,
+            }),
+            Some((
+                MTEB_COLUMN_NAME.to_string(),
+                FullTextSearchConfig {
+                    enabled: true,
+                    row_ids: Some(vec!["_id".to_string()]),
+                },
+            )),
         )
         .with_acceleration(Acceleration {
             enabled: true,
@@ -140,6 +228,13 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
             "quora_openai-text-embedding-3-small_duckdb",
             "QuoraRetrieval",
             "openai:text-embedding-3-small",
+            Some(ColumnEmbeddingConfig {
+                column: MTEB_COLUMN_NAME.to_string(),
+                model: EMBEDDING_MODEL_NAME.to_string(),
+                primary_keys: Some(vec!["_id".to_string()]),
+                chunking: None,
+            }),
+            None,
         )
         .with_acceleration(Acceleration {
             enabled: true,
@@ -151,18 +246,24 @@ fn benchmark_configurations() -> Vec<SearchBenchmarkConfiguration> {
             "quora_openai-text-embedding-3-small_duckdb_chunking",
             "QuoraRetrieval",
             "openai:text-embedding-3-small",
+            Some(ColumnEmbeddingConfig {
+                column: MTEB_COLUMN_NAME.to_string(),
+                model: EMBEDDING_MODEL_NAME.to_string(),
+                primary_keys: Some(vec!["_id".to_string()]),
+                chunking: Some(EmbeddingChunkConfig {
+                    enabled: true,
+                    target_chunk_size: 512,
+                    overlap_size: 128,
+                    trim_whitespace: false,
+                }),
+            }),
+            None,
         )
         .with_acceleration(Acceleration {
             enabled: true,
             engine: Some("duckdb".into()),
             mode: acceleration::Mode::File,
             ..Default::default()
-        })
-        .with_chunking(EmbeddingChunkConfig {
-            enabled: true,
-            target_chunk_size: 512,
-            overlap_size: 128,
-            trim_whitespace: false,
         }),
     ]
     .into_iter()
@@ -302,14 +403,14 @@ async fn run_search_queries(
                         Some(vec!["data".to_string()]),
                         search_limit,
                         None,
-                        vec!["_id".to_string()],
+                        vec![],
                         vec![],
                     );
 
                     let start = Instant::now();
                     match vsearch.search(&req).await {
                         Ok(search_res) => {
-                            scores.push((query.id.clone(), to_search_result(&search_res)?));
+                            scores.push((query.id.clone(), to_search_result(search_res).await?));
                         }
                         Err(e) => return Err(e.to_string()),
                     }
@@ -348,15 +449,15 @@ async fn run_search_queries(
     Ok(result)
 }
 
-fn to_search_result(result: &VectorSearchResult) -> Result<HashMap<String, f64>, String> {
+async fn to_search_result(result: VectorSearchResult) -> Result<HashMap<String, f64>, String> {
     let mut output = HashMap::new();
 
-    for (table_ref, value) in result {
-        match value.to_matches(table_ref) {
+    for (table_ref, agg_result) in result {
+        match to_matches(&table_ref, agg_result).await {
             Ok(matches) => {
                 for m in matches {
-                    let id = m.metadata().get("_id").ok_or_else(|| {
-                        "Missing '_id' key value in search result metadata".to_string()
+                    let id = m.primary_key().get("_id").ok_or_else(|| {
+                        "Missing '_id' primary key value in search result".to_string()
                     })?;
 
                     let id = id

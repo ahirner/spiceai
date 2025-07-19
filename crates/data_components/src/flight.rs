@@ -15,27 +15,33 @@ limitations under the License.
 */
 
 use crate::{Read, ReadWrite};
-use arrow::{array::RecordBatch, datatypes::SchemaRef};
+use arrow::{
+    array::RecordBatch,
+    datatypes::{Schema, SchemaRef},
+};
 use arrow_flight::error::FlightError;
 use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{project_schema, TableReference},
+    common::{TableReference, project_schema},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown},
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
-        ExecutionPlan, Partitioning, PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
     },
     sql::unparser::dialect::Dialect,
 };
-use datafusion_federation::table_reference::MultiPartTableReference;
+use datafusion_federation::sql::MultiPartTableReference;
 use datafusion_table_providers::sql::sql_provider_datafusion::expr;
-use flight_client::FlightClient;
+use flight_client::{
+    Error as FlightClientError, FlightClient, TonicStatusError, is_connection_reset_error,
+};
 use futures::{Stream, StreamExt};
 use snafu::prelude::*;
 use std::{any::Any, fmt, sync::Arc};
@@ -49,7 +55,9 @@ pub mod write;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Query execution failed.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Query execution failed.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
+    ))]
     UnableToGenerateSQL { source: expr::Error },
 
     #[snafu(display("Failed to query Arrow Flight.\n{source}"))]
@@ -61,10 +69,10 @@ pub enum Error {
         table: String,
     },
 
-    #[snafu(display(
-        "Query execution failed.\n{source}\nVerify the configuration and try again."
-    ))]
-    ArrowFlight { source: FlightError },
+    #[snafu(display("Query execution failed.\n{source}\nVerify the configuration and try again."))]
+    ArrowFlight {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 type Result<T, E = Error> = std::result::Result<T, E>;
@@ -74,23 +82,26 @@ pub struct FlightFactory {
     name: &'static str,
     client: FlightClient,
     dialect: Arc<dyn Dialect>,
-    subquery_use_partial_path: bool,
     extra_compute_context: Option<Arc<str>>,
+}
+
+impl std::fmt::Debug for FlightFactory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FlightFactory")
+            .field("name", &self.name)
+            .field("client", &self.client)
+            .field("extra_compute_context", &self.extra_compute_context)
+            .finish_non_exhaustive()
+    }
 }
 
 impl FlightFactory {
     #[must_use]
-    pub fn new(
-        name: &'static str,
-        client: FlightClient,
-        dialect: Arc<dyn Dialect>,
-        subquery_use_partial_path: bool,
-    ) -> Self {
+    pub fn new(name: &'static str, client: FlightClient, dialect: Arc<dyn Dialect>) -> Self {
         Self {
             name,
             client,
             dialect,
-            subquery_use_partial_path,
             extra_compute_context: None,
         }
     }
@@ -124,7 +135,6 @@ impl FlightFactory {
                 table_reference,
                 schema,
                 Arc::clone(&self.dialect),
-                self.subquery_use_partial_path,
                 self.extra_compute_context.as_ref().map(Arc::clone),
             )),
             None => Arc::new(
@@ -133,18 +143,13 @@ impl FlightFactory {
                     self.client.clone(),
                     table_reference,
                     Arc::clone(&self.dialect),
-                    self.subquery_use_partial_path,
                     self.extra_compute_context.as_ref().map(Arc::clone),
                 )
                 .await?,
             ),
         };
 
-        let table_provider = Arc::new(
-            table_provider
-                .create_federated_table_provider()
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?,
-        );
+        let table_provider = Arc::new(table_provider.create_federated_table_provider());
 
         Ok(table_provider)
     }
@@ -185,7 +190,6 @@ pub struct FlightTable {
     schema: SchemaRef,
     dialect: Arc<dyn Dialect>,
     table_reference: MultiPartTableReference,
-    subquery_use_partial_path: bool,
 }
 
 impl std::fmt::Debug for FlightTable {
@@ -207,7 +211,6 @@ impl FlightTable {
         client: FlightClient,
         table_reference: impl Into<MultiPartTableReference>,
         dialect: Arc<dyn Dialect>,
-        subquery_use_partial_path: bool,
         extra_compute_context: Option<Arc<str>>,
     ) -> Result<Self> {
         let table_reference = table_reference.into();
@@ -224,7 +227,6 @@ impl FlightTable {
             table_reference,
             dialect,
             join_push_down_context,
-            subquery_use_partial_path,
         })
     }
 
@@ -234,7 +236,6 @@ impl FlightTable {
         table_reference: impl Into<MultiPartTableReference>,
         schema: SchemaRef,
         dialect: Arc<dyn Dialect>,
-        subquery_use_partial_path: bool,
         extra_compute_context: Option<Arc<str>>,
     ) -> Self {
         let table_reference = table_reference.into();
@@ -251,7 +252,6 @@ impl FlightTable {
             table_reference,
             dialect,
             join_push_down_context,
-            subquery_use_partial_path,
         }
     }
 
@@ -279,14 +279,31 @@ impl FlightTable {
             }
         };
 
-        let schema = client
-            .get_schema(table_paths)
-            .await
-            .context(UnableToGetSchemaSnafu {
-                table: table_reference.to_quoted_string(),
-            })?;
-
+        let schema = if let Ok(schema) = client.get_schema(table_paths).await {
+            schema
+        } else {
+            tracing::debug!(
+                "Failed to get schema from Arrow Flight for table {table_reference} via the native GetSchema call. Falling back to query schema."
+            );
+            Self::get_query_schema(
+                client.clone(),
+                &format!(
+                    "SELECT * FROM {} LIMIT 0",
+                    table_reference.to_quoted_string()
+                ),
+            )
+            .await?
+        };
         Ok(Arc::new(schema))
+    }
+
+    async fn get_query_schema(client: FlightClient, sql: &str) -> Result<Schema> {
+        let schema = client
+            .get_query_schema(sql.into())
+            .await
+            .context(FlightSnafu)?;
+
+        Ok(schema)
     }
 
     fn create_physical_plan(
@@ -400,7 +417,8 @@ impl FlightExec {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             ),
         })
     }
@@ -487,10 +505,8 @@ impl ExecutionPlan for FlightExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         let sql = self.sql().map_err(to_execution_error)?;
 
-        let stream_adapter = RecordBatchStreamAdapter::new(
-            self.schema(),
-            query_to_stream(self.client.clone(), sql.as_str()),
-        );
+        let stream_adapter =
+            RecordBatchStreamAdapter::new(self.schema(), query_to_stream(self.client.clone(), sql));
 
         Ok(Box::pin(stream_adapter))
     }
@@ -499,9 +515,8 @@ impl ExecutionPlan for FlightExec {
 #[allow(clippy::needless_pass_by_value)]
 fn query_to_stream(
     client: FlightClient,
-    sql: &str,
+    sql: String,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
-    let sql = sql.to_string();
     stream! {
         match client.query(sql.as_str()).await {
             Ok(mut stream) => {
@@ -509,7 +524,7 @@ fn query_to_stream(
                     match batch {
                         Ok(batch) => yield Ok(batch),
                         Err(error) => {
-                            yield Err(to_execution_error(Error::ArrowFlight { source: error }));
+                            yield Err(map_query_stream_error(error));
                         }
                     }
                 }
@@ -526,8 +541,36 @@ fn to_execution_error(e: Error) -> DataFusionError {
             flight_client::Error::UnableToQuery { source } => {
                 DataFusionError::Execution(format!("{source}"))
             }
+            flight_client::Error::ConnectionReset { .. } => {
+                DataFusionError::External(Box::new(source))
+            }
             _ => DataFusionError::Execution(format!("{source}")),
         },
         _ => DataFusionError::Execution(format!("{e}")),
+    }
+}
+
+fn map_query_stream_error(error: FlightError) -> DataFusionError {
+    match error {
+        FlightError::Tonic(ref source) => {
+            let source_owned = *source.clone();
+            if is_connection_reset_error(&source_owned) {
+                return DataFusionError::External(Box::new(FlightClientError::ConnectionReset {
+                    source: TonicStatusError::from(source_owned),
+                }));
+            }
+            DataFusionError::Execution(
+                Error::ArrowFlight {
+                    source: Box::new(error),
+                }
+                .to_string(),
+            )
+        }
+        _ => DataFusionError::Execution(
+            Error::ArrowFlight {
+                source: Box::new(error),
+            }
+            .to_string(),
+        ),
     }
 }

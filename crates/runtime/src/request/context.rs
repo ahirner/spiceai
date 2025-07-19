@@ -15,9 +15,11 @@ limitations under the License.
 */
 
 use std::{
+    any::{Any, TypeId},
+    collections::HashMap,
     future::Future,
     marker::PhantomData,
-    sync::{atomic::AtomicU8, Arc, LazyLock, OnceLock},
+    sync::{Arc, LazyLock, OnceLock, RwLock, atomic::AtomicU8},
 };
 
 use app::App;
@@ -26,7 +28,11 @@ use opentelemetry::KeyValue;
 use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
 use spicepod::component::runtime::UserAgentCollection;
 
-use super::{baggage, CacheControl, Protocol, UserAgent};
+use crate::datafusion::DataFusion;
+
+use super::{CacheControl, CacheKeyType, DatabricksAuthExtension, Protocol, UserAgent, baggage};
+
+type Extensions = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
 
 pub struct RequestContext {
     // Use an AtomicU8 to allow updating the protocol without locking
@@ -34,6 +40,7 @@ pub struct RequestContext {
     cache_control: CacheControl,
     dimensions: Vec<KeyValue>,
     auth_principal: OnceLock<AuthPrincipalRef>,
+    extensions: RwLock<Extensions>,
 }
 
 tokio::task_local! {
@@ -94,6 +101,22 @@ impl RequestContext {
             .unwrap_or_else(|| Arc::clone(&INTERNAL_REQUEST_CONTEXT))
     }
 
+    /// **UNSAFE: Use `RequestContext::current` instead.**
+    ///
+    /// Returns the current request context, or an internal context if this is called outside of a request.
+    ///
+    /// # Safety
+    /// This method is unsafe and should not be used in most cases. It allows access to the request context from synchronous code,
+    /// which can easily lead to subtle bugs and undefined behavior if the context is not actually present.
+    /// Always prefer using [`RequestContext::current`] with an [`AsyncMarker`] in async code to ensure correct context handling.
+    #[must_use]
+    pub unsafe fn current_sync() -> Arc<Self> {
+        REQUEST_CONTEXT
+            .try_with(Arc::clone)
+            .ok()
+            .unwrap_or_else(|| Arc::clone(&INTERNAL_REQUEST_CONTEXT))
+    }
+
     /// Runs the provided future with the current request context.
     pub async fn scope<F>(self: Arc<Self>, f: F) -> F::Output
     where
@@ -144,6 +167,29 @@ impl RequestContext {
     pub fn cache_control(&self) -> CacheControl {
         self.cache_control
     }
+
+    pub fn extension<T>(&self) -> Option<Arc<T>>
+    where
+        T: 'static + Send + Sync + Clone,
+    {
+        let extensions = self.extensions.read().ok()?;
+        let type_id = TypeId::of::<T>();
+        extensions
+            .get(&type_id)
+            .and_then(|arc_any| Arc::clone(arc_any).downcast::<T>().ok())
+    }
+
+    pub fn insert_extension<T: 'static + Send + Sync>(&self, extension: T) {
+        if let Ok(mut extensions) = self.extensions.write() {
+            extensions.insert(TypeId::of::<T>(), Arc::new(extension));
+        }
+    }
+
+    pub async fn load_extensions(&self) {
+        if let Some(extension) = self.extension::<DatabricksAuthExtension>() {
+            extension.load_u2m_components().await;
+        }
+    }
 }
 
 impl AuthRequestContext for RequestContext {
@@ -166,8 +212,10 @@ pub struct RequestContextBuilder {
     protocol: Protocol,
     cache_control: CacheControl,
     app: Option<Arc<App>>,
+    df: Option<Arc<DataFusion>>,
     user_agent: UserAgent,
     baggage: Vec<KeyValue>,
+    extensions: Extensions,
 }
 
 impl RequestContextBuilder {
@@ -175,16 +223,24 @@ impl RequestContextBuilder {
     pub fn new(protocol: Protocol) -> Self {
         Self {
             protocol,
-            cache_control: CacheControl::Cache,
+            cache_control: CacheControl::Cache(CacheKeyType::Default),
             app: None,
+            df: None,
             user_agent: UserAgent::Absent,
             baggage: vec![],
+            extensions: Extensions::default(),
         }
     }
 
     #[must_use]
     pub fn with_app_opt(mut self, app: Option<Arc<App>>) -> Self {
         self.app = app;
+        self
+    }
+
+    #[must_use]
+    pub fn with_df_opt(mut self, df: Option<Arc<DataFusion>>) -> Self {
+        self.df = df;
         self
     }
 
@@ -202,6 +258,14 @@ impl RequestContextBuilder {
         };
         self.cache_control = CacheControl::from_headers(headers);
         self.baggage.extend(baggage::from_headers(headers));
+
+        let app = self.app.as_ref().map(Arc::clone);
+        let df = self.df.as_ref().map(Arc::clone);
+        if let Some(extension) = DatabricksAuthExtension::from_headers(&app, &df, headers) {
+            self.extensions
+                .insert(TypeId::of::<DatabricksAuthExtension>(), Arc::new(extension));
+        }
+
         self
     }
 
@@ -265,11 +329,20 @@ impl RequestContextBuilder {
             }
         }
 
+        // Apply the runtime parameter `runtime.results_cache.cache_key_type` to the cache control if set.
+        let cache_control = if let CacheControl::Cache(CacheKeyType::Default) = self.cache_control {
+            let cache_key_type = CacheKeyType::from_app_runtime(self.app.as_ref());
+            CacheControl::Cache(cache_key_type)
+        } else {
+            self.cache_control
+        };
+
         RequestContext {
             protocol: AtomicU8::new(self.protocol as u8),
-            cache_control: self.cache_control,
+            cache_control,
             dimensions,
             auth_principal: OnceLock::new(),
+            extensions: RwLock::new(self.extensions),
         }
     }
 }

@@ -40,6 +40,7 @@ pub fn from_app(app: App) -> SpicepodDefinition {
         name: app.name,
         runtime: app.runtime,
         extensions: app.extensions,
+        management: app.management,
         secrets: app.secrets,
         views: app
             .views
@@ -73,6 +74,11 @@ pub fn from_app(app: App) -> SpicepodDefinition {
             .collect(),
         embeddings: app
             .embeddings
+            .into_iter()
+            .map(ComponentOrReference::Component)
+            .collect(),
+        workers: app
+            .workers
             .into_iter()
             .map(ComponentOrReference::Component)
             .collect(),

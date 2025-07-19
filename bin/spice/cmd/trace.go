@@ -19,6 +19,7 @@ package cmd
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
@@ -44,10 +45,10 @@ var (
 )
 
 var supported_trace_tasks = []string{
-	"ai_chat", "accelerated_refresh", "ai_completion", "sql_query", "nsql",
-	"tool_use::document_similarity", "tool_use::list_datasets", "tool_use::sql",
-	"tool_use::table_schema", "tool_use::sample_data", "tool_use::sql_query", "tool_use::memory", "eval_run",
-	"vector_search",
+	"ai_chat", "accelerated_refresh", "ai_completion", "eval_run", "nsql", "sql_query",
+	"tool_use::document_similarity", "tool_use::list_datasets", "tool_use::load_memory",
+	"tool_use::sample_data", "tool_use::sql", "tool_use::store_memory",
+	"tool_use::table_schema", "vector_search", "scheduled_worker",
 }
 
 func isValidTraceTask(task string) bool {
@@ -62,6 +63,10 @@ func isValidTraceTask(task string) bool {
 var traceCmd = &cobra.Command{
 	Use:   "trace",
 	Short: "Return a user friendly trace into an operation that occurred in Spice",
+	Long: fmt.Sprintf(`
+	Available operations:
+	  %s
+	`, strings.Join(supported_trace_tasks, ", ")),
 	Example: `
 # returns the last trace
 $ spice trace ai_chat
@@ -74,14 +79,13 @@ $ spice trace ai_chat --include-input --truncate=120
 `,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
-		rtcontext := context.NewContext()
-		apiKey, _ := cmd.Flags().GetString("api-key")
-		if apiKey != "" {
-			rtcontext.SetApiKey(apiKey)
+		rtcontext, err := context.FromFlags(cmd.Flags())
+		if err != nil {
+			slog.Error("failed to initialize runtime context", "error", err)
+			return
 		}
 
 		var filter string
-		var err error
 		switch isValidTraceTask(args[0]) {
 		case true:
 			filter, err = getTraceFilter(args[0], id, trace_id)
@@ -126,7 +130,7 @@ func ToRowInterface(treePrefix string, t *taskhistory.TaskHistory, includeInput 
 		Tree     string `json:"tree"`
 		Status   string `json:"status"`
 		Duration string `json:"duration"`
-		Task     string `json:"task"`
+		SpanID   string `json:"span_id"`
 	}
 	type TaskRowFull struct {
 		TaskRowBase
@@ -145,7 +149,7 @@ func ToRowInterface(treePrefix string, t *taskhistory.TaskHistory, includeInput 
 	base := TaskRowBase{
 		Tree:     treePrefix,
 		Duration: fmt.Sprintf("%8.2fms", t.ExecutionDurationMs),
-		Task:     t.Task,
+		SpanID:   t.SpanID,
 	}
 
 	if t.ErrorMessage == nil || *t.ErrorMessage == "" {

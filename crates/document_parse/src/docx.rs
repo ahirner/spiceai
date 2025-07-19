@@ -16,7 +16,7 @@ limitations under the License.
 
 use bytes::Bytes;
 use docx_rs::Render;
-use docx_rs::{read_docx, Docx};
+use docx_rs::{Docx, read_docx};
 use snafu::ResultExt;
 use std::{any::Any, collections::HashMap, sync::Arc};
 
@@ -43,6 +43,7 @@ impl DocumentParserFactory for DocxParserFactory {
 #[derive(Default)]
 pub struct DocxParser {}
 impl DocxParser {
+    #[must_use]
     pub fn new(_parser_options: &HashMap<String, String>) -> Self {
         DocxParser::default()
     }

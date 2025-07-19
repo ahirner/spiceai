@@ -14,10 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::LazyLock;
-
-use spicepod::component::{dataset::acceleration::Mode, params::Params};
-use tokio::sync::Mutex;
+use runtime::{
+    component::dataset::Dataset, dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint,
+};
+use spicepod::{acceleration::Mode, param::Params};
 
 #[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
@@ -25,6 +25,8 @@ mod checkpoint_duckdb;
 mod checkpoint_postgres;
 #[cfg(feature = "sqlite")]
 mod checkpoint_sqlite;
+#[cfg(feature = "duckdb")]
+mod cron;
 #[cfg(feature = "sqlite")]
 mod file_watcher;
 #[cfg(all(feature = "postgres", feature = "duckdb", feature = "sqlite"))]
@@ -33,11 +35,7 @@ mod query_push_down;
 #[cfg(feature = "duckdb")]
 mod single_instance_duckdb;
 
-// Several acceleration tests need to use shared state from the acceleration registry.
-// To avoid race conditions, use a mutex to ensure that the acceleration tests are run serially.
-pub static ACCELERATION_MUTEX: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
-
-fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
+pub(crate) fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params> {
     let param_name = format!("{engine}_file",);
     if mode == &Mode::File {
         return Some(Params::from_string_map(
@@ -47,4 +45,35 @@ fn get_params(mode: &Mode, file: Option<String>, engine: &str) -> Option<Params>
         ));
     }
     None
+}
+
+async fn wait_for_checkpoints(
+    datasets: Vec<Dataset>,
+    timeout_secs: u64,
+) -> Result<(), anyhow::Error> {
+    let mut checkpoint_futures = Vec::new();
+
+    for dataset in datasets {
+        let check_future = async move {
+            match DatasetCheckpoint::try_new(&dataset).await {
+                Ok(checkpoint) => {
+                    while !checkpoint.exists().await {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    }
+                    Ok(())
+                }
+                Err(e) => Err(anyhow::anyhow!("Failed to verify checkpoint: {e}")),
+            }
+        };
+        checkpoint_futures.push(check_future);
+    }
+
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_secs(timeout_secs)) => {
+            Err(anyhow::anyhow!("Timed out waiting for dataset checkpoints"))
+        },
+        result = futures::future::try_join_all(checkpoint_futures) => {
+            result.map(|_| ())
+        }
+    }
 }

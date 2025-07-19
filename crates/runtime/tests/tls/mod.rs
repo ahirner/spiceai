@@ -25,13 +25,13 @@ use crate::{
     utils::{test_request_context, wait_until_true},
 };
 use arrow_flight::{
+    FlightDescriptor,
     flight_service_client::FlightServiceClient,
     sql::{CommandStatementQuery, ProstMessageExt},
-    FlightDescriptor,
 };
 use prost::Message;
 use rand::Rng;
-use runtime::{auth::EndpointAuth, config::Config, tls::TlsConfig, Runtime};
+use runtime::{Runtime, auth::EndpointAuth, config::Config, tls::TlsConfig};
 use tonic::transport::Channel;
 use tonic_health::pb::health_client::HealthClient;
 
@@ -49,8 +49,8 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
         let span = tracing::info_span!("test_tls_endpoints");
         let _span_guard = span.enter();
 
-        let mut rng = rand::thread_rng();
-        let http_port: u16 = rng.gen_range(50000..60000);
+        let mut rng = rand::rng();
+        let http_port: u16 = rng.random_range(50000..60000);
         let flight_port: u16 = http_port + 1;
         let otel_port: u16 = http_port + 2;
         let metrics_port: u16 = http_port + 3;
@@ -69,15 +69,17 @@ async fn test_tls_endpoints() -> Result<(), anyhow::Error> {
         let tls_config = TlsConfig::try_new(cert_bytes.clone(), key_bytes).expect("valid TlsConfig");
 
         let registry = prometheus::Registry::new();
+        let app = app::AppBuilder::new("test_app").build();
 
-        let rt = Runtime::builder()
+        let rt = Arc::new(Runtime::builder()
             .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
+            .with_app(app)
             .build()
-            .await;
+            .await);
 
         // Start the servers
         tokio::spawn(async move {
-            Box::pin(Arc::new(rt).start_servers(
+            Box::pin(Arc::clone(&rt).start_servers(
                 api_config,
                 Some(Arc::new(tls_config)),
                 EndpointAuth::no_auth(),

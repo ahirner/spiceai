@@ -15,18 +15,20 @@ limitations under the License.
 */
 
 use super::get_app_and_start_request;
-use crate::args::DatasetTestArgs;
+use crate::{args::DatasetTestArgs, wait_test_and_memory};
 use std::time::Duration;
 use test_framework::{
-    anyhow,
+    TestType, anyhow,
+    arrow::util::pretty::print_batches,
     metrics::{MetricCollector, NoExtendedMetrics, QueryMetrics, StatisticsCollector},
     queries::{QueryOverrides, QuerySet},
     spiced::SpicedInstance,
     spicetest::{
-        datasets::{EndCondition, NotStarted},
         SpiceTest,
+        datasets::{EndCondition, NotStarted},
     },
-    TestType,
+    tokio_util::sync::CancellationToken,
+    utils::observe_memory,
 };
 
 #[allow(clippy::too_many_lines)]
@@ -41,7 +43,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     let query_overrides = args.query_overrides.clone().map(QueryOverrides::from);
     let queries = query_set.get_queries(query_overrides);
 
-    let (app, start_request) = get_app_and_start_request(&args.common)?;
+    let (app, start_request) = get_app_and_start_request(&args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
     spiced_instance
@@ -55,12 +57,13 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     println!("Running baseline throughput test");
     let baseline_test = SpiceTest::new(
         app.name.clone(),
-        spiced_instance,
         NotStarted::new()
             .with_parallel_count(args.common.concurrency)
             .with_query_set(queries.clone())
-            .with_end_condition(EndCondition::QuerySetCompleted(test_hours.try_into()?)),
+            .with_end_condition(EndCondition::QuerySetCompleted(test_hours.try_into()?))
+            .with_disable_caching(args.disable_caching),
     )
+    .with_spiced_instance(spiced_instance)
     .with_progress_bars(!args.common.disable_progress_bars)
     .start()
     .await?;
@@ -73,51 +76,57 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
 
     let baseline_metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Load)?;
     println!("Baseline metrics:");
-    baseline_metrics.show_records()?;
-    let spiced_instance = test.end();
+    let records = baseline_metrics.build_records()?;
+    print_batches(&records)?;
+    let spiced_instance = test.end()?;
+    let memory_token = CancellationToken::new();
+    let memory_readings = spiced_instance.process().watch_memory(&memory_token);
 
     // load test
     println!("Running load test");
     let throughput_test = SpiceTest::<NotStarted>::new(
         app.name.clone(),
-        spiced_instance,
         NotStarted::new()
             .with_parallel_count(args.common.concurrency)
             .with_query_set(queries.clone())
             .with_end_condition(EndCondition::Duration(Duration::from_secs(
                 args.common.duration,
-            ))),
+            )))
+            .with_disable_caching(args.disable_caching),
     )
+    .with_spiced_instance(spiced_instance)
     .with_progress_bars(!args.common.disable_progress_bars)
     .start()
     .await?;
 
-    let test = throughput_test.wait().await?;
+    let test = wait_test_and_memory!(throughput_test, memory_token, memory_readings);
     let test_durations = test.get_query_durations().statistical_set()?;
     let metrics: QueryMetrics<_, NoExtendedMetrics> = test.collect(TestType::Load)?;
-    let mut spiced_instance = test.end();
+    let mut spiced_instance = test.end()?;
+    let (max_memory, _) = observe_memory(memory_token, memory_readings).await?;
 
     println!("Baseline metrics:");
-    baseline_metrics.show_records()?;
+    let baseline_records = baseline_metrics.build_records()?;
+    print_batches(&baseline_records)?;
     println!("{}", vec!["-"; 30].join(""));
     println!("Load test metrics:");
-    metrics.show_records()?;
+    let records = metrics.with_memory_usage(max_memory).build_records()?;
+    print_batches(&records)?;
 
-    spiced_instance.show_memory_usage()?;
     spiced_instance.stop()?;
 
     let mut test_passed = true;
     let mut yellow_measurements = 0;
-    for (query, _) in queries {
-        let Some(baseline_percentile) = baseline_percentiles.get(query) else {
+    for query in queries {
+        let Some(baseline_percentile) = baseline_percentiles.get(&query.name) else {
             // Query Failed, no percentile statistics recorded
             continue;
         };
 
-        let Some(duration) = test_durations.get(query) else {
+        let Some(duration) = test_durations.get(&query.name) else {
             return Err(anyhow::anyhow!(
                 "Query {} not found in test durations",
-                query
+                query.name
             ));
         };
 
@@ -139,11 +148,13 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
         if red {
             println!(
                 "FAIL - Query {query} has a 99th percentile that increased {percentile_ratio}% of the baseline 99th percentile",
+                query = query.name
             );
             test_passed = false;
         } else if yellow {
             println!(
                 "WARN - Query {query} has a 99th percentile that increased {percentile_ratio}% of the baseline 99th percentile",
+                query = query.name
             );
             yellow_measurements += 1;
         }

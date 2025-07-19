@@ -14,23 +14,30 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
-
-use app::App;
-use tokio::sync::RwLock;
+use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use crate::{
-    catalogconnector, dataaccelerator, dataconnector,
+    Runtime, catalogconnector,
+    dataaccelerator::AcceleratorEngineRegistry,
+    dataconnector,
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
+    embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc},
     extension::{Extension, ExtensionFactory},
     flight::RateLimits,
     metrics, podswatcher,
+    search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc},
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
-    tools, tracers, Runtime,
+    tracers,
 };
+use app::App;
+use spicepod::component::caching::Caching;
+use token_provider::registry::TokenProviderRegistry;
+use tokio::sync::{Mutex, RwLock};
+
+type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
 pub struct RuntimeBuilder {
     app: Option<Arc<app::App>>,
@@ -40,9 +47,11 @@ pub struct RuntimeBuilder {
     datasets_health_monitor_enabled: bool,
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
-    datafusion: Option<Arc<DataFusion>>,
-    runtime_status: Option<Arc<status::RuntimeStatus>>,
+    runtime_status: Arc<status::RuntimeStatus>,
     rate_limits: Option<Arc<RateLimits>>,
+    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+    datafusion_configuration_fn: Option<DatafusionConfigurationCallback>,
+    token_provider_registry: Arc<TokenProviderRegistry>,
 }
 
 impl RuntimeBuilder {
@@ -54,10 +63,12 @@ impl RuntimeBuilder {
             datasets_health_monitor_enabled: false,
             metrics_endpoint: None,
             prometheus_registry: None,
-            datafusion: None,
             autoload_extensions: HashMap::new(),
-            runtime_status: None,
+            runtime_status: status::RuntimeStatus::new(),
             rate_limits: None,
+            accelerator_engine_registry: Arc::new(AcceleratorEngineRegistry::new()),
+            datafusion_configuration_fn: None,
+            token_provider_registry: Arc::new(TokenProviderRegistry::new()),
         }
     }
 
@@ -115,13 +126,12 @@ impl RuntimeBuilder {
         self
     }
 
-    pub fn with_datafusion(mut self, datafusion: Arc<DataFusion>) -> Self {
-        self.datafusion = Some(datafusion);
-        self
-    }
-
-    pub fn with_runtime_status(mut self, runtime_status: Arc<status::RuntimeStatus>) -> Self {
-        self.runtime_status = Some(runtime_status);
+    /// Used to configure `DataFusion` in integration tests & test CI
+    pub fn with_datafusion_configuration_fn(
+        mut self,
+        callback: DatafusionConfigurationCallback,
+    ) -> Self {
+        self.datafusion_configuration_fn = Some(callback);
         self
     }
 
@@ -130,22 +140,82 @@ impl RuntimeBuilder {
         self
     }
 
+    #[allow(clippy::too_many_lines)]
     pub async fn build(self) -> Runtime {
+        self.accelerator_engine_registry.register_all().await;
         dataconnector::register_all().await;
         catalogconnector::register_all().await;
-        dataaccelerator::register_all().await;
-        tools::factory::register_all_factories().await;
         document_parse::register_all().await;
 
-        let status = match self.runtime_status {
-            Some(status) => status,
-            None => status::RuntimeStatus::new(),
-        };
+        let memory_limit = self
+            .app
+            .as_ref()
+            .and_then(|app| parse_memory_limit(app.runtime.memory_limit.clone()));
 
-        let df = match self.datafusion {
-            Some(df) => df,
-            None => Arc::new(DataFusion::builder(Arc::clone(&status)).build()),
-        };
+        let temp_directory = self
+            .app
+            .as_ref()
+            .and_then(|app| app.runtime.temp_directory.clone());
+
+        let dataset_parallelism = self
+            .app
+            .as_ref()
+            .and_then(|app| app.runtime.dataset_load_parallelism);
+
+        let task_history = self
+            .app
+            .as_ref()
+            .is_none_or(|app| app.runtime.task_history.enabled);
+
+        let mut caching_config = self
+            .app
+            .as_ref()
+            .map_or(Caching::default(), |app| app.runtime.caching.clone());
+        if let Some(results_cache) = self
+            .app
+            .as_ref()
+            .and_then(|app| app.runtime.results_cache.clone())
+        {
+            crate::in_tracing_context(|| {
+                tracing::warn!(
+                    "The `results_cache` Runtime parameter is deprecated and will be removed in a future release.\nUse `caching.sql_results` instead.\nFor more information, visit: https://spiceai.org/docs/features/caching"
+                );
+            });
+            caching_config.sql_results = Some(results_cache.into());
+        }
+
+        let caching = Runtime::init_caching(Some(&caching_config));
+
+        let mut df_builder = DataFusion::builder(
+            Arc::clone(&self.runtime_status),
+            Arc::clone(&self.accelerator_engine_registry),
+        )
+        .memory_limit(memory_limit)
+        .temp_directory(temp_directory)
+        .with_task_history(task_history)
+        .with_caching(caching);
+
+        if let Some(dataset_parallelism) = dataset_parallelism {
+            df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);
+        }
+
+        let mut df = df_builder.build();
+
+        if let Some(callback) = self.datafusion_configuration_fn {
+            callback(&mut df);
+        }
+
+        let df = Arc::new(df);
+
+        // UDFs that require a weak reference to the DataFusion instance defined here.
+        df.ctx.register_udtf(
+            TEXT_SEARCH_UDTF_NAME,
+            Arc::new(TextSearchTableFunc::new(Arc::downgrade(&df))),
+        );
+        df.ctx.register_udtf(
+            VECTOR_SEARCH_UDTF_NAME,
+            Arc::new(VectorSearchTableFunc::new(Arc::downgrade(&df))),
+        );
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
             let is_task_history_enabled = self
@@ -173,10 +243,12 @@ impl RuntimeBuilder {
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
             llms: Arc::new(RwLock::new(HashMap::new())),
+            workers: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
             evals: Arc::new(RwLock::new(evals)),
             eval_scorers: Arc::new(RwLock::new(HashMap::new())),
             tools: Arc::new(RwLock::new(HashMap::new())),
+            tool_factories: Arc::new(Mutex::new(HashMap::new())),
             pods_watcher: Arc::new(RwLock::new(self.pods_watcher)),
             secrets: Arc::new(RwLock::new(secrets)),
             spaced_tracer: Arc::new(tracers::SpacedTracer::new(Duration::from_secs(15))),
@@ -186,7 +258,11 @@ impl RuntimeBuilder {
             metrics_endpoint: self.metrics_endpoint,
             prometheus_registry: self.prometheus_registry,
             rate_limits: self.rate_limits.unwrap_or_default(),
-            status,
+            status: self.runtime_status,
+            runtime_tasks: Arc::new(RwLock::new(HashMap::new())),
+            accelerator_engine_registry: self.accelerator_engine_registry,
+            token_provider_registry: self.token_provider_registry,
+            schedulers: Arc::new(RwLock::new(HashMap::new())),
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
@@ -197,7 +273,7 @@ impl RuntimeBuilder {
                 eprintln!("Failed to initialize extension {extension_name}: {err}");
             } else {
                 extensions.insert(extension_name.into(), extension.into());
-            };
+            }
         }
         rt.extensions = Arc::new(RwLock::new(extensions));
 
@@ -211,7 +287,7 @@ impl RuntimeBuilder {
         if let Some(app) = app {
             if let Err(e) = secrets.load_from(&app.secrets).await {
                 eprintln!("Error loading secret stores: {e}");
-            };
+            }
         }
 
         secrets
@@ -221,5 +297,80 @@ impl RuntimeBuilder {
 impl Default for RuntimeBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
+    let memory_limit = memory_limit?;
+    let original_memory_limit = memory_limit.clone();
+
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let memory_limit = byte_unit::Byte::from_str(&memory_limit)
+        .ok()
+        // losing the fractional part of a byte is not a problem
+        .map(|v| v.get_adjusted_unit(byte_unit::Unit::B).get_value() as u64);
+
+    if memory_limit.is_none() {
+        crate::in_tracing_context(|| {
+            tracing::warn!(
+                "An invalid Runtime memory limit was specified: {original_memory_limit}\n A memory limit must be specified as an integer in GB, MB, or KB size."
+            );
+        });
+    }
+
+    if memory_limit == Some(0) {
+        crate::in_tracing_context(|| {
+            tracing::warn!(
+                "A Runtime memory limit of 0 was specified: {original_memory_limit}\n A memory limit must be greater than 0."
+            );
+        });
+        None
+    } else {
+        memory_limit
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_parse_memory_limit() {
+        let test_cases: Vec<(Option<&str>, Option<u64>)> = vec![
+            // bytes
+            (Some("1GB"), Some(1_000_000_000)),
+            (Some("1G"), Some(1_000_000_000)),
+            (Some("1MB"), Some(1_000_000)),
+            (Some("1M"), Some(1_000_000)),
+            (Some("1KB"), Some(1_000)),
+            (Some("1K"), Some(1_000)),
+            (Some("1B"), Some(1)),
+            // bits
+            (Some("1gb"), Some(125_000_000)),
+            (Some("1mb"), Some(125_000)),
+            (Some("1kb"), Some(125)),
+            (Some("1b"), Some(1)),
+            // kibi, gibi, mebi
+            (Some("1GiB"), Some(1_073_741_824)),
+            (Some("1Gi"), Some(1_073_741_824)),
+            (Some("1MiB"), Some(1_048_576)),
+            (Some("1Mi"), Some(1_048_576)),
+            (Some("1KiB"), Some(1024)),
+            (Some("1Ki"), Some(1024)),
+            // without a b identifier, defaults to bytes
+            (Some("1g"), Some(1_000_000_000)),
+            (Some("1m"), Some(1_000_000)),
+            (Some("1k"), Some(1_000)),
+            (Some("1"), Some(1)),
+            (Some("0"), None),
+            (Some("-1"), None),
+            (Some("invalid"), None),
+            (None, None),
+        ];
+
+        for (input, expected) in test_cases {
+            let result = parse_memory_limit(input.map(ToString::to_string));
+            assert_eq!(result, expected, "Input: {input:?}");
+        }
     }
 }

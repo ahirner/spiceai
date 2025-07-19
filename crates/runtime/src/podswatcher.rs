@@ -15,14 +15,12 @@ limitations under the License.
 */
 
 use notify::{
-    event::{CreateKind, ModifyKind, RemoveKind},
     EventKind, RecursiveMode, Watcher,
+    event::{CreateKind, ModifyKind, RemoveKind},
 };
 use spicepod::component::ComponentOrReference;
 use std::path::PathBuf;
-use tokio::sync::mpsc::{channel, Receiver};
-
-use app::{App, AppBuilder};
+use tokio::sync::mpsc::{Receiver, channel};
 
 pub struct PodsWatcher {
     root_path: PathBuf,
@@ -38,7 +36,7 @@ impl PodsWatcher {
         }
     }
 
-    pub fn watch(&mut self) -> notify::Result<Receiver<App>> {
+    pub async fn watch(&mut self) -> notify::Result<Receiver<PathBuf>> {
         let root_path = self.root_path.clone();
 
         let (tx, rx) = channel(100);
@@ -48,10 +46,10 @@ impl PodsWatcher {
             root_path.join("spicepod.yml"),
         ];
 
-        let mut watch_paths = get_watch_paths(&root_path);
+        let watch_paths = get_watch_paths(&root_path).await;
 
-        let mut watcher = notify::recommended_watcher(
-            move |res: Result<notify::Event, notify::Error>| {
+        let mut watcher =
+            notify::recommended_watcher(move |res: Result<notify::Event, notify::Error>| {
                 match res {
                     Ok(event) => {
                         if !is_spicepods_modification_event(&watch_paths, &event) {
@@ -62,25 +60,16 @@ impl PodsWatcher {
                         // check if main spicepod file has been modified to update watching paths
                         for event_path in &event.paths {
                             if root_spicepod_path.iter().any(|dir| event_path.eq(dir)) {
-                                watch_paths = get_watch_paths(&root_path);
+                                // Note: Cannot await in this sync closure, so paths will be stale until next restart
+                                tracing::debug!("Main spicepod file modified, paths may be stale");
                             }
                         }
 
-                        match AppBuilder::build_from_filesystem_path(root_path.clone()) {
-                            Ok(app) => {
-                                if let Err(e) = tx.blocking_send(app) {
-                                    tracing::error!("Pods content watcher is unable to notify detected state change: {e}");
-                                }
-                            }
-                            Err(e) => tracing::warn!(
-                                "Invalid app state detected, unable to load pods information: {e}"
-                            ),
-                        }
+                        let _ = tx.blocking_send(root_path.clone());
                     }
                     Err(e) => tracing::error!("Pods content watcher error: {e}"),
                 }
-            },
-        )?;
+            })?;
 
         watcher.watch(&self.root_path, RecursiveMode::Recursive)?;
 
@@ -103,7 +92,7 @@ macro_rules! enable_watch_for_component {
     };
 }
 
-fn get_watch_paths(app_path: impl Into<PathBuf>) -> Vec<PathBuf> {
+async fn get_watch_paths(app_path: impl Into<PathBuf>) -> Vec<PathBuf> {
     let root_dir: PathBuf = app_path.into();
 
     let mut dirs = vec![
@@ -111,7 +100,7 @@ fn get_watch_paths(app_path: impl Into<PathBuf>) -> Vec<PathBuf> {
         root_dir.join("spicepod.yml"),
     ];
 
-    if let Ok(spicepod) = spicepod::Spicepod::load_definition(&root_dir) {
+    if let Ok(spicepod) = spicepod::Spicepod::load_definition(&root_dir).await {
         for dep in spicepod.dependencies {
             let dep_path = root_dir.join("spicepods").join(dep);
             dirs.push(dep_path);

@@ -51,6 +51,9 @@ pub enum TestCommands {
     HttpConsistency(HttpConsistencyTestArgs),
     HttpOverhead(HttpOverheadTestArgs),
     Evals(EvalsTestArgs),
+    #[cfg(feature = "append")]
+    Append(DatasetTestArgs),
+    VectorSearch(CommonArgs),
 }
 
 /// Arguments Common to all [`TestCommands`].
@@ -83,4 +86,8 @@ pub struct CommonArgs {
     /// An optional data directory, to symlink into the spiced instance
     #[arg(short, long)]
     pub(crate) data_dir: Option<PathBuf>,
+
+    /// Whether to enable metrics collection
+    #[arg(long)]
+    pub(crate) metrics: bool,
 }

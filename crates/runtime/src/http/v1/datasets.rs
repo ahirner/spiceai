@@ -16,23 +16,27 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    accelerated_table::refresh::RefreshOverrides, component::dataset::Dataset,
-    datafusion::DataFusion, status::ComponentStatus, LogErrors, Runtime,
+    LogErrors, Runtime,
+    accelerated_table::refresh::RefreshOverrides,
+    component::dataset::Dataset,
+    datafusion::request_context_extension::get_current_datafusion,
+    request::{AsyncMarker, RequestContext},
+    status::ComponentStatus,
 };
 use app::App;
 use axum::{
+    Extension, Json,
     extract::Path,
     extract::Query,
     http::status,
     response::{IntoResponse, Response},
-    Extension, Json,
 };
 use datafusion::sql::TableReference;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
-use super::{convert_entry_to_csv, dataset_status, Format};
+use super::{Format, convert_entry_to_csv, dataset_status};
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams, utoipa::ToSchema))]
@@ -135,7 +139,7 @@ postgres:aidemo_messages,general,false,false
 ))]
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
-    Extension(df): Extension<Arc<DataFusion>>,
+    Extension(rt): Extension<Arc<Runtime>>,
     Query(filter): Query<DatasetFilter>,
     Query(params): Query<DatasetQueryParams>,
 ) -> Response {
@@ -156,7 +160,10 @@ pub(crate) async fn get(
             .into_response();
     };
 
-    let valid_datasets = Runtime::get_valid_datasets(readable_app, LogErrors(false));
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
+
+    let valid_datasets = rt.get_valid_datasets(readable_app, LogErrors(false));
     let datasets: Vec<Arc<Dataset>> = match filter.source {
         Some(source) => valid_datasets
             .into_iter()
@@ -225,9 +232,11 @@ pub struct AccelerationRequest {
     request_body(
         description = "On-demand refresh request for a specific dataset.",
         content((
-            AccelerationRequest = "application/json",
+            RefreshOverrides = "application/json",
             example = json!({
-                "refresh_sql": "SELECT * FROM taxi_trips WHERE tip_amount > 10.0"
+                "refresh_sql": "SELECT * FROM taxi_trips WHERE tip_amount > 10.0",
+                "refresh_mode": "full",
+                "refresh_jitter_max": "10s"
             })
         ))
     ),
@@ -260,7 +269,6 @@ pub struct AccelerationRequest {
 ))]
 pub(crate) async fn refresh(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
-    Extension(df): Extension<Arc<DataFusion>>,
     Path(dataset_name): Path<String>,
     overrides_opt: Option<Json<RefreshOverrides>>,
     // When this is an Option<Json>, Json rejections are silenced
@@ -279,6 +287,9 @@ pub(crate) async fn refresh(
     let Some(readable_app) = &*app_lock else {
         return (status::StatusCode::INTERNAL_SERVER_ERROR).into_response();
     };
+
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
 
     let Some(dataset) = readable_app
         .datasets
@@ -304,7 +315,7 @@ pub(crate) async fn refresh(
             }),
         )
             .into_response();
-    };
+    }
 
     match df
         .refresh_table(
@@ -313,7 +324,7 @@ pub(crate) async fn refresh(
         )
         .await
     {
-        Ok(()) => (
+        Ok(_) => (
             status::StatusCode::CREATED,
             Json(MessageResponse {
                 message: format!("Dataset refresh triggered for {dataset_name}."),
@@ -373,7 +384,6 @@ pub(crate) async fn refresh(
 ))]
 pub(crate) async fn acceleration(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
-    Extension(df): Extension<Arc<DataFusion>>,
     Path(dataset_name): Path<String>,
     Json(payload): Json<AccelerationRequest>,
 ) -> Response {
@@ -389,6 +399,9 @@ pub(crate) async fn acceleration(
     let Some(readable_app) = &*app_lock else {
         return (status::StatusCode::INTERNAL_SERVER_ERROR).into_response();
     };
+
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
 
     let Some(dataset) = readable_app
         .datasets

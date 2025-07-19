@@ -18,15 +18,15 @@ limitations under the License.
 use async_stream::stream;
 use datafusion::{
     common::{
-        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
         DFSchemaRef,
+        tree_node::{Transformed, TreeNode, TreeNodeRecursion},
     },
     error::Result,
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Extension, LogicalPlan, UserDefinedLogicalNodeCore},
     optimizer::{OptimizerConfig, OptimizerRule},
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionPlan,
+        DisplayAs, DisplayFormatType, ExecutionPlan, stream::RecordBatchStreamAdapter,
     },
     prelude::Expr,
 };
@@ -111,6 +111,7 @@ impl OptimizerRule for BytesProcessedOptimizerRule {
 }
 
 impl BytesProcessedOptimizerRule {
+    #[must_use]
     pub fn new() -> Self {
         Self::default()
     }
@@ -225,7 +226,9 @@ impl std::fmt::Debug for BytesProcessedExec {
 impl DisplayAs for BytesProcessedExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match t {
-            DisplayFormatType::Default | DisplayFormatType::Verbose => {
+            DisplayFormatType::Default
+            | DisplayFormatType::Verbose
+            | DisplayFormatType::TreeRender => {
                 write!(f, "BytesProcessedExec")
             }
         }
@@ -277,7 +280,9 @@ impl ExecutionPlan for BytesProcessedExec {
         let Some(request_context) = context.session_config().get_extension::<RequestContext>()
         else {
             // This should never happen if all queries are run through the query builder, so if it does its a bug we need to catch in development.
-            panic!("The request context was not provided to BytesProcessedExec, report a bug at https://github.com/spiceai/spiceai/issues")
+            panic!(
+                "The request context was not provided to BytesProcessedExec, report a bug at https://github.com/spiceai/spiceai/issues"
+            )
         };
 
         let bytes_processed_stream = stream! {

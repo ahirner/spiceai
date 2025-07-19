@@ -28,13 +28,14 @@ use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,
 };
-use mysql_async::{prelude::Queryable, Params, Row};
+use mysql_async::{Params, Row, prelude::Queryable};
+
 use runtime::Runtime;
 use tracing::instrument;
-use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
-const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-federation-mysql";
-const MYSQL_PORT: u16 = 13306;
+const MYSQL_PORT1: u16 = 13306;
+const MYSQL_PORT2: u16 = 13308;
 
 #[instrument]
 async fn init_mysql_db(port: u16) -> Result<(), anyhow::Error> {
@@ -72,7 +73,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
     test_request_context()
         .scope(async {
             let running_container =
-                start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
+                start_mysql_docker_container(MYSQL_PORT1)
                     .await
                     .map_err(|e| {
                         tracing::error!("start_mysql_docker_container: {e}");
@@ -81,7 +82,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
             tracing::debug!("Container started");
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mysql_db(MYSQL_PORT)
+                init_mysql_db(MYSQL_PORT1)
                     .await
                     .map_err(RetryError::transient)
             })
@@ -91,25 +92,23 @@ async fn mysql_federation_push_down() -> Result<(), String> {
                 e.to_string()
             })?;
             let app = AppBuilder::new("mysql_federation_push_down")
-                .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT, false))
+                .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT1, false))
                 .build();
-
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
 
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
 
+            let cloned_rt = Arc::new(rt.clone());
+
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             let queries: QueryTests = vec![
@@ -171,12 +170,10 @@ async fn mysql_federation_push_down() -> Result<(), String> {
 async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let mysql_port = 13308;
 
     test_request_context().scope_retry(3, || async {
         let running_container = start_mysql_docker_container(
-            "runtime-integration-test-federation-inner-join-mysql",
-            mysql_port,
+            MYSQL_PORT2,
         )
         .await
         .map_err(|e| {
@@ -186,7 +183,7 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
         tracing::debug!("Container started");
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
         retry(retry_strategy, || async {
-            init_mysql_db(mysql_port)
+            init_mysql_db(MYSQL_PORT2)
                 .await
                 .map_err(RetryError::transient)
         })
@@ -196,25 +193,24 @@ async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
             e.to_string()
         })?;
         let app = AppBuilder::new("mysql_federation_inner_join_with_accelerated_dataset")
-            .with_dataset(make_mysql_dataset("lineitem", "line", mysql_port, false))
-            .with_dataset(make_mysql_dataset("lineitem", "acc_line", mysql_port, true))
+            .with_dataset(make_mysql_dataset("lineitem", "line", MYSQL_PORT2, false))
+            .with_dataset(make_mysql_dataset("lineitem", "acc_line", MYSQL_PORT2, true))
             .build();
 
-        let status = status::RuntimeStatus::new();
-        let df = get_test_datafusion(Arc::clone(&status));
+        let mut rt =
+            Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
 
-        let mut rt = Runtime::builder()
-            .with_app(app)
-            .with_datafusion(df)
-            .with_runtime_status(status)
-            .build()
-            .await;
+        let cloned_rt = Arc::new(rt.clone());
         // Set a timeout for the test
         tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                 return Err("Timed out waiting for datasets to load".to_string());
             }
-            () = rt.load_components() => {}
+            () = cloned_rt.load_components() => {}
         }
 
         runtime_ready_check(&rt).await;

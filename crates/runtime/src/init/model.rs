@@ -17,8 +17,8 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use crate::{
-    get_params_with_secrets, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status,
-    timing::TimeMeasurement, Runtime,
+    Runtime, get_params_with_secrets, metrics, model::ENABLE_MODEL_SUPPORT_MESSAGE, status,
+    timing::TimeMeasurement,
 };
 use app::App;
 use model_components::model::Model;
@@ -52,16 +52,18 @@ pub enum Error {
 }
 
 impl Runtime {
-    pub(crate) async fn load_models(&self) {
+    pub(crate) async fn load_models(self: Arc<Self>) {
         let app_lock = self.app.read().await;
 
         if !cfg!(feature = "models") && app_lock.as_ref().is_some_and(|s| !s.models.is_empty()) {
-            tracing::error!("Cannot load models without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}");
+            tracing::error!(
+                "Cannot load models without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}"
+            );
             return;
         }
 
         // Load tools before loading models.
-        self.load_tools().await;
+        Arc::clone(&self).load_tools().await;
 
         if let Some(app) = app_lock.as_ref() {
             for model in &app.models {
@@ -177,7 +179,7 @@ impl Runtime {
                 llm_map.remove(&m.name);
             }
             None => return,
-        };
+        }
 
         tracing::info!("Model [{}] has been unloaded", m.name);
         let source_str = m.get_source().map(|s| s.to_string()).unwrap_or_default();
@@ -228,7 +230,7 @@ fn verify_local_files_exist(m: &SpicepodModel) -> Result<(), Error> {
                 name: m.name.clone(),
                 path: f.path.clone(),
             });
-        };
+        }
     }
     Ok(())
 }

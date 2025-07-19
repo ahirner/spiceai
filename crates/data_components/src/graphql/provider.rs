@@ -24,17 +24,19 @@ use datafusion::{
     logical_expr::{Expr, TableProviderFilterPushDown},
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        expressions::Column, projection::ProjectionExec, stream::RecordBatchStreamAdapter,
-        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PhysicalExpr,
-        PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PhysicalExpr, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+        expressions::Column,
+        projection::ProjectionExec,
+        stream::RecordBatchStreamAdapter,
     },
 };
 use futures::StreamExt;
 use snafu::ResultExt;
 use std::{any::Any, fmt, sync::Arc};
 
-use super::{client::GraphQLClient, ErrorChecker, GraphQLContext, ResultTransformSnafu};
-use super::{client::GraphQLQuery, Result};
+use super::{ErrorChecker, GraphQLContext, ResultTransformSnafu, client::GraphQLClient};
+use super::{Result, client::GraphQLQuery};
 
 pub type TransformFn =
     fn(&RecordBatch) -> Result<RecordBatch, Box<dyn std::error::Error + Send + Sync>>;
@@ -43,6 +45,7 @@ pub struct GraphQLTableProviderBuilder {
     client: GraphQLClient,
     transform_fn: Option<TransformFn>,
     context: Option<Arc<dyn GraphQLContext>>,
+    health_check_query: Option<GraphQLQuery>,
 }
 
 impl GraphQLTableProviderBuilder {
@@ -52,6 +55,7 @@ impl GraphQLTableProviderBuilder {
             client,
             transform_fn: None,
             context: None,
+            health_check_query: None,
         }
     }
 
@@ -67,12 +71,32 @@ impl GraphQLTableProviderBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_health_check_query(mut self, health_check_query: GraphQLQuery) -> Self {
+        self.health_check_query = Some(health_check_query);
+        self
+    }
+
     pub async fn build(self, query_string: &str) -> Result<GraphQLTableProvider> {
         let query_string: Arc<str> = Arc::from(query_string);
         let mut query = GraphQLQuery::try_from(Arc::clone(&query_string))?;
 
         if self.client.json_pointer.is_none() && query.json_pointer.is_none() {
             return Err(super::Error::NoJsonPointerFound {});
+        }
+
+        // Health check on GraphQL resource existence
+        if let Some(mut health_check_query) = self.health_check_query {
+            let _ = self
+                .client
+                .execute(
+                    &mut health_check_query,
+                    None,
+                    None,
+                    None,
+                    self.context.clone().and_then(|o| o.error_checker()),
+                )
+                .await?;
         }
 
         let result = self
@@ -239,7 +263,8 @@ impl GraphQLTableProviderExec {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(table_schema),
                 Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             ),
         }
     }

@@ -22,23 +22,21 @@ use datafusion::{
 };
 use datafusion_table_providers::{
     sql::db_connection_pool::sqlitepool::SqliteConnectionPool,
-    sqlite::{write::SqliteTableWriter, SqliteTableProviderFactory},
+    sqlite::{SqliteTableProviderFactory, write::SqliteTableWriter},
 };
+use runtime_table_partition::expression::PartitionBy;
 use rusqlite::ffi::{sqlite3_auto_extension, sqlite3_decimal_init};
 use snafu::prelude::*;
 use std::{any::Any, ffi::OsStr, sync::Arc, time::Duration};
 
 use crate::{
-    component::dataset::{
-        acceleration::{Engine, Mode},
-        Dataset,
-    },
+    component::dataset::acceleration::{Engine, Mode},
     make_spice_data_directory,
     parameters::ParameterSpec,
-    spice_data_base_path, Runtime,
+    spice_data_base_path,
 };
 
-use super::{DataAccelerator, Error as DataAcceleratorError};
+use super::{AccelerationSource, Behaviors, DataAccelerator, Error as DataAcceleratorError};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -57,7 +55,9 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("The \"sqlite_file\" acceleration parameter has an invalid extension. Expected one of \"{valid_extensions}\" but got \"{extension}\"."))]
+    #[snafu(display(
+        "The \"sqlite_file\" acceleration parameter has an invalid extension. Expected one of \"{valid_extensions}\" but got \"{extension}\"."
+    ))]
     InvalidFileExtension {
         valid_extensions: String,
         extension: String,
@@ -84,6 +84,12 @@ pub struct SqliteAccelerator {
     sqlite_factory: SqliteTableProviderFactory,
 }
 
+impl Default for SqliteAccelerator {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SqliteAccelerator {
     #[must_use]
     pub fn new() -> Self {
@@ -94,17 +100,17 @@ impl SqliteAccelerator {
             sqlite3_auto_extension(Some(sqlite3_decimal_init));
         }
         Self {
-            sqlite_factory: SqliteTableProviderFactory::new(),
+            sqlite_factory: SqliteTableProviderFactory::new().with_decimal_between(true),
         }
     }
 
     /// Returns the `Sqlite` file path that would be used for a file-based `Sqlite` accelerator from this dataset
-    pub fn sqlite_file_path(&self, dataset: &Dataset) -> Result<String> {
-        if !dataset.is_file_accelerated() {
+    pub fn sqlite_file_path(&self, source: &dyn AccelerationSource) -> Result<String> {
+        if !source.is_file_accelerated() {
             Err(Error::InvalidConfiguration {
                 detail: Arc::from("Dataset is not file accelerated"),
             })
-        } else if let Some(acceleration) = dataset.acceleration.as_ref() {
+        } else if let Some(acceleration) = source.acceleration() {
             let mut acceleration_params = acceleration.params.clone();
 
             acceleration_params.insert("data_directory".to_string(), spice_data_base_path());
@@ -120,8 +126,8 @@ impl SqliteAccelerator {
     }
 
     /// Returns the `Sqlite` `busy_timeout` param that would be used for setting the `busy_timeout` in `Sqlite` accelerator for this dataset, default to 5000 milliseconds
-    pub fn sqlite_busy_timeout(&self, dataset: &Dataset) -> Result<Duration> {
-        if let Some(acceleration) = dataset.acceleration.as_ref() {
+    pub fn sqlite_busy_timeout(&self, source: &dyn AccelerationSource) -> Result<Duration> {
+        if let Some(acceleration) = source.acceleration() {
             let acceleration_params = acceleration.params.clone();
             return self
                 .sqlite_factory
@@ -132,22 +138,22 @@ impl SqliteAccelerator {
     }
 
     /// Returns an existing `SQLite` connection pool for the given dataset, or creates a new one if it doesn't exist.
-    pub async fn get_shared_pool(&self, dataset: &Dataset) -> Result<SqliteConnectionPool> {
-        let sqlite_file = self.sqlite_file_path(dataset)?;
+    pub async fn get_shared_pool(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<SqliteConnectionPool> {
+        let sqlite_file = self.sqlite_file_path(source)?;
 
-        let acceleration = dataset
-            .acceleration
-            .as_ref()
-            .context(AccelerationNotEnabledSnafu {
-                dataset: dataset.name.to_string(),
-            })?;
+        let acceleration = source.acceleration().context(AccelerationNotEnabledSnafu {
+            dataset: source.name().to_string(),
+        })?;
 
         let mode = match acceleration.mode {
             Mode::File => datafusion_table_providers::sql::db_connection_pool::Mode::File,
             Mode::Memory => datafusion_table_providers::sql::db_connection_pool::Mode::Memory,
         };
         let file_path: Arc<str> = sqlite_file.into();
-        let busy_timeout = self.sqlite_busy_timeout(dataset)?;
+        let busy_timeout = self.sqlite_busy_timeout(source)?;
 
         let pool = self
             .sqlite_factory
@@ -157,12 +163,6 @@ impl SqliteAccelerator {
             .context(AccelerationCreationFailedSnafu)?;
 
         Ok(pool)
-    }
-}
-
-impl Default for SqliteAccelerator {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -186,20 +186,20 @@ impl DataAccelerator for SqliteAccelerator {
         vec!["sqlite", "db"]
     }
 
-    fn file_path(&self, dataset: &Dataset) -> Result<String, DataAcceleratorError> {
-        self.sqlite_file_path(dataset)
+    fn file_path(&self, source: &dyn AccelerationSource) -> Result<String, DataAcceleratorError> {
+        self.sqlite_file_path(source)
             .map_err(|err| DataAcceleratorError::InvalidConfiguration {
                 msg: err.to_string(),
             })
     }
 
-    fn is_initialized(&self, dataset: &Dataset) -> bool {
-        if !dataset.is_file_accelerated() {
+    fn is_initialized(&self, source: &dyn AccelerationSource) -> bool {
+        if !source.is_file_accelerated() {
             return true; // memory mode SQLite is always initialized
         }
 
         // otherwise, we're initialized if the file exists
-        self.has_existing_file(dataset)
+        self.has_existing_file(source)
     }
 
     /// Initializes an SQLite database for the dataset
@@ -208,19 +208,19 @@ impl DataAccelerator for SqliteAccelerator {
     /// Federation then requires that all attached databases exist before dataset registration.
     async fn init(
         &self,
-        dataset: &Dataset,
+        source: &dyn AccelerationSource,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        if !dataset.is_file_accelerated() {
+        if !source.is_file_accelerated() {
             return Ok(());
         }
 
-        let path = self.file_path(dataset)?;
+        let path = self.file_path(source)?;
 
-        if let Some(acceleration) = &dataset.acceleration {
+        if let Some(acceleration) = source.acceleration() {
             if !acceleration.params.contains_key("sqlite_file") {
                 make_spice_data_directory()
                     .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
-            } else if !self.is_valid_file(dataset) {
+            } else if !self.is_valid_file(source) {
                 if std::path::Path::new(&path).is_dir() {
                     return Err(Error::InvalidFileIsDirectory.into());
                 }
@@ -237,7 +237,7 @@ impl DataAccelerator for SqliteAccelerator {
                 .into());
             }
 
-            self.get_shared_pool(dataset).await?;
+            self.get_shared_pool(source).await?;
         }
 
         Ok(())
@@ -246,47 +246,54 @@ impl DataAccelerator for SqliteAccelerator {
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
-        cmd: &CreateExternalTable,
-        dataset: Option<&Dataset>,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
-        let mut cmd = cmd.clone();
+        mut cmd: CreateExternalTable,
+        source: Option<&dyn AccelerationSource>,
+        partition_by: Option<PartitionBy>,
+    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
+        ensure!(
+            partition_by.is_none(),
+            super::InvalidConfigurationSnafu {
+                msg: "Sqlite data accelerator does not support the `partition_by` parameter but it was provided".to_string()
+            }
+        );
 
-        if let Some(this_dataset) = dataset {
-            if this_dataset.is_file_accelerated() {
+        if let Some(source) = source {
+            if source.is_file_accelerated() {
                 // If the user didn't specify a SQLite file and this is a file-mode SQLite,
                 // then use the shared SQLite file `accelerated_sqlite.db`
                 if !cmd.options.contains_key("file") {
-                    let sqlite_file = self.sqlite_file_path(this_dataset)?;
+                    let sqlite_file = self.sqlite_file_path(source)?;
                     cmd.options.insert("file".to_string(), sqlite_file);
                 }
 
-                if let Some(app) = &this_dataset.app {
-                    let datasets =
-                        Runtime::get_initialized_datasets(app, crate::LogErrors(false)).await;
-                    let self_path = self.file_path(this_dataset)?;
-                    let attach_databases =
-                        datasets
-                            .iter()
-                            .filter_map(|other_dataset| {
-                                if other_dataset.acceleration.as_ref().is_some_and(|a| {
-                                    a.engine == Engine::Sqlite && a.mode == Mode::File
-                                }) {
-                                    if **other_dataset == *this_dataset {
-                                        None
-                                    } else {
-                                        let other_path = self.file_path(other_dataset);
-                                        other_path.ok().filter(|p| p != &self_path)
-                                    }
-                                } else {
-                                    None
-                                }
-                            })
-                            .collect::<Vec<_>>();
+                let datasets = source
+                    .runtime()
+                    .get_initialized_datasets(&source.app(), crate::LogErrors(false))
+                    .await;
+                let self_path = self.file_path(source)?;
+                let attach_databases = datasets
+                    .iter()
+                    .filter_map(|other_dataset| {
+                        if other_dataset
+                            .acceleration
+                            .as_ref()
+                            .is_some_and(|a| a.engine == Engine::Sqlite && a.mode == Mode::File)
+                        {
+                            if other_dataset.name() == source.name() {
+                                None
+                            } else {
+                                let other_path = self.file_path(other_dataset.as_ref());
+                                other_path.ok().filter(|p| p != &self_path)
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .collect::<Vec<_>>();
 
-                    if !attach_databases.is_empty() {
-                        cmd.options
-                            .insert("attach_databases".to_string(), attach_databases.join(";"));
-                    }
+                if !attach_databases.is_empty() {
+                    cmd.options
+                        .insert("attach_databases".to_string(), attach_databases.join(";"));
                 }
             }
         }
@@ -306,11 +313,13 @@ impl DataAccelerator for SqliteAccelerator {
         let sqlite_writer = Arc::new(sqlite_writer.clone());
         let cloned_writer = Arc::clone(&sqlite_writer);
 
-        Ok(Arc::new(PolyTableProvider::new(
+        let table_provider = Arc::new(PolyTableProvider::new(
             cloned_writer,
             sqlite_writer,
             read_provider,
-        )))
+        ));
+
+        Ok((table_provider, Behaviors::default()))
     }
 
     fn prefix(&self) -> &'static str {
@@ -335,7 +344,7 @@ mod tests {
     use datafusion::{
         common::{Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
-        logical_expr::{cast, col, dml::InsertOp, lit, CreateExternalTable},
+        logical_expr::{CreateExternalTable, cast, col, dml::InsertOp, lit},
         physical_plan::collect,
         scalar::ScalarValue,
     };
@@ -343,7 +352,7 @@ mod tests {
 
     use crate::component::dataset::acceleration::Acceleration;
     use crate::component::dataset::acceleration::{Engine, Mode};
-    use crate::component::dataset::Dataset;
+    use crate::component::dataset::builder::DatasetBuilder;
     use crate::dataaccelerator::sqlite::SqliteAccelerator;
 
     #[tokio::test]
@@ -370,8 +379,8 @@ mod tests {
             temporary: false,
         };
         let ctx = SessionContext::new();
-        let table = SqliteAccelerator::new()
-            .create_external_table(&external_table, None)
+        let (table, _) = SqliteAccelerator::new()
+            .create_external_table(external_table, None, None)
             .await
             .expect("table should be created");
 
@@ -446,11 +455,18 @@ mod tests {
 
     #[tokio::test]
     async fn test_sqlite_file_initialization() {
-        let mut dataset = Dataset::try_new(
+        let app = app::AppBuilder::new("test").build();
+        let rt = crate::Runtime::builder().build().await;
+
+        let mut dataset = DatasetBuilder::try_new(
             "sqlite_file_accelerator_init".to_string(),
             "sqlite_file_accelerator_init",
         )
-        .expect("dataset should be created");
+        .expect("Failed to create builder")
+        .with_app(Arc::new(app))
+        .with_runtime(Arc::new(rt))
+        .build()
+        .expect("Failed to build dataset");
 
         dataset.acceleration = Some(Acceleration {
             engine: Engine::Sqlite,

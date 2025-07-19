@@ -30,12 +30,14 @@ import (
 	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
+	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
 
 const (
-	limitKeyFlag = "limit"
+	limitKeyFlag     = "limit"
+	cacheControlFlag = "cache-control"
 )
 
 type SearchRequest struct {
@@ -47,15 +49,16 @@ type SearchRequest struct {
 }
 
 type SearchMatch struct {
-	Value      string                 `json:"value"`
+	Matches    map[string]string      `json:"matches"`
 	Score      float64                `json:"score"`
 	Dataset    string                 `json:"dataset"`
 	PrimaryKey map[string]interface{} `json:"primary_key"`
 	Metadata   map[string]interface{} `json:"metadata"`
+	Data       map[string]interface{} `json:"data"`
 }
 
 type SearchResponse struct {
-	Matches    []SearchMatch `json:"matches"`
+	Results    []SearchMatch `json:"results"`
 	DurationMs uint64        `json:"duration_ms"`
 }
 
@@ -70,10 +73,13 @@ spice search
 spice search --cloud
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
-		rtcontext := context.NewContext().WithCloud(cloud)
+		rtcontext, err := context.FromFlags(cmd.Flags())
+		if err != nil {
+			slog.Error("failed to initialize runtime context", "error", err)
+			os.Exit(1)
+		}
 
-		if !cloud {
+		if !rtcontext.IsCloud() {
 			rtcontext.RequireModelsFlavor(cmd)
 		}
 
@@ -92,20 +98,6 @@ spice search --cloud
 			}
 		}
 
-		httpEndpoint, err := cmd.Flags().GetString("http-endpoint")
-		if err != nil {
-			slog.Error("could not get http-endpoint flag", "error", err)
-			os.Exit(1)
-		}
-		if httpEndpoint != "" {
-			rtcontext.SetHttpEndpoint(httpEndpoint)
-		}
-
-		apiKey, _ := cmd.Flags().GetString("api-key")
-		if apiKey != "" {
-			rtcontext.SetApiKey(apiKey)
-		}
-
 		matches := map[string][]SearchMatch{}
 
 		limit, err := cmd.Flags().GetUint(limitKeyFlag)
@@ -114,9 +106,24 @@ spice search --cloud
 			os.Exit(1)
 		}
 
+		cache_control, err := cmd.Flags().GetString(cacheControlFlag)
+		if err != nil {
+			slog.Error("could not get cache control flag", "error", err)
+			os.Exit(1)
+		}
+
+		if cache_control != "cache" && cache_control != "no-cache" {
+			slog.Error("invalid value for cache-control flag. Possible values: cache, no-cache")
+			os.Exit(1)
+		}
+
 		line := liner.NewLiner()
 		line.SetCtrlCAborts(true)
-		defer line.Close()
+		defer func() {
+			if err := line.Close(); err != nil {
+				slog.Error("closing line", "error", err)
+			}
+		}()
 		for {
 			message, err := line.Prompt("search> ")
 			if err == liner.ErrPromptAborted {
@@ -144,7 +151,7 @@ spice search --cloud
 					Text:     message,
 					Datasets: nil, // search across all datasets containing embeddings
 					Limit:    limit,
-				})
+				}, cache_control)
 				if err != nil {
 					slog.Error("failed to send search request to spiced", "error", err)
 					out <- nil
@@ -171,59 +178,50 @@ spice search --cloud
 				continue
 			}
 
-			var searchResponse SearchResponse = SearchResponse{}
+			var searchResponse = SearchResponse{}
 			err = json.Unmarshal([]byte(raw), &searchResponse)
 			if err != nil {
 				slog.Error("parsing response from spiced", "error", err)
 				continue
 			}
 
-			for i, match := range searchResponse.Matches {
+			for i, match := range searchResponse.Results {
 				cmd.Printf("Rank %d, Score: %0.1f, Datasets [%s]", i+1, match.Score*100, match.Dataset)
 				if len(match.PrimaryKey) > 0 {
 					for key, value := range match.PrimaryKey {
 						cmd.Printf(" %s=%v", key, value)
 					}
 				}
-				cmd.Printf("\n%s\n\n", match.Value)
+				if len(match.Matches) == 1 {
+					// This will only print a single line.
+					for _, value := range match.Matches {
+						cmd.Printf("\n%s", value)
+					}
+				} else {
+					for col, value := range match.Matches {
+						cmd.Printf("\n%s: %s", col, value)
+					}
+				}
+				cmd.Print("\n\n")
 			}
 
-			matches[message] = append(matches[message], searchResponse.Matches...)
-			cmd.Printf("Time: %s. %d results.\n\n", time.Duration(searchResponse.DurationMs)*time.Millisecond, len(searchResponse.Matches))
+			matches[message] = append(matches[message], searchResponse.Results...)
+			cmd.Printf("Time: %s. %d results.\n\n", time.Duration(searchResponse.DurationMs)*time.Millisecond, len(searchResponse.Results))
 		}
 	},
 }
 
-func sendSearchRequest(rtcontext *context.RuntimeContext, body *SearchRequest) (*http.Response, error) {
+func sendSearchRequest(rtcontext *context.RuntimeContext, body *SearchRequest, cache_control string) (*http.Response, error) {
 	jsonBody, err := json.Marshal(body)
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling search request body: %w", err)
 	}
-
-	url := fmt.Sprintf("%s/v1/search", rtcontext.HttpEndpoint())
-	request, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, fmt.Errorf("error creating search request: %w", err)
-	}
-
-	headers := rtcontext.GetHeaders()
-	for key, value := range headers {
-		request.Header.Set(key, value)
-	}
-	request.Header.Set("Content-Type", "application/json")
-
-	response, err := rtcontext.Client().Do(request)
-	if err != nil {
-		return nil, fmt.Errorf("error sending request: %w", err)
-	}
-
-	return response, nil
+	return rtcontext.Do("POST", "/v1/search", bytes.NewReader(jsonBody), "Content-Type", "application/json", "Cache-Control", cache_control)
 }
 
 func init() {
-	searchCmd.Flags().Bool(cloudKeyFlag, false, "Use cloud instance for search (default: false)")
-	searchCmd.Flags().String(modelKeyFlag, "", "Model to use for search")
-	searchCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for search (default: http://localhost:8090)")
+	searchCmd.Flags().String("cache-control", "cache", "Control whether the results cache is used for searches. [possible values: cache, no-cache]")
+	searchCmd.Flags().String(constants.ModelKeyFlag, "", "Model to use for search")
 	searchCmd.Flags().Uint(limitKeyFlag, 10, "Limit number of search results")
 
 	RootCmd.AddCommand(searchCmd)

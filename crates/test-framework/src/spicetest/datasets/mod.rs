@@ -16,10 +16,17 @@ limitations under the License.
 
 use std::{
     collections::BTreeMap,
+    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric, ThroughputMetrics};
+use crate::{
+    metrics::{
+        DatasetMetrics, MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus,
+        ThroughputMetrics, system_time_to_unix_epoch_ms,
+    },
+    queries::Query,
+};
 use anyhow::Result;
 use futures::future::join_all;
 use indicatif::{MultiProgress, ProgressBar};
@@ -27,7 +34,7 @@ use tokio::task::JoinHandle;
 
 use super::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 mod worker;
-use worker::{SpiceTestQueryWorker, SpiceTestQueryWorkerResult};
+pub(crate) use worker::{SpiceTestQueryWorker, SpiceTestQueryWorkerResult};
 
 #[derive(Debug, Clone, Copy)]
 pub enum EndCondition {
@@ -53,10 +60,13 @@ impl EndCondition {
 
 #[derive(Default)]
 pub struct NotStarted {
-    query_set: Vec<(&'static str, &'static str)>,
+    query_set: Vec<Query>,
     end_condition: EndCondition,
     query_count: usize,
     parallel_count: usize,
+    validate: bool,
+    disable_caching: bool,
+    scale_factor: f64,
 }
 
 impl NotStarted {
@@ -66,13 +76,19 @@ impl NotStarted {
     }
 
     #[must_use]
+    pub fn with_disable_caching(mut self, disable_caching: bool) -> Self {
+        self.disable_caching = disable_caching;
+        self
+    }
+
+    #[must_use]
     pub fn with_parallel_count(mut self, parallel_count: usize) -> Self {
         self.parallel_count = parallel_count;
         self
     }
 
     #[must_use]
-    pub fn with_query_set(mut self, query_set: Vec<(&'static str, &'static str)>) -> Self {
+    pub fn with_query_set(mut self, query_set: Vec<Query>) -> Self {
         self.query_count = query_set.len();
         self.query_set = query_set;
         self
@@ -81,6 +97,18 @@ impl NotStarted {
     #[must_use]
     pub fn with_end_condition(mut self, end_condition: EndCondition) -> Self {
         self.end_condition = end_condition;
+        self
+    }
+
+    #[must_use]
+    pub fn with_validate(mut self, validate: bool) -> Self {
+        self.validate = validate;
+        self
+    }
+
+    #[must_use]
+    pub fn with_scale_factor(mut self, scale_factor: f64) -> Self {
+        self.scale_factor = scale_factor;
         self
     }
 }
@@ -93,14 +121,18 @@ pub struct Running {
     progress_bar: Option<MultiProgress>,
     query_count: usize,
     parallel_count: usize,
+    end_condition: EndCondition,
 }
 pub struct Completed {
-    query_durations: BTreeMap<String, Vec<Duration>>,
-    row_counts: BTreeMap<String, Vec<usize>>,
-    test_duration: Duration,
-    end_time: SystemTime,
-    query_count: usize,
-    parallel_count: usize,
+    pub(crate) query_durations: BTreeMap<Arc<str>, Vec<Duration>>,
+    pub(crate) query_iteration_durations: BTreeMap<Arc<str>, (SystemTime, SystemTime)>,
+    pub(crate) row_counts: BTreeMap<Arc<str>, Vec<usize>>,
+    pub(crate) query_statuses: BTreeMap<Arc<str>, QueryStatus>,
+    pub(crate) test_duration: Duration,
+    pub(crate) end_time: SystemTime,
+    pub(crate) query_count: usize,
+    pub(crate) parallel_count: usize,
+    pub(crate) end_condition: EndCondition,
 }
 
 impl TestState for NotStarted {}
@@ -143,15 +175,24 @@ impl SpiceTest<NotStarted> {
             None
         };
 
-        let flight_client = self.spiced_instance.flight_client().await?;
+        let spice_client = self
+            .get_spiced()?
+            .spice_client(self.api_key.clone(), self.state.disable_caching)
+            .await?;
+
         let query_workers = (0..self.state.parallel_count)
             .map(|id| {
                 let worker = SpiceTestQueryWorker::new(
                     id,
                     self.state.query_set.clone(),
                     self.state.end_condition,
-                    flight_client.clone(),
-                );
+                    spice_client.clone(),
+                    self.name.clone(),
+                )
+                .with_explain_plan_snapshot(self.explain_plan_snapshot)
+                .with_results_snapshot(self.results_snapshot_predicate)
+                .with_validate(self.state.validate)
+                .with_scale_factor(self.state.scale_factor);
 
                 if let Some(multi) = &multi {
                     worker.with_progress_bar(multi.add(self.get_new_progress_bar()))
@@ -167,12 +208,16 @@ impl SpiceTest<NotStarted> {
             spiced_instance: self.spiced_instance,
             start_time: self.start_time,
             use_progress_bars: self.use_progress_bars,
+            api_key: self.api_key,
+            explain_plan_snapshot: self.explain_plan_snapshot,
+            results_snapshot_predicate: self.results_snapshot_predicate,
             state: Running {
                 start_time: Instant::now(),
                 query_workers,
                 progress_bar: multi,
                 query_count: self.state.query_count,
                 parallel_count: self.state.parallel_count,
+                end_condition: self.state.end_condition,
             },
         })
     }
@@ -181,9 +226,11 @@ impl SpiceTest<NotStarted> {
 impl SpiceTest<Running> {
     pub async fn wait(self) -> Result<SpiceTest<Completed>> {
         let mut query_durations = BTreeMap::new();
+        let mut query_iteration_durations = BTreeMap::new();
         let mut row_counts = BTreeMap::new();
-        for query_duration in join_all(self.state.query_workers).await {
-            let worker_result = query_duration??;
+        let mut query_statuses = BTreeMap::new();
+        for worker_result in join_all(self.state.query_workers).await {
+            let worker_result = worker_result??;
             if worker_result.connection_failed {
                 return Err(anyhow::anyhow!(
                     "Test failed - a connection failed during the test"
@@ -197,11 +244,33 @@ impl SpiceTest<Running> {
                     .extend(duration);
             }
 
+            for (query, iteration_durations) in worker_result.query_iteration_durations {
+                query_iteration_durations
+                    .entry(query)
+                    .or_insert_with(|| iteration_durations);
+            }
+
             for (query, query_row_counts) in worker_result.row_counts {
                 row_counts
                     .entry(query)
                     .or_insert_with(Vec::new)
                     .extend(query_row_counts);
+            }
+
+            for (query, worker_status) in worker_result.query_statuses {
+                query_statuses
+                    .entry(query)
+                    .and_modify(|existing_status| {
+                        // If the worker reports failure, update the status to Failed
+                        if matches!(existing_status, QueryStatus::Failed(_)) {
+                            return; // don't update any existing status message
+                        }
+
+                        if matches!(worker_status, QueryStatus::Failed(_)) {
+                            *existing_status = worker_status.clone();
+                        }
+                    })
+                    .or_insert(worker_status);
             }
         }
 
@@ -214,13 +283,19 @@ impl SpiceTest<Running> {
             spiced_instance: self.spiced_instance,
             start_time: self.start_time,
             use_progress_bars: self.use_progress_bars,
+            api_key: self.api_key,
+            explain_plan_snapshot: self.explain_plan_snapshot,
+            results_snapshot_predicate: self.results_snapshot_predicate,
             state: Completed {
                 query_durations,
+                query_iteration_durations,
                 row_counts,
+                query_statuses,
                 test_duration: self.state.start_time.elapsed(),
                 end_time: SystemTime::now(),
                 query_count: self.state.query_count,
                 parallel_count: self.state.parallel_count,
+                end_condition: self.state.end_condition,
             },
         })
     }
@@ -228,8 +303,16 @@ impl SpiceTest<Running> {
 
 impl SpiceTest<Completed> {
     #[must_use]
-    pub fn get_query_durations(&self) -> &BTreeMap<String, Vec<Duration>> {
+    pub fn get_query_durations(&self) -> &BTreeMap<Arc<str>, Vec<Duration>> {
         &self.state.query_durations
+    }
+
+    /// Returns the start and end time of for all consecutive query iterations of the same query in a set.
+    ///
+    /// Only valid when the `EndCondition` is `QuerySetCompleted`.
+    #[must_use]
+    pub fn get_query_iteration_durations(&self) -> &BTreeMap<Arc<str>, (SystemTime, SystemTime)> {
+        &self.state.query_iteration_durations
     }
 
     #[must_use]
@@ -245,14 +328,29 @@ impl SpiceTest<Completed> {
     pub fn get_throughput_metric(&self, scale: f64) -> Result<f64> {
         // metric = (Parallel Query Count * Test Suite Query Count * 3600) / Cs * Scale
         let lhs = self.state.parallel_count * self.state.query_count * 3600;
-        let rhs = self.get_cumulative_query_duration().as_secs_f64() * scale;
+
         // u32 is safe because lhs is unlikely to be greater than u32::MAX unless some extreme parameters are used (more than 1000 parallel and query count)
-        Ok(f64::from(u32::try_from(lhs)?) / rhs)
+        let lhs = f64::from(u32::try_from(lhs)?);
+
+        // because we perform query sets one after the other, we're not 100% like the original TPCH QpH metric because it expects to only run once
+        // apply a modifier based on the query set count
+        // e.g. query set count of 5, means our calculated QpH needs to be times 5 because we ran 5 query sets
+        // this adjusts for a longer test duration as a result of running multiple query sets, which would otherwise reduce the QpH
+        let end_condition_modifier = match self.state.end_condition {
+            EndCondition::Duration(_) => {
+                return Err(anyhow::anyhow!(
+                    "Throughput metric calculation for duration-based tests is not supported. Use a QuerySetCompleted test instead."
+                ));
+            }
+            EndCondition::QuerySetCompleted(count) => f64::from(u32::try_from(count)?),
+        };
+
+        Ok((lhs / self.state.test_duration.as_secs_f64()) * scale * end_condition_modifier)
     }
 
     /// Validates that row counts are consistent across queries
     /// Each query should return the same number of rows
-    pub fn validate_returned_row_counts(&self) -> Result<BTreeMap<String, usize>> {
+    pub fn validate_returned_row_counts(&self) -> Result<BTreeMap<Arc<str>, usize>> {
         // validate that row counts are consistent across queries - each query should return the same number of rows
         let mut returned_row_counts = BTreeMap::new();
         for (query, counts) in &self.state.row_counts {
@@ -266,10 +364,19 @@ impl SpiceTest<Completed> {
                 ));
             }
 
-            returned_row_counts.insert(query.clone(), *first);
+            returned_row_counts.insert(Arc::clone(query), *first);
         }
 
         Ok(returned_row_counts)
+    }
+
+    /// Returns true if every query status is passed. Returns false if any query status is failed.
+    #[must_use]
+    pub fn succeeded(&self) -> bool {
+        self.state
+            .query_statuses
+            .values()
+            .all(|status| status == &QueryStatus::Passed)
     }
 }
 
@@ -285,7 +392,7 @@ impl std::fmt::Display for SpiceTest<Completed> {
     }
 }
 
-impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Completed> {
+impl MetricCollector<DatasetMetrics, NoExtendedMetrics> for SpiceTest<Completed> {
     fn start_time(&self) -> SystemTime {
         self.start_time
     }
@@ -298,10 +405,43 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
         self.name.clone()
     }
 
-    fn metrics(&self) -> Result<Vec<QueryMetric<NoExtendedMetrics>>> {
+    fn spiced_version(&self) -> Result<&str> {
+        let spiced_instance = self.spiced_instance.as_ref().ok_or(
+            anyhow::anyhow!(
+                "Spiced instance is not available. SpiceTest must be started before metrics can be collected."
+            ))?;
+
+        Ok(spiced_instance.version())
+    }
+
+    fn metrics(&self) -> Result<Vec<QueryMetric<DatasetMetrics>>> {
         self.get_query_durations()
             .iter()
-            .map(|(query, durations)| QueryMetric::new_from_durations(query, durations))
+            .map(|(query, durations)| {
+                let query_iteration_durations = self.state.query_iteration_durations.get(query);
+                let query_start_time =
+                    query_iteration_durations.map_or(self.start_time, |(start, _)| *start);
+                let query_end_time =
+                    query_iteration_durations.map_or(self.state.end_time, |(_, end)| *end);
+                let query_status = self
+                    .state
+                    .query_statuses
+                    .get(query)
+                    .unwrap_or(&QueryStatus::Failed(None))
+                    .to_owned();
+
+                let metric = QueryMetric::new_from_durations(
+                    Arc::clone(query),
+                    durations,
+                    query_status,
+                    system_time_to_unix_epoch_ms(query_start_time)?,
+                    system_time_to_unix_epoch_ms(query_end_time)?,
+                );
+
+                metric.map(|metric| {
+                    metric.with_extended_metrics(DatasetMetrics::new(self.name.clone()))
+                })
+            })
             .collect::<Result<Vec<_>>>()
     }
 }
@@ -319,10 +459,39 @@ impl MetricCollector<NoExtendedMetrics, ThroughputMetrics> for SpiceTest<Complet
         self.name.clone()
     }
 
+    fn spiced_version(&self) -> Result<&str> {
+        let spiced_instance = self.spiced_instance.as_ref().ok_or(
+            anyhow::anyhow!(
+                "Spiced instance is not available. SpiceTest must be started before metrics can be collected."
+            ))?;
+
+        Ok(spiced_instance.version())
+    }
+
     fn metrics(&self) -> Result<Vec<QueryMetric<NoExtendedMetrics>>> {
         self.get_query_durations()
             .iter()
-            .map(|(query, durations)| QueryMetric::new_from_durations(query, durations))
+            .map(|(query, durations)| {
+                let query_iteration_durations = self.state.query_iteration_durations.get(query);
+                let query_start_time =
+                    query_iteration_durations.map_or(self.start_time, |(start, _)| *start);
+                let query_end_time =
+                    query_iteration_durations.map_or(self.state.end_time, |(_, end)| *end);
+                let query_status = self
+                    .state
+                    .query_statuses
+                    .get(query)
+                    .unwrap_or(&QueryStatus::Failed(None))
+                    .to_owned();
+
+                QueryMetric::new_from_durations(
+                    Arc::clone(query),
+                    durations,
+                    query_status,
+                    system_time_to_unix_epoch_ms(query_start_time)?,
+                    system_time_to_unix_epoch_ms(query_end_time)?,
+                )
+            })
             .collect::<Result<Vec<_>>>()
     }
 }

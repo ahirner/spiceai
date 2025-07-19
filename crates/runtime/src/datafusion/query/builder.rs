@@ -16,16 +16,18 @@ limitations under the License.
 
 use std::{collections::HashSet, sync::Arc};
 
+use datafusion::common::ParamValues;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::datafusion::DataFusion;
+use crate::datafusion::{DataFusion, query::QueryMethod};
 
-use super::{tracker::QueryTracker, Query};
+use super::{Query, tracker::QueryTracker};
 
 pub struct QueryBuilder<'a> {
     df: Arc<DataFusion>,
     sql: &'a str,
+    parameters: Option<ParamValues>,
     query_id: Uuid,
 }
 
@@ -34,6 +36,7 @@ impl<'a> QueryBuilder<'a> {
         Self {
             df,
             sql,
+            parameters: None,
             query_id: Uuid::new_v4(),
         }
     }
@@ -45,12 +48,16 @@ impl<'a> QueryBuilder<'a> {
     }
 
     #[must_use]
+    pub fn parameters(mut self, parameters: ParamValues) -> Self {
+        self.parameters = Some(parameters);
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> Query {
         let sql: Arc<str> = self.sql.into();
-        Query {
-            df: Arc::clone(&self.df),
-            sql: Arc::clone(&sql),
-            tracker: QueryTracker {
+        let tracker = if self.df.task_history_enabled {
+            Some(QueryTracker {
                 schema: None,
                 query_duration_secs: None,
                 query_execution_duration_secs: None,
@@ -62,7 +69,18 @@ impl<'a> QueryBuilder<'a> {
                 query_duration_timer: Instant::now(),
                 query_execution_duration_timer: Instant::now(),
                 datasets: Arc::new(HashSet::default()),
+            })
+        } else {
+            None
+        };
+
+        Query {
+            df: Arc::clone(&self.df),
+            sql: QueryMethod::Text {
+                sql: Arc::clone(&sql),
+                parameters: self.parameters,
             },
+            tracker,
         }
     }
 }

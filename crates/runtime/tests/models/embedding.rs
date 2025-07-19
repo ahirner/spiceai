@@ -23,7 +23,7 @@ use crate::{
 use app::AppBuilder;
 use async_openai::types::{CreateEmbeddingResponse, EmbeddingInput};
 use core::time;
-use runtime::{auth::EndpointAuth, Runtime};
+use runtime::{Runtime, auth::EndpointAuth};
 use spicepod::component::embeddings::Embeddings;
 use std::sync::Arc;
 
@@ -199,7 +199,7 @@ async fn start_runtime_with_embedding(
         () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
             return Err(anyhow::anyhow!("Timed out waiting for components to load"));
         }
-        () = rt.load_components() => {}
+        () = Arc::clone(&rt).load_components() => {}
     }
 
     match ready_timeout {

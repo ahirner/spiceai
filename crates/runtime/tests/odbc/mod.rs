@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::configure_test_datafusion;
 use app::AppBuilder;
 use futures::TryStreamExt;
 use runtime::Runtime;
@@ -22,17 +23,15 @@ use std::time::Duration;
 use tracing::instrument;
 
 use crate::{
-    init_tracing,
+    RecordBatch, init_tracing,
     utils::{test_request_context, wait_until_true},
-    RecordBatch,
 };
 
 use std::collections::HashMap;
 
-use spicepod::component::{
-    dataset::{acceleration::Acceleration, Dataset},
-    params::Params as DatasetParams,
-};
+use spicepod::acceleration::Acceleration;
+use spicepod::acceleration::RefreshMode;
+use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 
 // This method is only used in tests
 #[allow(clippy::expect_used)]
@@ -50,9 +49,9 @@ fn make_databricks_odbc(path: &str, name: &str, acceleration: bool, engine: &str
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset.acceleration = Some(Acceleration {
         enabled: acceleration,
-        mode: spicepod::component::dataset::acceleration::Mode::Memory,
+        mode: spicepod::acceleration::Mode::Memory,
         engine: Some(engine.to_string()),
-        refresh_mode: Some(spicepod::component::dataset::acceleration::RefreshMode::Full),
+        refresh_mode: Some(RefreshMode::Full),
         refresh_sql: Some(format!("SELECT * FROM {name} LIMIT 10")),
         ..Default::default()
     });
@@ -65,6 +64,10 @@ fn make_databricks_odbc(path: &str, name: &str, acceleration: bool, engine: &str
 // Running this test in local requires ODBC setup in local, check https://github.com/spiceai/spiceai/pull/1204 to see the details
 
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn databricks_odbc() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -79,21 +82,20 @@ async fn databricks_odbc() -> Result<(), String> {
                 ))
                 .build();
 
-            let status = runtime::status::RuntimeStatus::new();
-            let df = crate::get_test_datafusion(Arc::clone(&status));
-
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
 
+            let cloned_rt = Arc::new(rt.clone());
+
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             let query_result = rt
@@ -119,6 +121,10 @@ async fn databricks_odbc() -> Result<(), String> {
 
 #[tokio::test]
 #[instrument]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn databricks_odbc_with_acceleration() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -139,20 +145,21 @@ async fn databricks_odbc_with_acceleration() -> Result<(), String> {
                         engine,
                     ))
                     .build();
-                let status = runtime::status::RuntimeStatus::new();
-                let df = crate::get_test_datafusion(Arc::clone(&status));
+
                 let rt = Runtime::builder()
                     .with_app(app)
-                    .with_datafusion(df)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await;
+
+                let cloned_rt = Arc::new(rt.clone());
 
                 // Set a timeout for the test
                 tokio::select! {
                     () = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
                         return Err("Timed out waiting for datasets to load".to_string());
                     }
-                    () = rt.load_components() => {}
+                    () = cloned_rt.load_components() => {}
                 }
 
                 assert!(

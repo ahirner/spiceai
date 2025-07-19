@@ -17,30 +17,34 @@ limitations under the License.
 use std::collections::HashSet;
 use std::fmt::Display;
 use std::fmt::Formatter;
-use std::hash::DefaultHasher;
-use std::hash::Hash;
 use std::hash::Hasher;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
-use arrow::array::RecordBatch;
-use arrow::datatypes::Schema;
 use async_trait::async_trait;
 use byte_unit::Byte;
-use datafusion::execution::SendableRecordBatchStream;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::TableReference;
 use fundu::ParseError;
-use lru_cache::LruCache;
+use key::CacheKey;
+use key::RawCacheKey;
+use result::query::CachedQueryResult;
+use result::search::CachedSearchResult;
 use snafu::{ResultExt, Snafu};
-use spicepod::component::runtime::ResultsCache;
+use spicepod::component::caching::HashingAlgorithm;
 
-mod lru_cache;
+pub mod lru_cache;
 mod metrics;
+mod simple_cache;
 mod utils;
 
+pub mod key;
+pub mod result;
+
+pub use lru_cache::LruCache;
+pub use simple_cache::SimpleCache;
+use spicepod::component::caching::SQLResultsCacheConfig;
 pub use utils::get_logical_plan_input_tables;
 pub use utils::to_cached_record_batch_stream;
 
@@ -57,72 +61,150 @@ pub enum Error {
         source: moka::PredicateError,
         table_name: Arc<str>,
     },
+
+    #[snafu(display(
+        "Cache invalidation failed with error: {source}.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToInvalidateCacheGeneric { source: moka::PredicateError },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub struct QueryResult {
-    pub data: SendableRecordBatchStream,
-    pub results_cache_status: QueryResultsCacheStatus,
+pub trait Sizeable {
+    fn get_memory_size(&self) -> usize;
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum QueryResultsCacheStatus {
-    // The request was not eligible for caching, and thus the results cache was not checked.
-    CacheDisabled,
-    // The request asked to bypass the cache, i.e. via `Cache-Control: no-cache`.
-    CacheBypass,
-    // The request was a cache hit.
-    CacheHit,
-    // The request was a cache miss.
-    CacheMiss,
+pub trait HashProvider {
+    fn hasher(&self) -> Box<dyn Hasher>;
 }
 
-impl QueryResult {
-    #[must_use]
-    pub fn new(
-        data: SendableRecordBatchStream,
-        results_cache_status: QueryResultsCacheStatus,
-    ) -> Self {
-        QueryResult {
-            data,
-            results_cache_status,
-        }
+/// Trait for types that can be converted to a set of table references.
+pub trait AsTableRefs {
+    fn as_table_refs(&self) -> Arc<HashSet<TableReference>>;
+}
+
+impl AsTableRefs for LogicalPlan {
+    fn as_table_refs(&self) -> Arc<HashSet<TableReference>> {
+        Arc::new(get_logical_plan_input_tables(self))
     }
 }
 
-#[derive(Clone)]
-pub struct CachedQueryResult {
-    pub records: Arc<Vec<RecordBatch>>,
-    pub schema: Arc<Schema>,
-    pub input_tables: Arc<HashSet<TableReference>>,
-}
-
 #[async_trait]
-pub trait QueryResultCache {
-    async fn get(&self, plan: &LogicalPlan) -> Result<Option<CachedQueryResult>>;
-    async fn put(&self, plan: &LogicalPlan, result: CachedQueryResult) -> Result<()>;
-    async fn put_key(&self, key: u64, result: CachedQueryResult) -> Result<()>;
-    async fn invalidate_for_table(&self, table_name: TableReference) -> Result<()>;
+pub trait CacheProvider<V: AsTableRefs + Clone + Send + Sync + 'static>:
+    HashProvider + std::fmt::Debug
+{
+    async fn get_raw_key(&self, key: &u64) -> Option<V>;
+    async fn put_raw_key(&self, key: &u64, value: V);
+    fn invalidate_all(&self);
+
+    /// Invalidates all cache entries for the specified table.
+    ///
+    /// # Errors
+    ///
+    /// If the cache invalidation fails.
+    fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()>;
     fn size_bytes(&self) -> u64;
     fn item_count(&self) -> u64;
+    fn max_size(&self) -> usize;
+    async fn checkpoint(&self);
 }
 
+#[derive(Default)]
+pub struct Caching {
+    pub results: Option<Arc<QueryResultsCacheProvider>>,
+    pub plans: Option<Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>>,
+    pub search: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for Caching {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Caching")
+            .field("results", &self.results)
+            .field("plans", &self.plans)
+            .field("search", &self.search)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Caching {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn with_results_cache(mut self, results: Arc<QueryResultsCacheProvider>) -> Self {
+        self.results = Some(results);
+        self
+    }
+
+    #[must_use]
+    pub fn with_plans_cache(
+        mut self,
+        plans: Arc<dyn CacheProvider<LogicalPlan> + Send + Sync>,
+    ) -> Self {
+        self.plans = Some(plans);
+        self
+    }
+
+    #[must_use]
+    pub fn with_search_cache(
+        mut self,
+        search: Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>,
+    ) -> Self {
+        self.search = Some(search);
+        self
+    }
+
+    /// Invalidates all configured caches for the specified table.
+    ///
+    /// This is purposely eager, as an invalidated cache is better than a stale one.
+    ///
+    /// # Errors
+    ///
+    /// If the cache invalidation fails for any of the caches.
+    pub fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
+        if let Some(results_cache) = &self.results {
+            results_cache.invalidate_for_table(table_ref.clone())?;
+        }
+        if let Some(plans_cache) = &self.plans {
+            plans_cache.invalidate_for_table(table_ref.clone())?;
+        }
+        if let Some(search_cache) = &self.search {
+            search_cache.invalidate_for_table(table_ref)?;
+        }
+        Ok(())
+    }
+}
+
+// TODO: sunset ``QueryResultsCacheProvider`` in favor of ``CacheProvider``?
 pub struct QueryResultsCacheProvider {
-    cache: Arc<dyn QueryResultCache + Send + Sync>,
+    cache: Arc<dyn CacheProvider<CachedQueryResult> + Send + Sync>,
     cache_max_size: u64,
     ttl: std::time::Duration,
-    metrics_reported_last_time: AtomicU64,
 
     ignore_schemas: Box<[Box<str>]>,
+}
+
+impl std::fmt::Debug for QueryResultsCacheProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("QueryResultsCacheProvider")
+            .field("cache_max_size", &self.cache_max_size)
+            .field("ttl", &self.ttl)
+            .field("ignore_schemas", &self.ignore_schemas)
+            .finish_non_exhaustive()
+    }
 }
 
 impl QueryResultsCacheProvider {
     /// # Errors
     ///
     /// Will return `Err` if method fails to parse cache params or to create the cache
-    pub fn try_new(config: &ResultsCache, ignore_schemas: Box<[Box<str>]>) -> Result<Self> {
-        let cache_max_size: u64 = match &config.cache_max_size {
+    pub fn try_new(
+        config: &SQLResultsCacheConfig,
+        ignore_schemas: Box<[Box<str>]>,
+    ) -> Result<Self> {
+        let cache_max_size: u64 = match &config.max_size {
             Some(cache_max_size) => Byte::parse_str(cache_max_size, true)
                 .context(FailedToParseCacheMaxSizeSnafu)?
                 .as_u64(),
@@ -135,14 +217,22 @@ impl QueryResultsCacheProvider {
         };
 
         let cache_provider = QueryResultsCacheProvider {
-            cache: Arc::new(LruCache::new(cache_max_size, ttl)),
+            cache: match config.hashing_algorithm {
+                HashingAlgorithm::Ahash => Arc::new(LruCache::new(
+                    cache_max_size,
+                    ttl,
+                    ahash::RandomState::default(),
+                )),
+                HashingAlgorithm::Siphash => Arc::new(LruCache::new(
+                    cache_max_size,
+                    ttl,
+                    std::hash::RandomState::default(),
+                )),
+            },
             cache_max_size,
             ttl,
-            metrics_reported_last_time: AtomicU64::new(0),
             ignore_schemas,
         };
-
-        metrics::MAX_SIZE_BYTES.record(cache_max_size, &[]);
 
         Ok(cache_provider)
     }
@@ -150,57 +240,56 @@ impl QueryResultsCacheProvider {
     /// # Errors
     ///
     /// Will return `Err` if method fails to access the cache
-    pub async fn get(&self, plan: &LogicalPlan) -> Result<Option<CachedQueryResult>> {
-        metrics::REQUESTS.add(1, &[]);
-        match self.cache.get(plan).await {
-            Ok(Some(cached_result)) => {
-                metrics::HITS.add(1, &[]);
-                Ok(Some(cached_result))
-            }
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
+    pub async fn get(&self, key: CacheKey<'_>) -> Result<Option<CachedQueryResult>> {
+        let raw_key = key.as_raw_key(self.cache.hasher());
+        self.get_raw_key(&raw_key).await
+    }
+
+    /// # Errors
+    ///
+    /// Will return `Err` if method fails to access the cache
+    pub async fn get_raw_key(&self, raw_key: &RawCacheKey) -> Result<Option<CachedQueryResult>> {
+        match self.cache.get_raw_key(&raw_key.as_u64()).await {
+            Some(cached_result) => Ok(Some(cached_result)),
+            None => Ok(None),
         }
     }
 
     /// # Errors
     ///
     /// Will return `Err` if method fails to access the cache
-    pub async fn put(&self, plan: &LogicalPlan, result: CachedQueryResult) -> Result<()> {
-        let res = self.cache.put(plan, result).await;
-        self.report_size_metrics();
-        res
+    pub async fn put(&self, key: CacheKey<'_>, result: CachedQueryResult) -> Result<()> {
+        let raw_key = key.as_raw_key(self.cache.hasher());
+        self.put_raw_key(&raw_key, result).await
     }
 
     /// # Errors
     ///
     /// Will return `Err` if method fails to access the cache
-    pub async fn put_key(&self, plan_key: u64, result: CachedQueryResult) -> Result<()> {
-        let res = self.cache.put_key(plan_key, result).await;
-        self.report_size_metrics();
-        res
-    }
-
-    fn report_size_metrics(&self) {
-        let now_seconds = current_time_secs();
-
-        if now_seconds - self.metrics_reported_last_time.load(Ordering::Relaxed) >= 5 {
-            self.metrics_reported_last_time
-                .store(now_seconds, Ordering::Relaxed);
-            metrics::SIZE_BYTES.record(self.size(), &[]);
-            metrics::ITEMS.record(self.item_count(), &[]);
-        }
+    pub async fn put_raw_key(
+        &self,
+        raw_key: &RawCacheKey,
+        result: CachedQueryResult,
+    ) -> Result<()> {
+        let res = self.cache.put_raw_key(&raw_key.as_u64(), result).await;
+        Ok(res)
     }
 
     /// # Errors
     ///
     /// Will return `Err` if method fails to invalidate cache for the table provided
-    pub async fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
-        self.cache.invalidate_for_table(table_name).await
+    pub fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
+        self.cache.invalidate_for_table(table_name)
     }
 
     #[must_use]
     pub fn max_size(&self) -> u64 {
         self.cache_max_size
+    }
+
+    #[must_use]
+    pub fn hasher(&self) -> Box<dyn Hasher> {
+        self.cache.hasher()
     }
 
     #[must_use]
@@ -255,18 +344,11 @@ impl Display for QueryResultsCacheProvider {
     }
 }
 
-fn current_time_secs() -> u64 {
+pub(crate) fn current_time_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-#[must_use]
-pub fn key_for_logical_plan(plan: &LogicalPlan) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    plan.hash(&mut hasher);
-    hasher.finish()
 }
 
 #[cfg(test)]
@@ -281,7 +363,7 @@ mod tests {
         let logical_plan = parse_sql_to_logical_plan(sql).await;
 
         let cache_provider =
-            QueryResultsCacheProvider::try_new(&ResultsCache::default(), Box::new([]))
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
         assert!(!cache_provider.cache_is_enabled_for_plan(&logical_plan));
@@ -293,7 +375,7 @@ mod tests {
         let logical_plan = parse_sql_to_logical_plan(sql).await;
 
         let cache_provider = QueryResultsCacheProvider::try_new(
-            &ResultsCache::default(),
+            &SQLResultsCacheConfig::default(),
             Box::new(["information_schema".into()]),
         )
         .expect("valid cache provider");
@@ -307,7 +389,7 @@ mod tests {
         let logical_plan = parse_sql_to_logical_plan(sql).await;
 
         let cache_provider =
-            QueryResultsCacheProvider::try_new(&ResultsCache::default(), Box::new([]))
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
                 .expect("valid cache provider");
 
         assert!(cache_provider.cache_is_enabled_for_plan(&logical_plan));

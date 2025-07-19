@@ -31,6 +31,7 @@ import (
 	"github.com/peterh/liner"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/api"
+	"github.com/spiceai/spiceai/bin/spice/pkg/constants"
 	"github.com/spiceai/spiceai/bin/spice/pkg/context"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
@@ -70,24 +71,14 @@ nsql> How much money have I made in each country?
 	Run: func(cmd *cobra.Command, args []string) {
 		cmd.Println("Welcome to the Spice.ai NSQL REPL!")
 
-		cloud, _ := cmd.Flags().GetBool(cloudKeyFlag)
-		rtcontext := context.NewContext().WithCloud(cloud)
-
-		apiKey, _ := cmd.Flags().GetString("api-key")
-		if apiKey != "" {
-			rtcontext.SetApiKey(apiKey)
+		rtcontext, err := context.FromFlags(cmd.Flags())
+		if err != nil {
+			slog.Error("failed to initialize runtime context", "error", err)
+			os.Exit(1)
 		}
-
-		userAgent, _ := cmd.Flags().GetString("user-agent")
-		if userAgent != "" {
-			rtcontext.SetUserAgent(userAgent)
-		} else {
-			rtcontext.SetUserAgentClient("nsql")
-		}
-
 		rtcontext.RequireModelsFlavor(cmd)
 
-		model, err := cmd.Flags().GetString(modelKeyFlag)
+		model, err := cmd.Flags().GetString(constants.ModelKeyFlag)
 		if err != nil {
 			slog.Error("getting model flag", "error", err)
 			os.Exit(1)
@@ -127,21 +118,16 @@ nsql> How much money have I made in each country?
 			model = selectedModel
 		}
 
-		httpEndpoint, err := cmd.Flags().GetString(httpEndpointKeyFlag)
-		if err != nil {
-			slog.Error("getting http-endpoint flag", "error", err)
-			os.Exit(1)
-		}
-		if httpEndpoint != "" {
-			rtcontext.SetHttpEndpoint(httpEndpoint)
-		}
-
 		cmd.Println("")
 		cmd.Println("Enter a query in natural language.")
 
 		line := liner.NewLiner()
 		line.SetCtrlCAborts(true)
-		defer line.Close()
+		defer func() {
+			if err := line.Close(); err != nil {
+				slog.Error("closing line", "error", err)
+			}
+		}()
 		for {
 			message, err := line.Prompt("nsql> ")
 			if err == liner.ErrPromptAborted {
@@ -213,21 +199,7 @@ func sendNsqlRequest(rtcontext *context.RuntimeContext, body *NsqlRequest) (*htt
 	if err != nil {
 		return nil, fmt.Errorf("error marshaling nsql request body: %w", err)
 	}
-
-	url := fmt.Sprintf("%s/v1/nsql", rtcontext.HttpEndpoint())
-	request, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
-	if err != nil {
-		return nil, fmt.Errorf("error creating nsql request: %w", err)
-	}
-
-	headers := rtcontext.GetHeaders()
-	for key, value := range headers {
-		request.Header.Set(key, value)
-	}
-	request.Header.Set("Content-Type", "application/json")
-	request.Header.Set("Accept", "text/plain")
-
-	response, err := rtcontext.Client().Do(request)
+	response, err := rtcontext.Do("POST", "/v1/nsql", bytes.NewReader(jsonBody), "Content-Type", "application/json", "Accept", "text/plain")
 	if err != nil {
 		return nil, fmt.Errorf("error sending nsql request: %w", err)
 	}
@@ -236,10 +208,6 @@ func sendNsqlRequest(rtcontext *context.RuntimeContext, body *NsqlRequest) (*htt
 }
 
 func init() {
-	nsqlCmd.Flags().Bool(cloudKeyFlag, false, "Use cloud instance for nsql (default: false)")
-	nsqlCmd.Flags().String(modelKeyFlag, "", "Model to use for nsql")
-	nsqlCmd.Flags().String(httpEndpointKeyFlag, "", "HTTP endpoint for nsql (default: http://localhost:8090)")
-	nsqlCmd.Flags().String("user-agent", "", "User agent to use in all requests")
-
+	nsqlCmd.Flags().String(constants.ModelKeyFlag, "", "Model to use for nsql")
 	RootCmd.AddCommand(nsqlCmd)
 }

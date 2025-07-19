@@ -20,8 +20,8 @@ use super::DataConnector;
 use super::DataConnectorFactory;
 use super::ParameterSpec;
 use async_trait::async_trait;
-use data_components::snowflake::SnowflakeTableFactory;
 use data_components::Read;
+use data_components::snowflake::SnowflakeTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 
 use crate::component::dataset::Dataset;
@@ -45,6 +45,7 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+#[derive(Debug)]
 pub struct Snowflake {
     table_factory: SnowflakeTableFactory,
 }
@@ -73,6 +74,16 @@ const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("warehouse").secret(),
     ParameterSpec::component("role").secret(),
     ParameterSpec::component("auth_type"),
+];
+
+// https://github.com/apache/datafusion-sqlparser-rs/blob/87d190734c7b978e8252b110c9529d7a93a30cf0/src/keywords.rs#L1061
+const RESERVED_KEYWORDS: &[&str] = &[
+    "START",
+    "CONNECT",
+    "MATCH_RECOGNIZE",
+    "SAMPLE",
+    "TABLESAMPLE",
+    "FROM",
 ];
 
 impl DataConnectorFactory for SnowflakeFactory {
@@ -105,6 +116,10 @@ impl DataConnectorFactory for SnowflakeFactory {
 
     fn parameters(&self) -> &'static [ParameterSpec] {
         PARAMETERS
+    }
+
+    fn reserved_keywords(&self) -> &'static [&'static str] {
+        RESERVED_KEYWORDS
     }
 }
 
