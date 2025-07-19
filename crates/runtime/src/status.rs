@@ -17,7 +17,10 @@ limitations under the License.
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
-    sync::{Arc, RwLock},
+    sync::{
+        Arc, RwLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use datafusion::sql::TableReference;
@@ -31,19 +34,22 @@ use crate::metrics;
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum ComponentStatus {
     /// The component is initializing and not yet ready
-    Initializing,
+    Initializing = 0,
 
     /// The component is ready to accept connections
-    Ready,
+    Ready = 1,
 
     /// The component is disabled and not running
-    Disabled,
+    Disabled = 2,
 
     /// An error occurred in the component
-    Error,
+    Error = 3,
 
     /// The component is in the process of refreshing its state
-    Refreshing,
+    Refreshing = 4,
+
+    /// The component is in the process of shutting down
+    ShuttingDown = 5,
 }
 
 impl Display for ComponentStatus {
@@ -54,6 +60,7 @@ impl Display for ComponentStatus {
             ComponentStatus::Disabled => write!(f, "Disabled"),
             ComponentStatus::Error => write!(f, "Error"),
             ComponentStatus::Refreshing => write!(f, "Refreshing"),
+            ComponentStatus::ShuttingDown => write!(f, "ShuttingDown"),
         }
     }
 }
@@ -64,6 +71,8 @@ pub struct RuntimeStatus {
     statuses: Arc<RwLock<HashMap<String, ComponentStatus>>>,
     /// Tracks components that have been in the Ready state at least once.
     ever_ready_components: Arc<RwLock<HashSet<String>>>,
+    /// Tracks if the runtime is in the process of shutting down.
+    is_shutdown: Arc<AtomicBool>,
 }
 
 impl RuntimeStatus {
@@ -72,7 +81,13 @@ impl RuntimeStatus {
         Arc::new(Self {
             statuses: Arc::new(RwLock::new(HashMap::new())),
             ever_ready_components: Arc::new(RwLock::new(HashSet::new())),
+            is_shutdown: Arc::new(AtomicBool::new(false)),
         })
+    }
+
+    #[must_use]
+    pub fn is_shutdown(&self) -> bool {
+        self.is_shutdown.load(Ordering::Relaxed)
     }
 
     /// Updates the status of a component and tracks if it has ever been ready.
@@ -139,7 +154,25 @@ impl RuntimeStatus {
         metrics::views::STATUS.record(status as u64, &[KeyValue::new("view", view_name)]);
     }
 
-    /// Checks if all registered components have been ready at least once.
+    /// Update the status of a worker
+    pub fn update_worker(&self, name: &str, status: ComponentStatus) {
+        let worker_name = name.to_string();
+        self.update_component_status(format!("worker:{worker_name}"), status);
+        metrics::models::STATUS.record(status as u64, &[KeyValue::new("worker", worker_name)]);
+    }
+
+    /// Get the status of a worker
+    #[must_use]
+    pub fn worker_status(&self, name: &str) -> Option<ComponentStatus> {
+        let components = match self.statuses.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let full_name = format!("worker:{name}");
+        components.get(&full_name).copied()
+    }
+
+    /// Checks if all registered components have been ready at least once and the runtime is not shutting down.
     ///
     /// This function returns `true` if all components that have ever been registered
     /// have reached the `Ready` state at least once.
@@ -153,8 +186,13 @@ impl RuntimeStatus {
     /// Returns `false` if:
     /// - No components have been registered yet.
     /// - There are one or more registered components that have never been in the `Ready` state.
+    /// - The runtime is in the process of shutting down.
     #[must_use]
     pub fn is_ready(&self) -> bool {
+        if self.is_shutdown() {
+            return false;
+        }
+
         let statuses = match self.statuses.read() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -189,6 +227,26 @@ impl RuntimeStatus {
     /// Keys are the `model_name`, not the format from [`RuntimeStatus::get_all_statuses`] (i.e. `model:<model_name>`).
     #[must_use]
     pub fn get_model_statuses(&self) -> HashMap<String, ComponentStatus> {
+        self.get_statuses_of_prefix("model:")
+    }
+
+    /// Returns the status of all registered datasets.
+    #[must_use]
+    pub fn get_dataset_statuses(&self) -> HashMap<TableReference, ComponentStatus> {
+        self.get_statuses_of_prefix("dataset:")
+    }
+
+    /// Returns the status of all registered workers.
+    #[must_use]
+    pub fn get_worker_statuses(&self) -> HashMap<String, ComponentStatus> {
+        self.get_statuses_of_prefix("worker:")
+    }
+
+    #[must_use]
+    fn get_statuses_of_prefix<S>(&self, prefix: &'static str) -> HashMap<S, ComponentStatus>
+    where
+        S: for<'a> From<&'a str> + Eq + std::hash::Hash,
+    {
         let statuses = match self.statuses.read() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -196,10 +254,12 @@ impl RuntimeStatus {
 
         statuses
             .iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix("model:")
-                    .map(|model_name| (model_name.to_string(), *v))
-            })
+            .filter_map(|(k, v)| k.strip_prefix(prefix).map(|name| (name.into(), *v)))
             .collect()
+    }
+
+    /// Sets the runtime to the shutting down state.
+    pub fn mark_shutdown(&self) {
+        self.is_shutdown.store(true, Ordering::Relaxed);
     }
 }

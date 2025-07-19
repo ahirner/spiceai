@@ -15,13 +15,13 @@ limitations under the License.
 */
 
 use crate::embeddings::{
-    candle::ModelConfig, Error, FailedToInstantiateEmbeddingModelSnafu, FailedWithHFApiSnafu,
-    Result,
+    Error, FailedToInstantiateEmbeddingModelSnafu, FailedWithHFApiSnafu, Result,
+    candle::ModelConfig,
 };
 use async_openai::types::EmbeddingInput;
 use hf_hub::{
-    api::tokio::{ApiBuilder, ApiRepo},
     Repo, RepoType,
+    api::tokio::{ApiBuilder, ApiRepo},
 };
 use serde::Deserialize;
 use snafu::ResultExt;
@@ -30,9 +30,9 @@ use std::{
     fs,
     path::{self, Path, PathBuf},
 };
-use tei_backend::Pool;
+use tei_backend::{Pool, download_safetensors};
 use tei_core::{
-    download::{download_artifacts, download_pool_config, download_st_config, ST_CONFIG_NAMES},
+    download::{ST_CONFIG_NAMES, download_artifacts, download_st_config},
     tokenization::EncodingInput,
 };
 
@@ -86,7 +86,7 @@ pub(crate) fn position_offset(config: &ModelConfig) -> usize {
 pub(crate) fn inputs_from_openai(input: &EmbeddingInput) -> Vec<EncodingInput> {
     match input {
         EmbeddingInput::String(s) => vec![EncodingInput::Single(s.to_string())],
-        EmbeddingInput::StringArray(ref arr) => arr
+        EmbeddingInput::StringArray(arr) => arr
             .iter()
             .map(|s| EncodingInput::Single(s.clone()))
             .collect::<Vec<_>>(),
@@ -153,12 +153,11 @@ pub(crate) async fn download_hf_artifacts(
     let repo_url = api_repo.url("");
 
     tracing::trace!("Downloading artifacts for {repo_url}");
-    let root_dir = download_artifacts(&api_repo)
+    let root_dir = download_artifacts(&api_repo, true)
         .await
         .context(FailedWithHFApiSnafu)?;
 
-    tracing::trace!("Downloading pool config for {repo_url}");
-    let _ = download_pool_config(&api_repo)
+    let _ = download_safetensors(&api_repo)
         .await
         .context(FailedWithHFApiSnafu)?;
 
@@ -212,7 +211,7 @@ pub fn link_files_into_tmp_dir(files: HashMap<String, PathBuf>) -> Result<PathBu
     let temp_dir = tempdir()
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?
-        .into_path();
+        .keep();
 
     for (name, file) in files {
         let Ok(abs_path) = path::absolute(&file) else {

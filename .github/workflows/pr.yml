@@ -8,8 +8,19 @@ on:
     branches:
       - trunk
       - release-*
+      - release/*
       - feature-*
   workflow_dispatch:
+    inputs:
+      profile_option:
+        description: "Which Rust build profile to use? (Default is lint)"
+        required: false
+        type: choice
+        options:
+          - "lint"
+          - "release"
+          - "release-lto"
+        default: "lint"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
@@ -17,14 +28,14 @@ concurrency:
 
 env:
   IGNORED_PATHS: '(^./docs/|^README.md$|^version.txt$|^acknowledgements.md$)'
+  RUST_PROFILE: ${{ github.event.inputs.profile_option || 'lint' }}
 
 jobs:
-
-  # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via 
-  # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report 
+  # `pr` is a required check for pull requests. Therefore we cannot skip the workflow via
+  # `on.pull_requests.paths-ignore`. Instead, we conditionally run the jobs (which report
   # a sucess when skipped).
   check_changes:
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     outputs:
       relevant_changes: ${{ steps.check_changes.outputs.relevant_changes }}
     steps:
@@ -41,6 +52,7 @@ jobs:
               - 'crates/**'
               - 'bin/**'
               - 'test/**'
+              - 'tools/**'
               - 'install/**'
               - '.github/workflows/**'
               - 'Cargo.toml'
@@ -55,9 +67,9 @@ jobs:
 
   lint:
     name: Run Go & Rust Linters
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     env:
-      GOVER: 1.23.4
+      GOVER: 1.24.2
     needs: check_changes
 
     steps:
@@ -85,21 +97,21 @@ jobs:
       
       - name: Check if sccache can be set up
         run: |
-          if [ -z "${{ secrets.MINIO_ENDPOINT }}" ]; then
+          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
             echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
             echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
           else
             echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
             echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
           fi
-        
+
       - name: Set up sccache
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' &&  env.SCCACHE_SETUP == 'true' }}
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           os: 'linux'
-      
+
       - name: Install Protoc
         if: needs.check_changes.outputs.relevant_changes == 'true'
         uses: arduino/setup-protoc@v3
@@ -116,10 +128,12 @@ jobs:
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
-      
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
+          RUST_PROFILE: ${{ env.RUST_PROFILE }}
+
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
@@ -136,9 +150,9 @@ jobs:
 
   build:
     name: Build Go & Rust
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     env:
-      GOVER: 1.23.4
+      GOVER: 1.24.2
     needs: check_changes
 
     steps:
@@ -154,22 +168,27 @@ jobs:
         uses: ./.github/actions/setup-rust
         with:
           os: 'linux'
-      
+        
+      - name: Install Nextest
+        if: needs.check_changes.outputs.relevant_changes == 'true'
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
       - name: Check if sccache can be set up
         run: |
-          if [ -z "${{ secrets.MINIO_ENDPOINT }}" ]; then
+          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
             echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
             echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
           else
             echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
             echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
           fi
-      
+
       - name: Set up sccache
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         uses: ./.github/actions/setup-sccache
         with:
-          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           os: 'linux'
 
       - name: Set up make
@@ -178,21 +197,23 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
-      - run: make ci test
+      - run: make build-cli nextest
         if: needs.check_changes.outputs.relevant_changes == 'true'
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
-          AWS_ACCESS_KEY_ID: ${{ secrets.MINIO_ACCESS_KEY }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.MINIO_SECRET_KEY }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
           CARGO_INCREMENTAL: 0
-      
+          CARGO_NET_GIT_FETCH_WITH_CLI: true
+          RUST_PROFILE: ${{ env.RUST_PROFILE }}
+
       - name: Show sccache stats
         if: ${{ needs.check_changes.outputs.relevant_changes == 'true' && env.SCCACHE_SETUP == 'true' }}
         run: sccache --show-stats
 
   build-docker:
     name: Build Docker Image
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     needs: check_changes
 
     steps:
@@ -208,5 +229,6 @@ jobs:
           push: false
           build-args: |
             CARGO_FEATURES=odbc
+            RUST_PROFILE=${{ env.RUST_PROFILE }}
           tags: |
             ghcr.io/spiceai/spiceai-rust:ci

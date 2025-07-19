@@ -9,9 +9,10 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ahash.workspace = true
 app = { path = "../app" }
 arrow.workspace = true
-arrow-csv = "53.3.0"
+arrow-csv.workspace = true
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
 arrow-ipc.workspace = true
 arrow-json.workspace = true
@@ -21,13 +22,17 @@ arrow_tools = { path = "../arrow_tools" }
 async-openai.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
-aws-config = { version = "1.1.10", optional = true }
+aws-config = { workspace = true, optional = true }
+aws-credential-types.workspace = true
+aws-sdk-bedrockruntime = { version = "1.55.0", optional = true }
 aws-sdk-dynamodb = { version = "1", optional = true }
+aws-sdk-glue = "1"
 aws-sdk-secretsmanager = { version = "1", optional = true }
 aws-sdk-sts = { version = "1", optional = true }
 axum.workspace = true
-axum-extra = { version = "0.9.6", features = ["typed-header"] }
+axum-extra = { version = "0.10.1", features = ["typed-header"] }
 base64.workspace = true
+byte-unit.workspace = true
 bytes.workspace = true
 cache = { path = "../cache" }
 chrono = { version = "0.4.38" }
@@ -36,9 +41,10 @@ clickhouse-rs = { workspace = true, optional = true }
 csv = "1.3.0"
 dashmap = "6.1.0"
 data_components = { path = "../data_components" }
+dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
+datafusion-datasource.workspace = true
 datafusion-federation = { workspace = true }
-datafusion-federation-sql = { workspace = true }
 datafusion-functions-json = { workspace = true }
 datafusion-table-providers = { workspace = true }
 db_connection_pool = { path = "../db_connection_pool" }
@@ -50,43 +56,45 @@ duckdb = { workspace = true, features = [
     "vtab",
     "vtab-arrow",
 ], optional = true }
+event_stream = { path = "../event_stream" }
 flight_client = { path = "../flight_client" }
 fundu = { workspace = true }
 futures.workspace = true
 globset.workspace = true
-governor = "0.8.0"
+governor.workspace = true
 graph-rs-sdk = { workspace = true, optional = true }
 graphql-parser.workspace = true
 headers-accept = "0.1.3"
 http.workspace = true
-http-body-util = "0.1.2"
+http-body-util = "0.1.3"
 hyper = "1.6.0"
-hyper-util = { version = "0.1.6", features = ["service"] }
+hyper-util = { version = "0.1.15", features = ["service"] }
 iceberg.workspace = true
+iceberg-catalog-glue.workspace = true
 iceberg-catalog-rest.workspace = true
+iceberg-datafusion.workspace = true
 imap = { workspace = true, optional = true }
 indexmap.workspace = true
 itertools.workspace = true
 jsonwebtoken = "9.3.0"
-keyring = { version = "3.6.1", features = [
+keyring = { version = "3.6.2", features = [
     "apple-native",
     "windows-native",
     "linux-native",
 ], optional = true }
 llms = { path = "../llms" }
-logos = "0.15.0"
-mcp-client = { git = "https://github.com/block/goose", package = "mcp-client", optional = true }
-mcp-core = { git = "https://github.com/block/goose", package = "mcp-core", optional = true }
+logos.workspace = true
 mediatype = "0.19.18"
 model_components = { path = "../model_components" }
+moka.workspace = true
 mysql_async = { workspace = true, optional = true }
-notify = "7.0.0"
+notify = "8.0.0"
 ns_lookup = { path = "../ns_lookup" }
 object_store = { workspace = true, features = ["aws", "http", "azure"] }
-once_cell = "1.19.0"
+once_cell = "1.21.3"
 opentelemetry.workspace = true
 opentelemetry-prometheus.workspace = true
-opentelemetry-proto = { version = "0.27", features = [
+opentelemetry-proto = { version = "0.29", features = [
     "gen-tonic-messages",
     "gen-tonic",
     "metrics",
@@ -96,19 +104,36 @@ otel-arrow = { path = "../otel-arrow" }
 package = { path = "../package" }
 percent-encoding.workspace = true
 pin-project.workspace = true
+postcard.workspace = true
 prometheus.workspace = true
 prometheus-parse = "0.2.5"
 prost = { version = "0.13.1", default-features = false, features = [
     "prost-derive",
 ] }
-rand = "0.8.5"
+rand = "0.9.1"
 regex.workspace = true
 reqwest.workspace = true
+rmcp = { workspace = true, optional = true, features = [
+    "client",
+    "reqwest",
+    "server",
+    "transport-sse-server",
+    "transport-io",
+    "transport-sse-client",
+    "transport-child-process",
+    "transport-streamable-http-server",
+] }
 runtime-auth = { path = "../runtime-auth" }
+runtime-datafusion-index = { path = "../runtime-datafusion-index" }
+runtime-datafusion-udfs = { path = "../runtime-datafusion-udfs" }
+runtime-table-partition = { path = "../runtime-table-partition" }
 rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 rustls-pemfile.workspace = true
-schemars = "0.8.19"
+s3_vectors = { path = "../s3_vectors", optional = true }
+scheduler = { path = "../scheduler" }
+schemars.workspace = true
+search = { path = "../search" }
 secrecy.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
@@ -116,41 +141,50 @@ snafu.workspace = true
 snowflake-api = { workspace = true, optional = true }
 spicepod = { path = "../spicepod" }
 ssh2 = { workspace = true, optional = true }
+strsim = { version = "0.11.1", optional = true }
 suppaftp = { workspace = true, optional = true }
+tantivy.workspace = true
 telemetry = { path = "../telemetry" }
+tera = { version = "1.17" }
 tiberius = { workspace = true, optional = true }
+token_provider = { path = "../token_provider" }
 tokio.workspace = true
 tokio-rusqlite = { workspace = true, optional = true }
 tokio-rustls = "0.26.0"
 tokio-stream.workspace = true
-tokio-util = { workspace = true, optional = true }
+tokio-util.workspace = true
 tonic.workspace = true
 tonic-health.workspace = true
+tools = { path = "../tools" }
 tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
 tracing-futures.workspace = true
-tract-core = "0.21.0"
+tracing-subscriber.workspace = true
+tract-core = "0.21.10"
 url = "2.5.4"
 util = { path = "../util" }
 utoipa = { version = "5", features = ["axum_extras"], optional = true }
-utoipa-swagger-ui = { version = "8", features = ["axum"], optional = true }
+utoipa-swagger-ui = { version = ">=8.1.1", features = [
+    "axum",
+], optional = true }
 
 uuid = { workspace = true, features = ["v7"] }
+workers = { path = "../workers" }
 x509-certificate.workspace = true
 
 [dev-dependencies]
 anyhow = "1.0.86"
-async-graphql = "7.0.5"
-async-graphql-axum = "=7.0.13"
-azure_core = "0.21.0"
+async-graphql = "7.0.16"
+async-graphql-axum = "7.0.16"
+azure_core = "0.25.0"
 azure_storage = "0.21.0"
 azure_storage_blobs = "0.21.0"
 bollard = "0.18.1"
 dirs = "5.0.1"
 flightrepl = { path = "../flightrepl" }
 hf-hub = { workspace = true }
-insta.workspace = true
+insta = { workspace = true, features = ["json"] }
 jsonpath-rust = "0.7.3"
 opentelemetry_sdk = { workspace = true, features = ["rt-tokio-current-thread"] }
 paste.workspace = true
@@ -168,6 +202,10 @@ aws-secrets-manager = [
     "dep:aws-sdk-secretsmanager",
     "dep:aws-sdk-sts",
 ]
+bedrock = [
+    "dep:aws-config",
+    "dep:aws-sdk-bedrockruntime",
+]
 clickhouse = [
     "dep:clickhouse-rs",
     "db_connection_pool/clickhouse",
@@ -177,29 +215,32 @@ clickhouse = [
 cuda = ["llms/cuda"]
 databricks = ["data_components/databricks"]
 debezium = ["data_components/debezium"]
-default = ["keyring-secret-store", "aws-secrets-manager", "sharepoint"]
+default = ["keyring-secret-store", "aws-secrets-manager", "sharepoint", "bedrock"]
 delta_lake = ["data_components/delta_lake"]
 dev = ["openapi", "otel-arrow/dev", "mcp"]
 dremio = []
 duckdb = ["dep:duckdb", "db_connection_pool/duckdb", "data_components/duckdb"]
 dynamodb = ["dep:aws-sdk-dynamodb", "data_components/dynamodb"]
+extended_tests = []
 flightsql = ["data_components/flightsql"]
 ftp = ["dep:suppaftp", "dep:ssh2"]
 imap = ["data_components/imap", "dep:imap"]
 keyring-secret-store = ["dep:keyring"]
-mcp = ["dep:mcp-client", "dep:mcp-core"]
+mcp = ["dep:rmcp", "tools/mcp"]
 metal = ["llms/metal"]
-models = ["model_components/full"]
-mssql = ["dep:tiberius", "dep:tokio-util", "data_components/mssql"]
+models = ["model_components/full", "mcp", "dep:strsim"]
+mssql = ["dep:tiberius", "data_components/mssql"]
 mysql = ["dep:mysql_async", "db_connection_pool/mysql", "data_components/mysql"]
 odbc = ["db_connection_pool/odbc", "data_components/odbc"]
-openapi = ["dep:utoipa-swagger-ui", "dep:utoipa"]
+oracle = ["data_components/oracle"]
+openapi = ["dep:utoipa-swagger-ui", "dep:utoipa", "mcp"]
 postgres = [
     "db_connection_pool/postgres",
     "data_components/postgres",
     "datafusion-table-providers/postgres",
 ]
 postgres-write = []
+s3_vectors = ["data_components/s3_vectors", "dep:s3_vectors"]
 sharepoint = ["data_components/sharepoint", "dep:graph-rs-sdk"]
 snowflake = [
     "dep:snowflake-api",
@@ -213,10 +254,6 @@ sqlite = [
     "data_components/sqlite",
     "dep:rusqlite",
 ]
-
-[[bench]]
-harness = false
-name = "bench"
 
 [[bench]]
 harness = false

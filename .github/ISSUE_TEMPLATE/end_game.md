@@ -1,14 +1,14 @@
 ---
 name: Milestone Endgame
 about: Ship a milestone release for Spice.ai Open Source!
-title: 'v0.x.x-beta endgame'
+title: 'v1.x.x Endgame'
 labels: 'kind/endgame'
 assignees: ''
 ---
 
 ## DRIs
 
-|         | DRI |
+| Role    | DRI |
 | ------- | --- |
 | Endgame |     |
 | QA      |     |
@@ -26,56 +26,65 @@ assignees: ''
 
 ## Planning Checklist
 
-- [ ] Review the specific [GitHub Milestone](https://github.com/spiceai/spiceai/milestones).
-- [ ] Ensure all related Issues and PRs are correctly labeled.
+- [ ] Review the [GitHub Milestone](https://github.com/spiceai/spiceai/milestones).
+- [ ] Ensure all Issues and PRs are labeled correctly.
 - [ ] Confirm no high-priority security or performance Issues remain open.
-- [ ] Communicate the feature freeze date to all contributors.
-- [ ] **If this is a patch release (vX.Y.Z)**: Verify no backward-incompatible changes.
-- [ ] **If this is a patch release**: Plan to cherry-pick each relevant commit into the release branch.
-- [ ] **If this is a minor release (vX.Y)**: Plan to merge commit from `trunk` into the release branch.
+- [ ] Communicate the feature freeze date to contributors.
+- [ ] **Patch Release (vX.Y.Z)**: Verify no backward-incompatible changes and cherry-pick relevant commits.
+- [ ] **Minor Release (vX.Y)**: Plan to merge `trunk` into the release branch.
 
 ## Release Branch Creation
 
-- [ ] Create a release branch (`release/X.Y`) from `trunk` one day before the scheduled release (if not already created).
-  - Refer to [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md) for more details.
-- [ ] If **patch release**: cherry-pick each commit to include.
-- [ ] If **minor release**: merge commit from `trunk`.
-- [ ] Lock the release branch to critical fixes only. Notify the team of the branch status.
+- [ ] Create `release/X.Y` from `trunk` one day before release.
+  - Refer to [docs/RELEASE.md](https://github.com/spiceai/spiceai/blob/trunk/docs/RELEASE.md).
+- [ ] Lock the branch to critical fixes only and notify the team.
 
 ## Pre-Release Testing & Validation
 
 1. **Build Validations**
 
-   - [ ] Ensure all builds (including the CUDA build) pass in `trunk` for at least one supported compute capability on **both Linux and Windows**.
-   - [ ] Verify all CI workflows run successfully (no warnings or errors).
+   - [ ] Ensure all builds (including CUDA) pass on **Linux and Windows**.
+   - [ ] Verify all CI workflows complete without warnings or errors.
 
-2. **Unit/Integration Tests**
+1. **Unit/Integration Tests**
 
-   - [ ] Confirm local and CI tests pass without major deprecations or failures.
+   - [ ] Confirm local and CI tests pass without major failures.
+     - [ ] Verify [integration](https://github.com/spiceai/spiceai/actions/workflows/integration.yml) tests (which include the `run_all_tests` flag) is green on the release branch.
 
-3. **E2E Tests**
+1. **E2E Tests**
 
-   - [ ] Verify [E2E Test CI (core)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on `trunk` and on the release branch.
-   - [ ] Verify [E2E Test CI (models)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci_models.yml) is green on `trunk` and on the release branch.
+   - [ ] Verify [E2E Test CI (core)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci.yml) is green on `trunk` and the release branch.
+   - [ ] Verify [E2E Test CI (models)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_ci_models.yml) is green on `trunk` and the release branch.
+   - [ ] Verify [Test Operator Benchmarks](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_bench.yml) is green on `trunk` and the release branch.
+     - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new benchmark run. Specify `trunk` as the branch source, with the following parameters:
+       - Workflow to execute: `bench`
+       - All other values left empty.
+   - [ ] Verify [E2E Test CLI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_spice_cli.yml) is green on `trunk` and the release branch.
+     - Parameters: Branch: `trunk`
+     - Build CLI: `true`
+   - [ ] Verify [Throughput Tests](https://github.com/spiceai/spiceai/actions/workflows/testoperator_run_throughput.yml) is green on `trunk` and the release branch.
+     - Use the [Test Operator Dispatch](https://github.com/spiceai/spiceai/actions/workflows/testoperator_dispatch.yml) workflow to execute a new throughput run. Specify `trunk` as the branch source, with the following parameters:
+       - Workflow to execute: `throughput`
+       - All other values left empty.
 
-4. **Documentation Review**
+1. **Documentation Review**
 
-   - [ ] Update and confirm accuracy of `README.md` and docs in [Spice.ai Docs](https://github.com/spiceai/docs).
-   - [ ] Ensure version numbers, usage details, and references match the intended release.
+   - [ ] Update and confirm accuracy of `README.md` and [Spice.ai Docs](https://github.com/spiceai/docs).
 
-5. **Cookbook Recipes**
+1. **Cookbook Recipes**
 
    - **Data Connectors**
 
      - [ ] [AWS RDS Aurora (MySQL Compatible)](https://github.com/spiceai/cookbook/blob/trunk/mysql/rds-aurora/README.md)
      - [ ] [AWS RDS PostgreSQL](https://github.com/spiceai/cookbook/blob/trunk/postgres/rds/README.md)
      - [ ] [Clickhouse](https://github.com/spiceai/cookbook/blob/trunk/clickhouse/README.md)
-     - [ ] [Databricks Delta Lake](https://github.com/spiceai/cookbook/blob/trunk/databricks/delta_lake/README.md)
+     - [ ] [Databricks](https://github.com/spiceai/cookbook/blob/trunk/databricks/README.md)
      - [ ] [Dremio](https://github.com/spiceai/cookbook/blob/trunk/dremio/README.md)
      - [ ] [DuckDB](https://github.com/spiceai/cookbook/blob/trunk/duckdb/connector/README.md)
      - [ ] [FTP](https://github.com/spiceai/cookbook/blob/trunk/ftp/README.md)
      - [ ] [File Connector](https://github.com/spiceai/cookbook/blob/trunk/file/README.md)
      - [ ] [GitHub](https://github.com/spiceai/cookbook/blob/trunk/github/README.md)
+     - [ ] [Glue](https://github.com/spiceai/cookbook/tree/trunk/glue/README.md)
      - [ ] [GraphQL](https://github.com/spiceai/cookbook/blob/trunk/graphql/README.md)
      - [ ] [MSSQL](https://github.com/spiceai/cookbook/blob/trunk/mssql/README.md)
      - [ ] [MySQL](https://github.com/spiceai/cookbook/blob/trunk/mysql/connector/README.md)
@@ -88,6 +97,7 @@ assignees: ''
      - [ ] [Supabase](https://github.com/spiceai/cookbook/blob/trunk/postgres/supabase/README.md)
      - [ ] [Spice.ai Cloud Platform](https://github.com/spiceai/cookbook/blob/trunk/spiceai/README.md)
      - [ ] [Debezium CDC (plain & SASL/SCRAM)](https://github.com/spiceai/cookbook/blob/trunk/cdc-debezium/README.md)
+     - [ ] [IMAP](https://github.com/spiceai/cookbook/blob/trunk/imap/README.md)
      - [ ] Update connector status per [Connector RC Criteria](/docs/criteria/connectors/rc.md).
 
    - **Data Accelerators**
@@ -96,7 +106,8 @@ assignees: ''
      - [ ] [PostgreSQL Accelerator](https://github.com/spiceai/cookbook/blob/trunk/postgres/accelerator/README.md)
      - [ ] [SQLite Accelerator](https://github.com/spiceai/cookbook/blob/trunk/sqlite/accelerator/README.md)
      - [ ] [Arrow Accelerator](https://github.com/spiceai/cookbook/blob/trunk/arrow/README.md)
-     - [ ] Update accelerator status per [Accelerator RC Criteria](/docs/criteria/accelerators/rc.md).
+     - [ ] [Glue Catalog](https://github.com/spiceai/cookbook/tree/trunk/catalogs/glue/README.md)
+     - [ ] Update accelerator status per [Accelerator RC Criteria](/docs/criteria/accelerators/rc.md)
 
    - **Catalog Connectors**
 
@@ -113,14 +124,15 @@ assignees: ''
      - [ ] [OpenAI SDK](https://github.com/spiceai/cookbook/tree/trunk/openai_sdk)
      - [ ] [Nvidia NIM](https://github.com/spiceai/cookbook/tree/trunk/nvidia-nim)
      - [ ] [LLM Memory](https://github.com/spiceai/cookbook/tree/trunk/llm-memory)
+     - [ ] [Model-Context-Protocol (MCP)](https://github.com/spiceai/cookbook/tree/trunk/mcp)
 
    - **SDK Samples**
 
-     - [ ] [Spice with gospice-sdk sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/gospice-sdk-sample/README.md)
-     - [ ] [Spice with Java sdk sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice-java-sdk-sample/README.md)
-     - [ ] [Spice with rust sdk sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice-rs-sdk-sample/README.md)
-     - [ ] [Spice with spice.js sdk sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice.js-sdk-sample/README.md)
-     - [ ] [Spice with spicepy sdk sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spicepy-sdk-sample/README.md)
+     - [ ] [Spice with gospice SDK sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/gospice-sdk-sample/README.md)
+     - [ ] [Spice with Java SDK sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice-java-sdk-sample/README.md)
+     - [ ] [Spice with rust SDK sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice-rs-sdk-sample/README.md)
+     - [ ] [Spice with spice.js SDK sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spice.js-sdk-sample/README.md)
+     - [ ] [Spice with spicepy SDK sample](https://github.com/spiceai/cookbook/blob/trunk/client-sdk/spicepy-sdk-sample/README.md)
 
    - **Other Cookbook Recipes**
      - [ ] [Sales BI (Apache Superset)](https://github.com/spiceai/cookbook/blob/trunk/sales-bi/README.md)
@@ -131,25 +143,32 @@ assignees: ''
      - [ ] [Federated SQL Query](https://github.com/spiceai/cookbook/blob/trunk/federation/README.md)
      - [ ] [Indexes on Accelerated Data](https://github.com/spiceai/cookbook/blob/trunk/acceleration/indexes/README.md)
      - [ ] [Refresh Data Window](https://github.com/spiceai/cookbook/blob/trunk/refresh-data-window/README.md)
+     - [ ] [Cron Dataset Schedules](https://github.com/spiceai/cookbook/blob/trunk/acceleration/cron/README.md)
      - [ ] [Results Caching](https://github.com/spiceai/cookbook/blob/trunk/caching/README.md)
      - [ ] [Encryption in transit via TLS](https://github.com/spiceai/cookbook/blob/trunk/tls/README.md)
      - [ ] [TPC-H Benchmarking](https://github.com/spiceai/cookbook/blob/trunk/tpc-h/README.md)
      - [ ] [API Key Authentication](https://github.com/spiceai/cookbook/blob/trunk/api_key/README.md)
      - [ ] [Grafana datasource integration](https://github.com/spiceai/cookbook/blob/trunk/grafana-datasource/README.md)
+     - [ ] [Python ADBC Client](https://github.com/spiceai/cookbook/blob/trunk/clients/adbc/README.md)
+     - [ ] [Java JDBC Client](https://github.com/spiceai/cookbook/blob/trunk/clients/java/README.md)
+     - [ ] [Scala JDBC Client](https://github.com/spiceai/cookbook/blob/trunk/clients/scala/README.md)
 
 ## Final Updates
 
 - [ ] Merge any pending [Docs PRs](https://github.com/spiceai/docs/pulls).
 
-  - [ ] Update Spice version in [docs banner](https://github.com/spiceai/docs/blob/trunk/website/docusaurus.config.ts#L95).
-
-- [ ] Merge any pending [Cookbook PRs](https://github.com/spiceai/cookbook/pulls).
+- [ ] Merge any pending Merge pending [Cookbook PRs](https://github.com/spiceai/cookbook/pulls)
 
 - [ ] Prepare and finalize release notes:
 
   - [ ] Acknowledge external and new contributors.
   - [ ] List notable dependency updates (e.g. `datafusion`, `datafusion-table-providers`) under `## Dependencies`.
   - [ ] Summarize any cookbook changes under `## Cookbook`.
+  - [ ] Run [Generate Changelog](https://github.com/spiceai/spiceai/actions/workflows/generate_changelog.yml) to update the release notes.
+    - Use parameters:
+      - Previous Release Tag: the previous release tag (e.g. `v1.4.0`). This is the tag of the previous release we want to compare against.
+      - Release Branch: the release branch (e.g. `release/1.5`). This is the branch that contains the new changes that are based on the release branch. If this is a prep branch, use that branch here.
+      - The script will generate the changes it believes are in the release. It also generates a list of changes that are only in trunk but not in the release branch, but this is not always accurate. Please review the changes and copy any changes that are missing into the release notes changelog.
 
 - [ ] Add references to any SDK releases in the release notes:
 
@@ -159,6 +178,8 @@ assignees: ''
   - [ ] [spice-java](https://github.com/spiceai/spice-java/releases)
   - [ ] [spice-dotnet](https://github.com/spiceai/spice-dotnet/releases)
   - [ ] [gospice](https://github.com/spiceai/gospice/releases)
+
+- [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml) and cherry-pick schema update PR onto the release branch.
 
 - [ ] Run [Generate Acknowledgements](https://github.com/spiceai/spiceai/actions/workflows/generate_acknowledgements.yml) **on the release branch** to update acknowledgements in [docs](https://github.com/spiceai/docs/blob/trunk/website/docs/acknowledgements/index.md).
 
@@ -171,23 +192,35 @@ assignees: ''
 - [ ] Cherry-pick release notes onto the release branch.
 - [ ] Create a **pre-release** [GitHub Release](https://github.com/spiceai/spiceai/releases/new) with a tag (e.g. `v1.0.0-rc.1`). Leave the body empty so automation can populate it from the checked-in notes.
 - [ ] Tag and release docs (e.g. `v1.0.0`) **after** the [build_and_release workflow](https://github.com/spiceai/spiceai/actions/workflows/build_and_release.yml) completes.
-- [ ] Update the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart) (chart version & image.tag) only after:
+- [ ] Update the [Helm chart](https://github.com/spiceai/spiceai/blob/trunk/deploy/chart) (chart version & image.tag) in the release branch (not in trunk).
 
-  1. Docker build for the release branch completes (~2 hours).
-  2. [Release Chart workflow](https://github.com/spiceai/helm-charts/actions/workflows/release.yml) is triggered.
+  - [ ] If this is a **minor** release, replace the `ghcr.io/spiceai/spiceai-nightly` repository in `values.yaml` with `spiceai/spiceai` and change the tag to the release version (e.g. `1.0.0`).
+  - [ ] Docker build for the release branch completes (~2 hours).
+  - [ ] [Release Chart workflow](https://github.com/spiceai/helm-charts/actions/workflows/release.yml) is triggered using the release branch.
 
 - [ ] Mark the [release](https://github.com/spiceai/spiceai/releases) as official once all binaries and Docker images finish building.
 - [ ] Perform a final test pass on the released binaries and Docker images.
-- [ ] Run the following workflows to confirm installation health:
-  - [ ] [Generate Spicepod JSON schema](https://github.com/spiceai/spiceai/actions/workflows/generate_json_schema.yml)
-  - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
 
 ## Post-Release Housekeeping
 
-- [ ] Bump `version.txt` and `Cargo.toml` in `trunk` to the next planned release.
-- [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai) after the final build completes.
+- [ ] Run the following workflows to confirm installation health after the release is marked as official:
+  - [ ] [E2E Test Release Installation](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install.yml)
+  - [ ] [E2E Test Release Installation (AI)](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_release_install_ai.yml)
+  - [ ] [E2E Test CLI](https://github.com/spiceai/spiceai/actions/workflows/e2e_test_spice_cli.yml)
+    - Use parameters:
+      - Branch: `trunk`
+      - Build the CLI: `false`
+      - Release Version: the version tag released.
+- [ ] Bump `version.txt` and `Cargo.toml` in `trunk` to the next planned **minor** release (if required).
+- [ ] If this is a **minor** release, update the scheduled benchmark job `dispatch-scheduled` in [`testoperator_dispatch.yml`](https://github.com/spiceai/spiceai/blob/trunk/.github/workflows/testoperator_dispatch.yml) to use the new release branch.
+- [ ] Update [brew taps](https://github.com/spiceai/homebrew-spiceai/actions/workflows/update-formula.yml) after the final build completes.
 - [ ] Remove or mark the released version in the [ROADMAP](https://github.com/spiceai/spiceai/blob/trunk/docs/ROADMAP.md).
 - [ ] Update the supported version in `SECURITY.md` if necessary.
+- [ ] QA DRI: Run SpiceQA via [Github Action](https://github.com/spiceai/cookbook/actions/workflows/spice-qa.yml), with the correct `input.spice_version`.
+  - [ ] Redeploy the SpiceQA app in the Spice.ai Cloud Platform (SCP). Ensure the deployment is successful.
+  - [ ] Run the [SpiceQA Workflow](https://github.com/spiceai/cookbook/actions/workflows/spice-qa.yml) in GitHub Actions. Verify the job passing status for each recipe (green - pass, red - failure).
+- [ ] QA DRI: Add metrics to [QA analytics](https://github.com/spiceai/spiceai/blob/trunk/docs/release_notes/qa_analytics.csv).
+  - Use number of recipes total from [spiceai.org/docs/cookbook](https://spiceai.org/docs/cookbook).
 
 ## Announcement Checklist
 
@@ -196,3 +229,5 @@ assignees: ''
 - [ ] Discord: [#announcements](https://discord.gg/zv8ahzZVpf)
 - [ ] Telegram: [spiceai](https://t.me/spiceai)
 - [ ] Blog: [spiceai.org/blog](https://spiceai.org/blog)
+  - [ ] Update docs banner version in [docusaurus.config.ts](https://github.com/spiceai/docs/blob/trunk/website/docusaurus.config.ts#L95).
+  - [ ] Ensure version numbers and references match the release.

@@ -16,17 +16,17 @@ limitations under the License.
 
 use anyhow::Context;
 use async_openai::error::OpenAIError;
-use hf_hub::{api::sync::ApiBuilder, Repo, RepoType};
+use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use llms::{
     anthropic::Anthropic,
-    chat::{create_hf_model, create_local_model, Chat, Error as ChatError},
+    chat::{Chat, Error as ChatError, create_hf_model, create_local_model},
     config::GenericAuthMechanism,
     embeddings::candle::link_files_into_tmp_dir,
     openai::new_openai_client,
     perplexity::PerplexitySonar,
     xai::Xai,
 };
-use secrecy::{Secret, SecretString};
+use secrecy::SecretString;
 use std::{
     collections::HashMap,
     fs,
@@ -34,28 +34,25 @@ use std::{
     sync::Arc,
 };
 
-pub(crate) fn create_xai(model_id: &str) -> Result<Arc<Box<dyn Chat>>, anyhow::Error> {
+pub(crate) fn create_xai(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
     let Ok(api_key) = std::env::var("SPICE_XAI_API_KEY") else {
         return Err(anyhow::anyhow!("SPICE_XAI_API_KEY not set"));
     };
-    Ok(Arc::new(Box::new(Xai::new(
-        Some(model_id),
-        api_key.as_str(),
-    ))))
+    Ok(Arc::new(Xai::new(Some(model_id), api_key.as_str())))
 }
 
-pub(crate) fn create_openai(model_id: &str) -> Arc<Box<dyn Chat>> {
+pub(crate) fn create_openai(model_id: &str) -> Arc<dyn Chat> {
     let api_key = std::env::var("SPICE_OPENAI_API_KEY").ok();
-    Arc::new(Box::new(new_openai_client(
+    Arc::new(new_openai_client(
         model_id.to_string(),
         None,
         api_key.as_deref(),
         None,
         None,
-    )))
+    ))
 }
 
-pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<Box<dyn Chat>>, OpenAIError> {
+pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<dyn Chat>, OpenAIError> {
     let auth = match (
         std::env::var("SPICE_ANTHROPIC_API_KEY"),
         std::env::var("SPICE_ANTHROPIC_AUTH_TOKEN"),
@@ -66,35 +63,34 @@ pub(crate) fn create_anthropic(model_id: Option<&str>) -> Result<Arc<Box<dyn Cha
         }
         _ => return Err(OpenAIError::InvalidArgument("One and only one of 'SPICE_ANTHROPIC_API_KEY' or 'SPICE_ANTHROPIC_AUTH_TOKEN' must be set".to_string())),
     };
-    Ok(Arc::new(Box::new(Anthropic::new(
-        auth, model_id, None, None,
-    )?)))
+    Ok(Arc::new(Anthropic::new(auth, model_id, None, None)?))
 }
 
-pub(crate) fn create_hf(model_id: &str) -> Result<Arc<Box<dyn Chat>>, ChatError> {
-    Ok(Arc::new(create_hf_model(
+pub(crate) async fn create_hf(model_id: &str) -> Result<Arc<dyn Chat>, ChatError> {
+    create_hf_model(
         model_id,
         None,
         None,
-        std::env::var("HF_TOKEN").ok().map(Secret::new).as_ref(),
-    )?))
+        std::env::var("HF_TOKEN")
+            .ok()
+            .map(SecretString::from)
+            .as_ref(),
+    )
+    .await
 }
 
-pub(crate) fn create_perplexity() -> Result<Arc<Box<dyn Chat>>, ChatError> {
+pub(crate) fn create_perplexity() -> Result<Arc<dyn Chat>, ChatError> {
     let mut params: HashMap<String, SecretString> = HashMap::new();
     if let Ok(api_key) = std::env::var("SPICE_PERPLEXITY_AUTH_TOKEN") {
-        params.insert(
-            "perplexity_auth_token".to_string(),
-            SecretString::new(api_key),
-        );
+        params.insert("auth_token".to_string(), SecretString::from(api_key));
     }
     let sonar = PerplexitySonar::from_params(None, &params)
         .map_err(|e| ChatError::FailedToLoadModel { source: e })?;
 
-    Ok(Arc::new(Box::new(sonar)))
+    Ok(Arc::new(sonar))
 }
 
-pub(crate) fn create_local(model_id: &str) -> Result<Arc<Box<dyn Chat>>, anyhow::Error> {
+pub(crate) async fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
     let (temp_dir, model_weights) =
         download_hf_model_artifacts(model_id, None, std::env::var("HF_TOKEN").ok())?;
 
@@ -106,8 +102,9 @@ pub(crate) fn create_local(model_id: &str) -> Result<Arc<Box<dyn Chat>>, anyhow:
         None,
         None,
     )
+    .await
     .map_err(anyhow::Error::from)?;
-    Ok(Arc::from(Box::new(model)))
+    Ok(model)
 }
 
 /// For a given `HuggingFace` repo, downloads the specified file and save them into provided folder. Return folder, and which ones are model weights.

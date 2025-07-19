@@ -15,26 +15,45 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
+use ::tools::SpiceModelTool;
+use ::tools::rename::with_name;
+use async_stream::stream;
+use init::scheduler::ScheduleRegistry;
+use std::collections::HashSet;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
+use token_provider::registry::TokenProviderRegistry;
+use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
+use tools::factory::{ToolFactory, default_catalog_names};
+use tracing::subscriber;
+use util::force_shutdown_signal;
+use worker::WorkerRegistry;
 
+use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
     internal_table::Error as InternalTableError, model::ENABLE_MODEL_SUPPORT_MESSAGE,
 };
+
 use ::datafusion::error::DataFusionError;
-use ::datafusion::sql::{sqlparser, TableReference};
+use ::datafusion::sql::{TableReference, sqlparser};
 use app::App;
 use builder::RuntimeBuilder;
+use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 use config::Config;
 use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
+use futures::Stream;
+use futures::future::{join_all, try_join_all};
 #[cfg(feature = "openapi")]
-pub use http::ApiDoc;
+pub use http::get_api_doc;
 use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
 
+use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
 use secrecy::SecretString;
@@ -43,15 +62,16 @@ use snafu::prelude::*;
 use spicepod::component::eval::Eval;
 use status::ComponentStatus;
 use tls::TlsConfig;
-use tokio::sync::{oneshot::error::RecvError, RwLock};
-use tools::factory::default_available_catalogs;
-use tools::{catalog::SpiceToolCatalog, Tooling};
+
+use tokio::sync::{RwLock, oneshot::error::RecvError};
+use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
 use crate::extension::Extension;
 pub mod accelerated_table;
 pub mod auth;
 mod builder;
+mod cancellable_task;
 pub mod catalogconnector;
 pub mod component;
 pub mod config;
@@ -68,34 +88,41 @@ pub mod flight;
 mod http;
 mod init;
 pub mod internal_table;
+mod management;
 mod metrics;
 mod metrics_server;
 pub mod model;
 pub mod object_store_registry;
 pub mod objectstore;
 mod opentelemetry;
-mod parameters;
+pub mod parameters;
 pub mod podswatcher;
 pub mod request;
+mod scheduling;
+pub mod search;
 pub mod secrets;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
 pub mod timing;
 pub mod tls;
+mod token_providers;
 pub mod tools;
 pub mod topological_ordering;
 pub(crate) mod tracers;
 mod tracing_util;
 mod view;
+mod worker;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Unable to start HTTP server: {source}"))]
     UnableToStartHttpServer { source: http::Error },
 
-    #[snafu(display("{source}"))]
-    UnableToJoinTask { source: tokio::task::JoinError },
+    #[snafu(display(
+        "Task execution failed: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToExecuteTask { source: tokio::task::JoinError },
 
     #[snafu(display("Unable to start Prometheus metrics server: {source}"))]
     UnableToStartMetricsServer { source: metrics_server::Error },
@@ -114,6 +141,9 @@ pub enum Error {
 
     #[snafu(display("Unable to attach view: {source}"))]
     UnableToAttachView { source: datafusion::Error },
+
+    #[snafu(display("Unable to attach dataset index: {source}"))]
+    UnableToAttachIndex { source: datafusion::Error },
 
     #[snafu(display("Failed to start pods watcher: {source}"))]
     UnableToInitializePodsWatcher { source: NotifyError },
@@ -143,13 +173,19 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unknown data connector: {data_connector}.\nSpecify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"))]
+    #[snafu(display(
+        "Unknown data connector: {data_connector}.\nSpecify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"
+    ))]
     UnknownDataConnector { data_connector: String },
 
-    #[snafu(display("Unknown catalog connector: {catalog_connector}.\nSpecify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"))]
+    #[snafu(display(
+        "Unknown catalog connector: {catalog_connector}.\nSpecify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"
+    ))]
     UnknownCatalogConnector { catalog_connector: String },
 
-    #[snafu(display("The runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"))]
+    #[snafu(display(
+        "The runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
+    ))]
     OdbcNotInstalled,
 
     #[snafu(display("Unable to load secrets for data connector: {data_connector}"))]
@@ -187,19 +223,34 @@ pub enum Error {
     #[snafu(display("Unable to create view: {reason}"))]
     UnableToCreateView { reason: String },
 
-    #[snafu(display("Specify the SQL string for view {name} using either `sql: SELECT * FROM...` inline or as a file reference with `sql_ref: my_view.sql`"))]
+    #[snafu(display(
+        "Specify the SQL string for view {name} using either `sql: SELECT * FROM...` inline or as a file reference with `sql_ref: my_view.sql`"
+    ))]
     NeedToSpecifySQLView { name: String },
 
-    #[snafu(display("An accelerated table was configured as read_write without setting replication.enabled = true"))]
+    #[snafu(display(
+        "An accelerated table was configured as read_write without setting replication.enabled = true"
+    ))]
     AcceleratedReadWriteTableWithoutReplication,
 
-    #[snafu(display("An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."))]
+    #[snafu(display(
+        "An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."
+    ))]
     AcceleratedTableInvalidChanges { dataset_name: String },
+
+    #[snafu(display(
+        "An accelerated table has invalid configuration: {source}.\nUpdate the configuration and retry. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    InvalidAccelerationConfiguration {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 
     #[snafu(display("Expected acceleration settings for {name}, found None"))]
     ExpectedAccelerationSettings { name: String },
 
-    #[snafu(display("The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."))]
+    #[snafu(display(
+        "The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."
+    ))]
     AcceleratorEngineNotAvailable { name: String },
 
     #[snafu(display("The accelerator engine {name} failed to initialize: {source}"))]
@@ -222,6 +273,11 @@ pub enum Error {
     #[snafu(display("Unable to load data connector for catalog {catalog}: {source}"))]
     UnableToLoadCatalogConnector {
         catalog: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Unable to load worker: {source}"))]
+    UnableToLoadWorker {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
@@ -269,9 +325,86 @@ pub enum Error {
     #[snafu(display("Unable to create directory: {source}"))]
     UnableToCreateDirectory { source: std::io::Error },
 
+    #[snafu(display("Unable to build dataset: {dataset}: {source}"))]
+    UnableToBuildDataset {
+        dataset: String,
+        source: crate::component::dataset::Error,
+    },
+
+    #[snafu(display("Unable to build catalog: {catalog}: {source}"))]
+    UnableToBuildCatalog {
+        catalog: String,
+        source: crate::component::catalog::Error,
+    },
+
     #[snafu(display("{source}"))]
     ComponentError { source: component::Error },
+
+    #[snafu(display("{source}"))]
+    ComponentsInitializationFailed { source: tokio::task::JoinError },
+
+    #[snafu(display("Initialization has been cancelled"))]
+    ComponentsInitializationCancelled,
+
+    #[snafu(display("Force shutdown requested"))]
+    ForceTerminated,
+
+    #[snafu(display(
+        "Configuration of '{view_name}' view is invalid: {reason}.\nUpdate the configuration and retry. For details, visit: https://spiceai.org/docs/components/views"
+    ))]
+    AcceleratedViewInvalidConfiguration { view_name: String, reason: String },
+
+    #[snafu(display(
+        "Failed to start scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToStartScheduler { source: scheduler::Error },
+
+    #[snafu(display(
+        "Failed to build scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToBuildScheduler { source: scheduler::Error },
+
+    #[snafu(display(
+        "Failed to add schedule '{name}' to the '{scheduler}' scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToAddSchedule {
+        source: scheduler::Error,
+        scheduler: String,
+        name: String,
+    },
+
+    #[snafu(display(
+        "Failed to create a cron schedule from the provided expression: '{cron}'\n{source}\nEnsure the cron expression is valid and try again."
+    ))]
+    FailedToCreateCronChannel {
+        cron: String,
+        source: scheduler::Error,
+    },
+
+    #[snafu(display(
+        "Failed to remove a schedule '{name}' from the '{scheduler}' scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToRemoveSchedule {
+        source: scheduler::Error,
+        scheduler: String,
+        name: String,
+    },
+
+    #[snafu(display(
+        "Failed to infer the worker type for the worker '{name}'.\nEnsure the worker has a valid configuration, and try again.\nFor details, visit: https://spiceai.org/docs/components/workers"
+    ))]
+    FailedToInferWorkerType { name: String },
 }
+
+const HTTP_SERVER: &str = "http_server";
+const METRICS_SERVER: &str = "metrics_server";
+const FLIGHT_SERVER: &str = "flight_server";
+const OPENTELEMETRY_SERVER: &str = "opentelemetry_server";
+const PODS_WATCHER: &str = "pods_watcher";
+const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
+
+// Allow 30 seconds for tasks for graceful shutdown
+const RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -285,7 +418,9 @@ pub struct Runtime {
     models: Arc<RwLock<HashMap<String, Model>>>,
     llms: Arc<RwLock<LLMModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
+    workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
+    tool_factories: Arc<Mutex<HashMap<String, ToolFactory>>>,
     evals: Arc<RwLock<Vec<Eval>>>,
     eval_scorers: EvalScorerRegistry,
     pods_watcher: Arc<RwLock<Option<podswatcher::PodsWatcher>>>,
@@ -300,6 +435,11 @@ pub struct Runtime {
     spaced_tracer: Arc<tracers::SpacedTracer>,
 
     status: Arc<status::RuntimeStatus>,
+    runtime_tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
+    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+    token_provider_registry: Arc<TokenProviderRegistry>,
+
+    schedulers: Arc<ScheduleRegistry>,
 }
 
 impl Runtime {
@@ -333,8 +473,28 @@ impl Runtime {
         Arc::clone(&self.app)
     }
 
+    #[must_use]
+    pub fn tool_factories(&self) -> Arc<Mutex<HashMap<String, ToolFactory>>> {
+        Arc::clone(&self.tool_factories)
+    }
+
+    #[must_use]
+    pub fn accelerator_engine_registry(&self) -> Arc<AcceleratorEngineRegistry> {
+        Arc::clone(&self.accelerator_engine_registry)
+    }
+
+    #[must_use]
+    pub fn token_provider_registry(&self) -> Arc<TokenProviderRegistry> {
+        Arc::clone(&self.token_provider_registry)
+    }
+
+    #[must_use]
+    pub fn schedulers(&self) -> Arc<ScheduleRegistry> {
+        Arc::clone(&self.schedulers)
+    }
+
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
-    pub async fn extension(&self, name: &str) -> Option<Arc<dyn Extension>> {
+    pub async fn extension(self: Arc<Self>, name: &str) -> Option<Arc<dyn Extension>> {
         let extensions = self.extensions.read().await;
 
         if let Some(extension) = extensions.get(name) {
@@ -346,12 +506,12 @@ impl Runtime {
             let mut extensions = self.extensions.write().await;
             let mut extension = autoload_factory.create();
             let extension_name = extension.name().to_string();
-            if let Err(err) = extension.initialize(self).await {
+            if let Err(err) = extension.initialize(self.as_ref()).await {
                 tracing::error!("Unable to initialize extension {extension_name}: {err}");
                 return None;
             }
 
-            if let Err(err) = extension.on_start(self).await {
+            if let Err(err) = extension.on_start(Arc::clone(&self)).await {
                 tracing::error!("Unable to start extension {extension_name}: {err}");
                 return None;
             }
@@ -368,57 +528,98 @@ impl Runtime {
     /// The future returned by this function drives the individual server futures and will only return once the servers are shutdown.
     ///
     /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
+    #[allow(clippy::too_many_lines)]
     pub async fn start_servers(
         self: Arc<Self>,
         config: Config,
         tls_config: Option<Arc<TlsConfig>>,
         endpoint_auth: EndpointAuth,
     ) -> Result<()> {
-        self.register_metrics_table(self.prometheus_registry.is_some())
+        Arc::clone(&self)
+            .register_metrics_table(self.prometheus_registry.is_some())
             .await?;
 
+        // Start Http server
+        let cloned_tls_config = tls_config.clone();
+        let cloned_config = config.clone();
         let http_auth = endpoint_auth.http_auth.clone();
-        let http_server_future = tokio::spawn(http::start(
-            config.http_bind_address,
-            Arc::clone(&self),
-            config.clone().into(),
-            tls_config.clone(),
-            http_auth,
-        ));
+        let self_ref = Arc::clone(&self);
+        let http_shutdown = CancellationToken::new();
 
-        // Spawn the metrics server in the background
+        let http_future = self
+            .start_runtime_task(HTTP_SERVER, Some(http_shutdown.clone()), async move {
+                http::start(
+                    cloned_config.http_bind_address,
+                    self_ref,
+                    cloned_config.into(),
+                    cloned_tls_config,
+                    http_auth,
+                    Some(http_shutdown),
+                )
+                .await
+                .context(UnableToStartHttpServerSnafu)
+            })
+            .await;
+
+        // Start Metrics server
         let metrics_endpoint = self.metrics_endpoint;
         let prometheus_registry = self.prometheus_registry.clone();
         let cloned_tls_config = tls_config.clone();
-        tokio::spawn(async move {
-            if let Err(e) =
+
+        let metrics_future = self
+            .start_runtime_task(METRICS_SERVER, None, async move {
                 metrics_server::start(metrics_endpoint, prometheus_registry, cloned_tls_config)
                     .await
-            {
-                tracing::error!("Prometheus metrics server error: {e}");
-            }
-        });
+                    .context(UnableToStartMetricsServerSnafu)
+            })
+            .await;
 
-        let flight_server_future = tokio::spawn(flight::start(
-            config.flight_bind_address,
-            self.app.read().await.as_ref().map(Arc::clone),
-            Arc::clone(&self.df),
-            tls_config.clone(),
-            endpoint_auth.clone(),
-            Arc::clone(&self.rate_limits),
-        ));
-        let open_telemetry_server_future = tokio::spawn(opentelemetry::start(
-            config.open_telemetry_bind_address,
-            Arc::clone(&self.df),
-            tls_config.clone(),
-            endpoint_auth.grpc_auth.clone(),
-        ));
+        // Start Flight server
+        let flight_shutdown = CancellationToken::new();
+        let self_ref = Arc::clone(&self);
+        let cloned_tls_config = tls_config.clone();
+        let cloned_endpoint_auth = endpoint_auth.clone();
+        let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
 
-        let pods_watcher_future = if self.pods_watcher.read().await.is_some() {
-            Some(self.start_pods_watcher())
-        } else {
-            None
-        };
+        let flight_future = self
+            .start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
+                flight::start(
+                    config.flight_bind_address,
+                    cloned_app_ref,
+                    Arc::clone(&self_ref),
+                    cloned_tls_config,
+                    cloned_endpoint_auth,
+                    Arc::clone(&self_ref.rate_limits),
+                    Some(flight_shutdown),
+                )
+                .await
+                .context(UnableToStartFlightServerSnafu)
+            })
+            .await;
+
+        // Start OpenTelemetry server
+        let opentelemetry_graceful_shutdown = CancellationToken::new();
+        let df_ref = Arc::clone(&self.df);
+        let cloned_tls_config = tls_config.clone();
+        let grpc_auth = endpoint_auth.grpc_auth.clone();
+
+        let opentelemetry_future = self
+            .start_runtime_task(
+                OPENTELEMETRY_SERVER,
+                Some(opentelemetry_graceful_shutdown.clone()),
+                async move {
+                    opentelemetry::start(
+                        config.open_telemetry_bind_address,
+                        df_ref,
+                        cloned_tls_config,
+                        grpc_auth,
+                        Some(opentelemetry_graceful_shutdown),
+                    )
+                    .await
+                    .context(UnableToStartOpenTelemetryServerSnafu)
+                },
+            )
+            .await;
 
         if let Some(tls_config) = tls_config {
             match tls_config.subject_name() {
@@ -431,55 +632,57 @@ impl Runtime {
             }
         }
 
-        tokio::select! {
-            http_res = http_server_future => {
-                match http_res {
-                    Ok(http_res) => http_res.context(UnableToStartHttpServerSnafu),
-                    Err(source) => {
-                        Err(Error::UnableToJoinTask { source })
-                    }
-                }
-             },
-            flight_res = flight_server_future => {
-                match flight_res {
-                    Ok(flight_res) => flight_res.context(UnableToStartFlightServerSnafu),
-                    Err(source) => {
-                        Err(Error::UnableToJoinTask { source })
-                    }
-                }
-            },
-            open_telemetry_res = open_telemetry_server_future => {
-                match open_telemetry_res {
-                    Ok(open_telemetry_res) => open_telemetry_res.context(UnableToStartOpenTelemetryServerSnafu),
-                    Err(source) => {
-                        Err(Error::UnableToJoinTask { source })
-                    }
-                }
-            },
-            pods_watcher_res = async {
-                if let Some(fut) = pods_watcher_future {
-                    fut.await
-                } else {
-                    futures::future::pending().await
-                }
-            } => {
-                pods_watcher_res.context(UnableToInitializePodsWatcherSnafu)
-            },
-            () = shutdown_signal() => {
-                tracing::info!("Goodbye!");
+        // Start Spicepod watcher
+        let self_ref = Arc::clone(&self);
+        let pods_watcher_future = self
+            .start_runtime_task(PODS_WATCHER, None, async move {
+                self_ref
+                    .start_pods_watcher()
+                    .await
+                    .context(UnableToInitializePodsWatcherSnafu)
+            })
+            .await;
+
+        // Shutdown signal
+        let shutdown_signal_future = async {
+            let graceful_shutdown = async {
+                shutdown_signal().await;
+                tracing::debug!("Shutdown signal received. Press Ctrl-C again to force exit.");
+                self.shutdown().await;
                 Ok(())
-            },
+            };
+            tokio::select! {
+                result = graceful_shutdown => result,
+                () = force_shutdown_signal() => {
+                    tracing::info!("Force shutdown signal received. Terminating immediately.");
+                    // return error to force stop waiting for other tasks and terminate immediately
+                    Err(Error::ForceTerminated)
+                }
+            }
+        };
+
+        // wait for all servers to shut down or if any of the servers fail to start
+        match tokio::try_join!(
+            http_future,
+            flight_future,
+            metrics_future,
+            opentelemetry_future,
+            pods_watcher_future,
+            shutdown_signal_future
+        ) {
+            Err(err) => Err(err),
+            _ => Ok(()),
         }
     }
 
     /// Updates all of the component statuses to `Initializing`.
-    pub async fn set_components_initializing(&self) {
+    pub async fn set_components_initializing(self: Arc<Self>) {
         let app_lock = self.app.read().await;
         let Some(app) = app_lock.as_ref() else {
             return;
         };
 
-        let valid_datasets = Self::get_valid_datasets(app, LogErrors(false));
+        let valid_datasets = Arc::clone(&self).get_valid_datasets(app, LogErrors(false));
         for ds in &valid_datasets {
             self.status
                 .update_dataset(&ds.name, ComponentStatus::Initializing);
@@ -501,19 +704,24 @@ impl Runtime {
                     .update_tool(&tool.name, ComponentStatus::Initializing);
             }
 
-            for tool_catalog in default_available_catalogs() {
+            for catalog_name in default_catalog_names() {
                 self.status
-                    .update_tool_catalog(tool_catalog.name(), ComponentStatus::Initializing);
+                    .update_tool_catalog(catalog_name, ComponentStatus::Initializing);
+            }
+
+            for model in &app.models {
+                self.status
+                    .update_model(&model.name, ComponentStatus::Initializing);
             }
         }
 
-        let valid_catalogs = Self::get_valid_catalogs(app, LogErrors(false));
+        let valid_catalogs = Arc::clone(&self).get_valid_catalogs(app, LogErrors(false));
         for catalog in valid_catalogs {
             self.status
                 .update_catalog(&catalog.name, ComponentStatus::Initializing);
         }
 
-        let valid_views = Self::get_valid_views(app, LogErrors(false));
+        let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
         for view in valid_views {
             self.status
                 .update_view(&view.name, ComponentStatus::Initializing);
@@ -524,17 +732,18 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
-    pub async fn load_components(&self) {
-        self.set_components_initializing().await;
+    #[allow(clippy::too_many_lines)]
+    pub async fn load_components(self: Arc<Self>) {
+        Arc::clone(&self).set_components_initializing().await;
 
-        self.start_extensions().await;
+        Arc::clone(&self).start_extensions().await;
 
         // Must be loaded before datasets
         self.load_embeddings().await;
 
         // Spawn each component load in its own task to run in parallel
         let task_history = tokio::spawn({
-            let self_clone = self.clone();
+            let self_clone = Arc::clone(&self);
             async move {
                 if let Err(err) = self_clone.init_task_history().await {
                     tracing::warn!("Creating internal task history table: {err}");
@@ -542,81 +751,284 @@ impl Runtime {
             }
         });
 
-        let results_cache = tokio::spawn({
-            let self_clone = self.clone();
-            async move {
-                self_clone.init_results_cache().await;
-            }
-        });
-
         let datasets = tokio::spawn({
-            let self_clone = Arc::new(self.clone());
+            let self_clone = Arc::clone(&self);
             async move {
                 self_clone.load_datasets().await;
             }
         });
 
         let catalogs = tokio::spawn({
-            let self_clone = self.clone();
+            let self_clone = Arc::clone(&self);
             async move {
                 self_clone.load_catalogs().await;
             }
         });
 
-        let models = tokio::spawn({
-            let self_clone = self.clone();
-            async move {
-                self_clone.load_models().await;
-            }
-        });
+        let models_and_evals = tokio::spawn({
+            let self_clone = Arc::clone(&self);
 
-        let eval_scorer = tokio::spawn({
-            let self_clone = self.clone();
+            // This cannot be done earlier since we must have a `Arc<Runtime>` to provide to factories.
+            tools::factory::register_all_factories(Arc::clone(&self_clone)).await;
+
             async move {
-                let app_lock = self_clone.app.read().await;
+                Arc::clone(&self_clone).load_models().await;
+                let app_ref = Arc::clone(&self_clone).app();
+                let app_lock = app_ref.read().await;
 
                 if !cfg!(feature = "models")
                     && app_lock.as_ref().is_some_and(|s| !s.evals.is_empty())
                 {
-                    tracing::error!("Cannot load evals without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}");
+                    tracing::error!(
+                        "Cannot load evals without the 'models' feature enabled. {ENABLE_MODEL_SUPPORT_MESSAGE}"
+                    );
                 }
 
                 #[cfg(feature = "models")]
                 {
+                    Arc::clone(&self_clone).load_workers().await;
                     self_clone.load_eval_scorer().await;
+                    let () = self_clone.verify_evals().await;
                     let an_eval_exists = app_lock.as_ref().is_some_and(|app| !app.evals.is_empty());
-                    if !an_eval_exists {
-                        tracing::trace!("No eval spice components defined. Therefore not loading eval tables into database.");
-                    } else if let Err(err) = self_clone.load_eval_tables().await {
-                        tracing::warn!("Creating internal eval run table: {err}");
+                    if an_eval_exists {
+                        drop(app_lock);
+                        if let Err(err) = self_clone.load_eval_tables().await {
+                            tracing::warn!("Failed to create internal eval tables: {err}");
+                        }
+                    } else {
+                        tracing::trace!(
+                            "No eval spice components defined. Therefore not loading eval tables into database."
+                        );
                     }
                 }
             }
         });
 
-        // Wait for all tasks to complete
-        let load_result = tokio::try_join!(
-            task_history,
-            results_cache,
-            datasets,
-            catalogs,
-            models,
-            eval_scorer
-        );
+        if let Some(cfg) = self
+            .app
+            .read()
+            .await
+            .as_ref()
+            .and_then(|app| app.management.as_ref())
+        {
+            if let Err(err) = management::init_management(Arc::clone(&self), cfg).await {
+                tracing::error!("Failed to initialize management of the Spice runtime: {err}");
+            }
+        }
 
-        if let Err(err) = load_result {
-            tracing::error!("Could not start the Spice runtime: {err}");
+        let components = vec![task_history, datasets, catalogs, models_and_evals];
+
+        // Signal that the load must be canceled if the runtime is shut down before the components are loaded
+        let cancel_loading = CancellationToken::new();
+
+        // Wait for all components to load returning the first error
+        // or canceling spawned tokio tasks if the runtime is shutting down
+        let load_result = self
+            .start_runtime_task(
+                COMPONENTS_INITIAL_LOAD,
+                Some(cancel_loading.clone()),
+                async move {
+                    let abort_handlers = components
+                        .iter()
+                        .map(JoinHandle::abort_handle)
+                        .collect::<Vec<_>>();
+
+                    tokio::select! {
+                        load_result = try_join_all(components) => {
+                            load_result.map(|_| ()).context(ComponentsInitializationFailedSnafu)
+                        }
+                        () = cancel_loading.cancelled() => {
+                            for handle in abort_handlers {
+                                handle.abort();
+                            }
+                            ComponentsInitializationCancelledSnafu.fail()
+                        }
+                    }
+                },
+            )
+            .await;
+
+        if let Err(err) = load_result.await {
+            if !matches!(err, Error::ComponentsInitializationCancelled) {
+                tracing::error!("Could not start the Spice runtime: {err}");
+            }
+        } else {
+            // Create a background task to report once all components are marked as `Ready`
+            let status = self.status();
+            tokio::spawn({
+                async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                        if status.is_shutdown() {
+                            break;
+                        }
+                        if status.is_ready() {
+                            if let Some(app) = self.app.read().await.as_ref() {
+                                let valid_datasets =
+                                    Arc::clone(&self).get_valid_datasets(app, LogErrors(false));
+                                let valid_catalogs =
+                                    Arc::clone(&self).get_valid_catalogs(app, LogErrors(false));
+                                if valid_datasets.is_empty() && valid_catalogs.is_empty() {
+                                    tracing::info!(
+                                        "No datasets or catalogs were configured. If this is unexpected, check the Spicepod configuration."
+                                    );
+                                }
+                            }
+                            tracing::info!("All components are loaded. Spice runtime is ready!");
+                            break;
+                        }
+                    }
+                }
+            });
         }
     }
 
     // Closes and deallocates all resources (including the static registries)
-    pub async fn close(self) {
+    pub async fn shutdown(&self) {
+        if self.status.is_shutdown() {
+            return;
+        }
+
+        self.status.mark_shutdown();
+
+        let shutdown_timeout: Duration = self.app.read().await.as_ref().and_then(|app| {
+            app.runtime.shutdown_timeout().unwrap_or_else(|err| {
+                tracing::warn!("Invalid shutdown timeout: {err}. Using default: {RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT:?}");
+                Some(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT)
+            })
+        }).unwrap_or(RUNTIME_DEFAULT_SHUTDOWN_TIMEOUT);
+        tracing::info!(
+            "Shutdown initiated; waiting up to {shutdown_timeout:?} for connections to drain"
+        );
+
+        let start_time = Instant::now();
+
+        // shutdown all running components except the HTTP and Metrics servers
+        let mut runtime_tasks = self.runtime_tasks.write().await;
+
+        // HTTP and METRICS servers must be shutdown last
+        let mut first_shutdown_group = Vec::new();
+        let mut last_shutdown_group = Vec::new();
+
+        for (name, handle) in runtime_tasks.drain() {
+            match name.as_str() {
+                HTTP_SERVER | METRICS_SERVER => last_shutdown_group.push((name, handle)),
+                _ => first_shutdown_group.push((name, handle)),
+            }
+        }
+
+        let shutdown_futures: Vec<_> = first_shutdown_group
+            .into_iter()
+            .filter_map(|(name, handle)| {
+                if handle.is_finished() {
+                    None
+                } else {
+                    tracing::debug!("Shutting down {name}");
+                    Some(handle.cancel(shutdown_timeout))
+                }
+            })
+            .collect();
+
+        join_all(shutdown_futures).await;
+
+        // Clean up DataFusion first as there could be datasets loading and accessing registries below.
+        self.df.shutdown().await;
         dataconnector::unregister_all().await;
         catalogconnector::unregister_all().await;
-        dataaccelerator::unregister_all().await;
-        tools::factory::unregister_all_factories().await;
+        self.accelerator_engine_registry.unregister_all().await;
+        tools::factory::unregister_all_factories(self).await;
+
         document_parse::unregister_all().await;
-        self.df.shutdown().await;
+
+        // Measure elapsed time since shutdown started and calculate remaining time within the configured timeout. Remaining shutdown
+        // group includes only Metrics and HTTP Healthcheck endpoints; general HTTP API endpoints have already stopped accepting requests.
+        let elapsed = start_time.elapsed();
+        let remaining_timeout = shutdown_timeout.saturating_sub(elapsed);
+
+        // Shutdown HTTP & Metrics servers last
+        let shutdown_futures: Vec<_> = last_shutdown_group
+            .into_iter()
+            .map(|(name, handle)| {
+                tracing::debug!("Shutting down {name}");
+                handle.cancel(remaining_timeout)
+            })
+            .collect();
+
+        join_all(shutdown_futures).await;
+
+        tracing::debug!("Shutdown completed");
+    }
+
+    /// Spawns and registers a runtime task with optional cancellation support.
+    async fn start_runtime_task<F>(
+        self: &Arc<Self>,
+        component_name: &str,
+        cancellation_token: Option<CancellationToken>,
+        task_fn: F,
+    ) -> impl Future<Output = Result<(), Error>>
+    where
+        F: Future<Output = Result<(), Error>> + Send + 'static,
+    {
+        let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn);
+
+        self.runtime_tasks
+            .write()
+            .await
+            .insert(component_name.to_string(), handle);
+
+        future
+    }
+
+    /// List all tools available in the runtime, either within a catalog or standalone.
+    ///
+    /// Tools from default catalogs are also loaded individually, so the default catalogs must be ignored.
+    ///
+    /// For tools from catalog, the name is prefixed with the catalog name. e.g. `catalog_name/tool_name`.
+    fn list_all_tools(self: &Arc<Self>) -> impl Stream<Item = Arc<dyn SpiceModelTool>> {
+        let default_catalogs = default_available_catalogs(Arc::clone(self));
+        let stream_self = Arc::clone(self);
+        stream! {
+            let tool_lock = stream_self.tools.read().await;
+            let default_catalog_names = default_catalogs
+                .iter()
+                .map(|c| c.name())
+                .collect::<HashSet<_>>();
+            for (name, tooling) in tool_lock.iter() {
+                match tooling {
+                    Tooling::Tool(tool) => {
+                        yield Arc::clone(tool);
+                    }
+                    Tooling::Catalog(catalog) => {
+                        // Do not list tools from default catalogs. They are already listed individually as tools.
+                        if default_catalog_names.contains(&name.as_str()) {
+                            continue;
+                        }
+                        let all = catalog.all().await;
+                        for tool in all {
+                            yield with_name(&tool, format!("{}/{}", catalog.name(), tool.name()).as_str());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub async fn get_tool(self: &Arc<Self>, tool_name: &str) -> Option<Arc<dyn SpiceModelTool>> {
+        let tools = self.tools.read().await;
+        let tool: Arc<dyn SpiceModelTool> =
+            if let Some((catalog_name, name)) = tool_name.split_once('/') {
+                let Some(Tooling::Catalog(catalog)) = tools.get(catalog_name) else {
+                    return None;
+                };
+                return catalog.get(name).await;
+            } else {
+                let Some(Tooling::Tool(tool)) = tools.get(tool_name) else {
+                    return None;
+                };
+                Arc::clone(tool)
+            };
+        Some(tool)
     }
 }
 
@@ -652,4 +1064,14 @@ pub fn spice_data_base_path() -> String {
 pub(crate) fn make_spice_data_directory() -> Result<()> {
     let base_folder = spice_data_base_path();
     std::fs::create_dir_all(base_folder).context(UnableToCreateDirectorySnafu)
+}
+
+pub fn in_tracing_context<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+        .with_ansi(true)
+        .finish();
+    subscriber::with_default(subscriber, f)
 }

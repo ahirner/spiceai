@@ -25,6 +25,7 @@ on:
     branches:
       - trunk
       - release-*
+      - release/*
     paths-ignore:
       - 'docs/**'
       - 'README.md'
@@ -38,21 +39,26 @@ env:
 jobs:
   license-check-rust:
     name: Check Rust Licenses
-    runs-on: spiceai-runners
+    runs-on: spiceai-macos
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up make
-        uses: ./.github/actions/setup-make
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+        with:
+          os: macos
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny || true
 
       - name: Check Rust Licenses
-        run: make dep-licenses |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
+        run: cargo deny check licenses
 
   license-check-go:
     name: Check Golang Licenses
-    runs-on: spiceai-runners
+    runs-on: spiceai-macos
     env:
-      GOVER: 1.23.4
+      GOVER: 1.24.2
 
     steps:
       - uses: actions/checkout@v4
@@ -68,4 +74,4 @@ jobs:
       - name: Check spice licenses
         working-directory: bin/spice
         run: |
-          go-licenses csv . |& ${{ env.FORBIDDEN_LICENSE_CHECK }}
+          go-licenses csv . 2>&1 | ${{ env.FORBIDDEN_LICENSE_CHECK }}

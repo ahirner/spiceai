@@ -17,6 +17,8 @@ limitations under the License.
 use regex::Regex;
 use std::{collections::HashMap, fmt::Display, path::Path, sync::LazyLock};
 
+use crate::metric::Metrics;
+
 use super::{Nameable, WithDependsOn};
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
@@ -48,6 +50,9 @@ pub struct Model {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<Metrics>,
 }
 
 impl Nameable for Model {
@@ -67,6 +72,7 @@ impl WithDependsOn<Model> for Model {
             params: self.params.clone(),
             datasets: self.datasets.clone(),
             depends_on: depends_on.to_vec(),
+            metrics: self.metrics.clone(),
         }
     }
 }
@@ -83,6 +89,30 @@ pub enum ModelSource {
     Perplexity,
     SpiceAI,
     File,
+    Databricks,
+}
+
+impl ModelSource {
+    pub fn parse_from(&self, from: &str) -> Option<String> {
+        match self {
+            ModelSource::HuggingFace => HUGGINGFACE_PATH_REGEX.captures(from).map(|caps| {
+                let model = format!("{}/{}", &caps["org"], &caps["model"]);
+                if let Some(revision) = caps.name("revision") {
+                    format!("{}:{}", model, revision.as_str())
+                } else {
+                    model
+                }
+            }),
+            p => {
+                if let Some(stripped) = from.strip_prefix(&format!("{p}:")) {
+                    Some(stripped.to_string())
+                } else {
+                    from.strip_prefix(&format!("{p}/"))
+                        .map(std::string::ToString::to_string)
+                }
+            }
+        }
+    }
 }
 
 // Matches model paths in these formats:
@@ -133,6 +163,8 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::Xai)
         } else if value.starts_with("spiceai") {
             Ok(ModelSource::SpiceAI)
+        } else if value.starts_with("databricks") {
+            Ok(ModelSource::Databricks)
         } else {
             Err("Unknown prefix")
         }
@@ -151,6 +183,24 @@ impl Display for ModelSource {
             ModelSource::HuggingFace => write!(f, "huggingface"),
             ModelSource::File => write!(f, "file"),
             ModelSource::SpiceAI => write!(f, "spiceai"),
+            ModelSource::Databricks => write!(f, "databricks"),
+        }
+    }
+}
+
+impl ModelSource {
+    #[must_use]
+    pub fn short_name(&self) -> &'static str {
+        match self {
+            ModelSource::OpenAi => "openai",
+            ModelSource::Azure => "azure",
+            ModelSource::Xai => "xai",
+            ModelSource::Anthropic => "anthropic",
+            ModelSource::Perplexity => "perplexity",
+            ModelSource::HuggingFace => "hf",
+            ModelSource::File => "file",
+            ModelSource::SpiceAI => "spiceai",
+            ModelSource::Databricks => "databricks",
         }
     }
 }
@@ -183,6 +233,7 @@ impl Model {
             params: HashMap::default(),
             datasets: Vec::default(),
             depends_on: Vec::default(),
+            metrics: None,
         }
     }
 
@@ -288,28 +339,7 @@ impl Model {
     ///    - Source: `gpt-4o`
     #[must_use]
     pub fn get_model_id(&self) -> Option<String> {
-        match self.get_source() {
-            Some(ModelSource::HuggingFace) => {
-                HUGGINGFACE_PATH_REGEX.captures(&self.from).map(|caps| {
-                    let model = format!("{}/{}", &caps["org"], &caps["model"]);
-                    if let Some(revision) = caps.name("revision") {
-                        format!("{}:{}", model, revision.as_str())
-                    } else {
-                        model
-                    }
-                })
-            }
-            Some(p) => {
-                let from = &self.from;
-                if let Some(stripped) = from.strip_prefix(&format!("{p}:")) {
-                    Some(stripped.to_string())
-                } else {
-                    from.strip_prefix(&format!("{p}/"))
-                        .map(std::string::ToString::to_string)
-                }
-            }
-            None => None,
-        }
+        self.get_source()?.parse_from(self.from.as_str())
     }
 
     /// Attempts to determine the model's type based on its `from` field and, `files` and `params`.
@@ -334,13 +364,14 @@ impl Model {
                 | ModelSource::OpenAi
                 | ModelSource::Anthropic
                 | ModelSource::Xai
+                | ModelSource::Databricks
         ) {
             return Some(ModelType::Llm);
         }
 
         if source == ModelSource::SpiceAI {
             return Some(ModelType::Ml);
-        };
+        }
 
         let files = self.get_all_files();
 
@@ -371,22 +402,6 @@ impl Model {
         }
 
         None
-    }
-
-    /// Returns the subset of [`Self::params`] that are `OpenAI` request overrides. These will be
-    /// used as the default values in the request payload, instead of the provider's defaults.
-    ///
-    /// `OpenAI` request overrides are parameters that start with `openai_`. The returned keys will be
-    /// without the `openai_` prefix.
-    #[must_use]
-    pub fn get_openai_request_overrides(&self) -> Vec<(String, Value)> {
-        self.params
-            .iter()
-            .filter_map(|(k, v)| {
-                k.strip_prefix("openai_")
-                    .map(|new_k| (new_k.to_string(), v.clone()))
-            })
-            .collect()
     }
 }
 

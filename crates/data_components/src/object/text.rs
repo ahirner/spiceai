@@ -24,21 +24,22 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use datafusion::{
     catalog::Session,
-    common::{project_schema, Constraints},
+    common::{Constraints, project_schema},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown},
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
-        ExecutionPlan, Partitioning, PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
     },
 };
 use document_parse::DocumentParser;
 use futures::Stream;
 use futures::StreamExt;
-use object_store::{path::Path, GetResult, ObjectMeta, ObjectStore};
+use object_store::{GetResult, ObjectMeta, ObjectStore, path::Path};
 use snafu::ResultExt;
 use std::{any::Any, fmt, sync::Arc};
 
@@ -80,24 +81,20 @@ impl ObjectStoreTextTable {
         ])
     }
 
-    fn to_record_batch(
-        meta_list: &[ObjectMeta],
-        raw: &[Bytes],
-        formatter: Option<&Arc<dyn DocumentParser>>,
-    ) -> Result<RecordBatch, ArrowError> {
-        if meta_list.len() != raw.len() {
-            return Err(ArrowError::ParseError("Length mismatch".to_string()));
-        }
-
-        let schema = Self::table_schema();
-
-        let location_array: ArrayRef = Arc::new(StringArray::from(
+    fn get_location_value(meta_list: &[ObjectMeta]) -> ArrayRef {
+        Arc::new(StringArray::from(
             meta_list
                 .iter()
                 .map(|meta| meta.location.to_string())
                 .collect::<Vec<_>>(),
-        ));
+        ))
+    }
 
+    fn get_content_value(
+        raw: &[Bytes],
+        formatter: Option<&Arc<dyn DocumentParser>>,
+        meta_list: &[ObjectMeta],
+    ) -> Result<ArrayRef, ArrowError> {
         let utf8_strings: Result<Vec<_>, ArrowError> = raw
             .iter()
             .enumerate()
@@ -120,11 +117,48 @@ impl ObjectStoreTextTable {
             })
             .collect();
 
-        let content_array: ArrayRef = Arc::new(StringArray::from(
+        Ok(Arc::new(StringArray::from(
             utf8_strings?.into_iter().collect::<Vec<_>>(),
-        ));
+        )))
+    }
 
-        RecordBatch::try_new(Arc::new(schema), vec![location_array, content_array])
+    fn get_field_value(
+        meta_list: &[ObjectMeta],
+        raw: &[Bytes],
+        field_name: &str,
+        formatter: Option<&Arc<dyn DocumentParser>>,
+    ) -> Result<ArrayRef, ArrowError> {
+        match field_name {
+            "location" => Ok(Self::get_location_value(meta_list)),
+            "content" => Self::get_content_value(raw, formatter, meta_list),
+            _ => Err(ArrowError::SchemaError(format!(
+                "Unsupported field name: {field_name}",
+            ))),
+        }
+    }
+
+    fn to_record_batch(
+        meta_list: &[ObjectMeta],
+        raw: &[Bytes],
+        formatter: Option<&Arc<dyn DocumentParser>>,
+        schema: SchemaRef,
+    ) -> Result<RecordBatch, ArrowError> {
+        if meta_list.len() != raw.len() {
+            return Err(ArrowError::ParseError("Length mismatch".to_string()));
+        }
+
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|field| {
+                let field_name = field.name();
+                Self::get_field_value(meta_list, raw, field_name, formatter).map_err(|e| {
+                    ArrowError::SchemaError(format!("Error getting field {field_name}: {e}"))
+                })
+            })
+            .collect::<Result<Vec<_>, ArrowError>>()?;
+
+        RecordBatch::try_new(schema, columns)
     }
 }
 
@@ -236,7 +270,12 @@ impl ExecutionPlan for ObjectStoreTextExec {
     ) -> DataFusionResult<SendableRecordBatchStream> {
         Ok(Box::pin(RecordBatchStreamAdapter::new(
             self.schema(),
-            to_sendable_stream(self.ctx.clone(), self.formatter.clone(), self.limit), // TODO get prefix from filters
+            to_sendable_stream(
+                self.ctx.clone(),
+                self.formatter.clone(),
+                self.limit,
+                self.schema(),
+            ),
         )))
     }
 }
@@ -256,7 +295,8 @@ impl ObjectStoreTextExec {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             ),
             ctx,
             formatter,
@@ -268,6 +308,7 @@ pub(crate) fn to_sendable_stream(
     ctx: ObjectStoreContext,
     formatter: Option<Arc<dyn DocumentParser>>,
     limit: Option<usize>,
+    schema: SchemaRef,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> + 'static {
     stream! {
         let mut object_stream = ctx.store.list(ctx.prefix.clone().map(Path::from).as_ref());
@@ -281,10 +322,10 @@ pub(crate) fn to_sendable_stream(
                     continue;
                     }
 
-                    let result: GetResult = ctx.store.get(&object_meta.location).await?;
-                    let bytz = result.bytes().await?;
+                    let result: GetResult = ctx.store.get(&object_meta.location).await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
+                    let bytz = result.bytes().await.map_err(|e| DataFusionError::Execution(format!("{e}")))?;
 
-                    match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz], formatter.as_ref()) {
+                    match ObjectStoreTextTable::to_record_batch(&[object_meta], &[bytz], formatter.as_ref(), Arc::clone(&schema)) {
                         Ok(batch) => {
                             let n = batch.num_rows();
                             yield Ok(batch);

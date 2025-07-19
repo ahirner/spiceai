@@ -15,40 +15,55 @@ limitations under the License.
 */
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
+    num::NonZeroUsize,
     sync::{Arc, RwLock},
 };
 
-use cache::QueryResultsCacheProvider;
+use crate::{
+    dataaccelerator::AcceleratorEngineRegistry, datafusion::SPICE_SCP_SCHEMA,
+    object_store_registry::SpiceObjectStoreRegistry,
+    search::full_text::analyzer_rule::FullTextUDTFAnalyzerRule,
+};
+use cache::Caching;
 use datafusion::{
-    catalog_common::{CatalogProvider, MemoryCatalogProvider},
-    execution::SessionStateBuilder,
+    catalog::{CatalogProvider, MemoryCatalogProvider},
+    execution::{
+        SessionStateBuilder,
+        disk_manager::DiskManagerConfig,
+        memory_pool::{FairSpillPool, MemoryPool, TrackConsumersPool, UnboundedMemoryPool},
+        runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
+    },
     optimizer::{
-        analyzer::{
-            count_wildcard_rule::CountWildcardRule, expand_wildcard_rule::ExpandWildcardRule,
-            inline_table_scan::InlineTableScan, resolve_grouping_function::ResolveGroupingFunction,
-            type_coercion::TypeCoercion,
-        },
         AnalyzerRule,
+        analyzer::{
+            resolve_grouping_function::ResolveGroupingFunction, type_coercion::TypeCoercion,
+        },
     },
     prelude::{SessionConfig, SessionContext},
 };
-use datafusion_federation::FederationAnalyzerRule;
-use tokio::sync::RwLock as TokioRwLock;
+use datafusion_federation::sql::federation_analyzer_rule;
+use tokio::sync::{RwLock as TokioRwLock, Semaphore};
 
-use crate::{embeddings, object_store_registry::default_runtime_env, status};
+use crate::status;
 
 use super::{
-    extension::{bytes_processed::BytesProcessedOptimizerRule, SpiceQueryPlanner},
-    schema::SpiceSchemaProvider,
     DataFusion, SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA, SPICE_METADATA_SCHEMA,
     SPICE_RUNTIME_SCHEMA,
+    extension::{SpiceQueryPlanner, bytes_processed::BytesProcessedOptimizerRule},
+    schema::SpiceSchemaProvider,
+    udf::register_udfs,
 };
 
 pub struct DataFusionBuilder {
     config: SessionConfig,
     status: Arc<status::RuntimeStatus>,
-    cache_provider: Option<Arc<QueryResultsCacheProvider>>,
+    accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+    memory_limit: Option<u64>,
+    temp_directory: Option<String>,
+    accelerated_refresh_semaphore: Option<Arc<Semaphore>>,
+    task_history_enabled: bool,
+    caching: Option<Arc<Caching>>,
 }
 
 pub(crate) fn get_df_default_config() -> SessionConfig {
@@ -81,7 +96,10 @@ pub(crate) fn get_df_default_config() -> SessionConfig {
 
 impl DataFusionBuilder {
     #[must_use]
-    pub fn new(status: Arc<status::RuntimeStatus>) -> Self {
+    pub fn new(
+        status: Arc<status::RuntimeStatus>,
+        accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
+    ) -> Self {
         let mut df_config = get_df_default_config()
             .with_information_schema(true)
             .with_create_default_catalog_and_schema(false);
@@ -92,13 +110,46 @@ impl DataFusionBuilder {
         Self {
             config: df_config,
             status,
-            cache_provider: None,
+            accelerator_engine_registry,
+            memory_limit: None,
+            temp_directory: None,
+            accelerated_refresh_semaphore: None,
+            task_history_enabled: true,
+            caching: None,
         }
     }
 
     #[must_use]
-    pub fn with_cache_provider(mut self, cache_provider: Arc<QueryResultsCacheProvider>) -> Self {
-        self.cache_provider = Some(cache_provider);
+    pub fn with_task_history(mut self, task_history: bool) -> Self {
+        self.task_history_enabled = task_history;
+        self
+    }
+
+    #[must_use]
+    pub fn with_caching(mut self, caching: Arc<Caching>) -> Self {
+        self.caching = Some(caching);
+        self
+    }
+
+    #[must_use]
+    pub fn memory_limit(mut self, memory_limit: Option<u64>) -> Self {
+        self.memory_limit = memory_limit;
+        self
+    }
+
+    #[must_use]
+    pub fn temp_directory(mut self, temp_directory: Option<String>) -> Self {
+        self.temp_directory = temp_directory;
+        self
+    }
+
+    #[must_use]
+    pub fn max_parallel_accelerated_refreshes(
+        mut self,
+        max_parallel_accelerated_refreshes: usize,
+    ) -> Self {
+        self.accelerated_refresh_semaphore =
+            Some(Arc::new(Semaphore::new(max_parallel_accelerated_refreshes)));
         self
     }
 
@@ -113,19 +164,17 @@ impl DataFusionBuilder {
             .with_config(self.config)
             .with_default_features()
             .with_query_planner(Arc::new(SpiceQueryPlanner::new()))
-            .with_runtime_env(default_runtime_env())
+            .with_runtime_env(runtime_env(self.memory_limit, self.temp_directory.clone()))
             .with_analyzer_rules(get_analyzer_rules())
             .build();
 
         if let Err(e) = datafusion_functions_json::register_all(&mut state) {
             panic!("Unable to register JSON functions: {e}");
-        };
+        }
 
         let ctx = SessionContext::new_with_state(state);
         ctx.add_optimizer_rule(Arc::new(BytesProcessedOptimizerRule::new()));
-        ctx.register_udf(embeddings::cosine_distance::CosineDistance::new().into());
-        ctx.register_udf(crate::datafusion::udf::Greatest::new().into());
-        ctx.register_udf(crate::datafusion::udf::Least::new().into());
+        register_udfs(&ctx);
         let catalog = MemoryCatalogProvider::new();
         let default_schema = SpiceSchemaProvider::new();
         let runtime_schema = SpiceSchemaProvider::new();
@@ -160,19 +209,33 @@ impl DataFusionBuilder {
         match catalog.register_schema(SPICE_METADATA_SCHEMA, Arc::new(metadata_schema)) {
             Ok(_) => {}
             Err(e) => {
-                panic!("Unable to register spice runtime schema: {e}");
+                panic!("Unable to register spice metadata schema: {e}");
+            }
+        }
+
+        match catalog.register_schema(SPICE_SCP_SCHEMA, Arc::new(SpiceSchemaProvider::new())) {
+            Ok(_) => {}
+            Err(e) => {
+                panic!("Unable to register spice cloud platform schema: {e}");
             }
         }
 
         ctx.register_catalog(SPICE_DEFAULT_CATALOG, Arc::new(catalog));
 
+        let caching = self.caching.unwrap_or(Arc::new(Caching::default()));
+
         DataFusion {
             runtime_status: self.status,
             ctx: Arc::new(ctx),
             data_writers: RwLock::new(HashSet::new()),
-            cache_provider: RwLock::new(self.cache_provider),
+            caching,
             pending_sink_tables: TokioRwLock::new(Vec::new()),
+            deferred_tables: TokioRwLock::new(HashMap::new()),
+            deferred_catalogs: TokioRwLock::new(HashMap::new()),
             accelerated_tables: TokioRwLock::new(HashSet::new()),
+            accelerator_engine_registry: self.accelerator_engine_registry,
+            acceleration_refresh_semaphore: self.accelerated_refresh_semaphore,
+            task_history_enabled: self.task_history_enabled,
         }
     }
 }
@@ -181,16 +244,68 @@ impl DataFusionBuilder {
 /// as opposed to when underlying federated query engines will execute the query.
 ///
 /// This list should be kept in sync with the default rules in `Analyzer::new()`, but with the federation analyzer rule added.
-fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
+#[must_use]
+pub fn get_analyzer_rules() -> Vec<Arc<dyn AnalyzerRule + Send + Sync>> {
     vec![
-        Arc::new(InlineTableScan::new()),
-        Arc::new(ExpandWildcardRule::new()),
-        Arc::new(FederationAnalyzerRule::new()),
+        Arc::new(federation_analyzer_rule()),
         // The rest of these rules are run after the federation analyzer since they only affect internal DataFusion execution.
+        Arc::new(FullTextUDTFAnalyzerRule {}),
         Arc::new(ResolveGroupingFunction::new()),
         Arc::new(TypeCoercion::new()),
-        Arc::new(CountWildcardRule::new()),
     ]
+}
+
+// This method uses unwrap_or_default, however it should never fail on the initialization. See
+// RuntimeEnv::default()
+pub(crate) fn runtime_env(
+    memory_limit: Option<u64>,
+    temp_directory: Option<String>,
+) -> Arc<RuntimeEnv> {
+    let disk_manager = if let Some(directory) = temp_directory {
+        DiskManagerConfig::new_specified(vec![directory.into()])
+    } else {
+        DiskManagerConfig::new()
+    };
+
+    let memory_pool: Arc<dyn MemoryPool> = if let Some(limit) = memory_limit {
+        let limit = if let Ok(limit) = limit.try_into() {
+            limit
+        } else {
+            tracing::warn!(
+                "Memory limit {limit} is too large for the memory pool.\n Defaulting to a maximum sized pool of {}.",
+                usize::MAX
+            );
+
+            usize::MAX
+        };
+
+        let Some(topn) = NonZeroUsize::new(5) else {
+            unreachable!("Memory pool TopN must be greater than 0");
+        };
+
+        Arc::new(TrackConsumersPool::new(FairSpillPool::new(limit), topn))
+    } else {
+        let Some(topn) = NonZeroUsize::new(5) else {
+            unreachable!("Memory pool TopN must be greater than 0");
+        };
+
+        Arc::new(TrackConsumersPool::new(
+            UnboundedMemoryPool::default(),
+            topn,
+        ))
+    };
+
+    match RuntimeEnvBuilder::default()
+        .with_object_store_registry(Arc::new(SpiceObjectStoreRegistry::default()))
+        .with_memory_pool(memory_pool)
+        .with_disk_manager(disk_manager)
+        .build_arc()
+    {
+        Ok(runtime_env) => runtime_env,
+        Err(e) => {
+            unreachable!("Tests ensure this should never fail: {e}");
+        }
+    }
 }
 
 #[cfg(test)]
@@ -205,16 +320,10 @@ mod tests {
         let default_rules = Analyzer::new().rules;
         assert_eq!(
             default_rules.len(),
-            5,
+            2,
             "Default analyzer rules have changed"
         );
-        let expected_rule_names = vec![
-            "inline_table_scan",
-            "expand_wildcard_rule",
-            "resolve_grouping_function",
-            "type_coercion",
-            "count_wildcard_rule",
-        ];
+        let expected_rule_names = vec!["resolve_grouping_function", "type_coercion"];
         for (rule, expected_name) in default_rules.iter().zip(expected_rule_names.into_iter()) {
             assert_eq!(
                 expected_name,

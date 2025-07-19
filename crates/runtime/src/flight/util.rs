@@ -14,22 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow_flight::flight_service_server::FlightService;
-use cache::QueryResultsCacheStatus;
+use cache::result::CacheStatus;
 use tonic::{
-    metadata::{Ascii, MetadataValue},
     Response,
+    metadata::{Ascii, MetadataValue},
 };
 
-use crate::{
-    flight::Service,
-    request::{AsyncMarker, Protocol, RequestContext},
-};
+use crate::request::{AsyncMarker, Protocol, RequestContext};
 
-pub fn attach_cache_metadata(
-    response: &mut Response<<Service as FlightService>::DoGetStream>,
-    results_cache_status: QueryResultsCacheStatus,
-) {
+pub fn attach_cache_metadata<T>(response: &mut Response<T>, results_cache_status: CacheStatus) {
     if let Some(val) = status_to_x_cache_value(results_cache_status) {
         response.metadata_mut().insert("x-cache", val);
     }
@@ -40,24 +33,22 @@ pub fn attach_cache_metadata(
 }
 
 /// This is the legacy cache header, preserved for backwards compatibility.
-fn status_to_x_cache_value(
-    results_cache_status: QueryResultsCacheStatus,
-) -> Option<MetadataValue<Ascii>> {
+fn status_to_x_cache_value(results_cache_status: CacheStatus) -> Option<MetadataValue<Ascii>> {
     match results_cache_status {
-        QueryResultsCacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
-        QueryResultsCacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
-        QueryResultsCacheStatus::CacheDisabled | QueryResultsCacheStatus::CacheBypass => None,
+        CacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
+        CacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
+        CacheStatus::CacheDisabled | CacheStatus::CacheBypass => None,
     }
 }
 
 fn status_to_results_cache_value(
-    results_cache_status: QueryResultsCacheStatus,
+    results_cache_status: CacheStatus,
 ) -> Option<MetadataValue<Ascii>> {
     match results_cache_status {
-        QueryResultsCacheStatus::CacheHit => "HIT".parse().ok(),
-        QueryResultsCacheStatus::CacheMiss => "MISS".parse().ok(),
-        QueryResultsCacheStatus::CacheBypass => "BYPASS".parse().ok(),
-        QueryResultsCacheStatus::CacheDisabled => None,
+        CacheStatus::CacheHit => "HIT".parse().ok(),
+        CacheStatus::CacheMiss => "MISS".parse().ok(),
+        CacheStatus::CacheBypass => "BYPASS".parse().ok(),
+        CacheStatus::CacheDisabled => None,
     }
 }
 

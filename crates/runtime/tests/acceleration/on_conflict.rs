@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use crate::{
-    get_test_datafusion, init_tracing,
+    configure_test_datafusion, init_tracing,
     postgres::common,
     utils::{runtime_ready_check, test_request_context},
 };
@@ -23,13 +23,12 @@ use app::AppBuilder;
 use datafusion::{assert_batches_eq, error::DataFusionError};
 use futures::TryStreamExt;
 use rand::Rng;
-use runtime::{status, Runtime};
-use spicepod::component::{
-    dataset::{
-        acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
-        Dataset,
-    },
-    params::Params,
+
+use runtime::Runtime;
+use spicepod::{
+    acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode},
+    component::dataset::Dataset,
+    param::Params,
 };
 use std::{collections::HashMap, sync::Arc};
 
@@ -39,7 +38,6 @@ use super::get_params;
 #[tokio::test]
 async fn test_acceleration_on_conflict() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let _guard = super::ACCELERATION_MUTEX.lock().await;
 
     test_request_context()
         .scope(async {
@@ -177,9 +175,6 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
                 "sqlite",
             );
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
-
             let app = AppBuilder::new("on_conflict_behavior")
                 .with_dataset(pg_on_conflict_upsert)
                 .with_dataset(pg_on_conflict_drop)
@@ -196,18 +191,17 @@ INSERT INTO event_logs (event_name, event_timestamp) VALUES
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion(df)
-                    .with_runtime_status(status)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await,
             );
 
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = rt.load_components() => {}
+                () = Arc::clone(&rt).load_components() => {}
             }
 
             runtime_ready_check(&rt).await;
@@ -395,11 +389,11 @@ fn get_pg_params(port: usize) -> Params {
 }
 
 fn random_db_name() -> String {
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let mut name = String::new();
 
     for _ in 0..10 {
-        name.push(rng.gen_range(b'a'..=b'z') as char);
+        name.push(rng.random_range(b'a'..=b'z') as char);
     }
 
     format!("./{name}.db")

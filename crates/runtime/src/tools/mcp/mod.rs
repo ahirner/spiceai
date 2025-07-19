@@ -16,11 +16,12 @@ limitations under the License.
 
 pub mod catalog;
 pub mod factory;
+pub mod server;
 pub mod tool;
 
 use std::{collections::HashMap, str::FromStr};
 
-use mcp_client::{transport::Error as TransportError, Error as McpError};
+use rmcp::Error as McpError;
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use snafu::Snafu;
@@ -40,8 +41,9 @@ pub enum Error {
         "Error occured in underlying communication to MCP tool. Error: {}",
         source
     ))]
-    UnderlyingTransportError { source: TransportError },
-
+    UnderlyingTransportError {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
     #[snafu(display(
         "Error occured in initialization client connection with underlying MCP server. Error: {}",
         source
@@ -76,29 +78,37 @@ impl FromStr for MCPType {
 pub(crate) enum MCPConfig {
     Stdio {
         command: String,
-        args: Option<Vec<String>>,
+        args: Vec<String>,
+        env: HashMap<String, String>,
     },
     Https {
         url: url::Url,
     },
 }
 impl MCPConfig {
-    fn from_type(mcp_type: &MCPType, params: &HashMap<String, SecretString>) -> Self {
-        match mcp_type {
-            MCPType::Stdio(command) => match params.get("mcp_args") {
-                Some(args) => {
-                    let args = args.expose_secret();
-                    Self::Stdio {
-                        command: command.clone(),
-                        args: Some(args.split_whitespace().map(|s| s.to_string()).collect()),
-                    }
-                }
-                None => Self::Stdio {
-                    command: command.clone(),
-                    args: None,
-                },
-            },
-            MCPType::Https(url) => Self::Https { url: url.clone() },
+    fn from_type(
+        mcp_type: &MCPType,
+        params: &HashMap<String, SecretString>,
+        env: &HashMap<String, SecretString>,
+    ) -> Self {
+        match mcp_type.clone() {
+            MCPType::Stdio(command) => {
+                let args = params
+                    .get("mcp_args")
+                    .map(ExposeSecret::expose_secret)
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .map(ToString::to_string)
+                    .collect();
+
+                let env = env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), ExposeSecret::expose_secret(v).to_string()))
+                    .collect();
+
+                Self::Stdio { command, args, env }
+            }
+            MCPType::Https(url) => Self::Https { url },
         }
     }
 }

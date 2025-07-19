@@ -20,9 +20,8 @@ use async_openai::types::{
     ChatCompletionNamedToolChoice, ChatCompletionToolChoiceOption, CreateChatCompletionRequest,
 };
 use opentelemetry::{
-    global,
+    Key, KeyValue, StringValue, Value, global,
     metrics::{Counter, Histogram, Meter},
-    Key, KeyValue, StringValue, Value,
 };
 
 static METER: LazyLock<Meter> = LazyLock::new(|| global::meter("llms"));
@@ -73,21 +72,21 @@ pub(crate) fn request_labels(req: &CreateChatCompletionRequest) -> Vec<KeyValue>
             Key::new("tool_choice"),
             Value::String(choice_str),
         ));
-    };
+    }
 
     if let Some(ref user) = req.user {
         labels.push(KeyValue::new(
             Key::new("user"),
             Value::String(user.clone().into()),
         ));
-    };
+    }
 
     if let Some(ref metadata) = req.metadata {
         labels.push(KeyValue::new(
             Key::new("metadata"),
             Value::String(metadata.to_string().into()),
         ));
-    };
+    }
 
     labels
 }

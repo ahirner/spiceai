@@ -13,15 +13,19 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::{datafusion::DataFusion, model::run};
+use crate::{
+    datafusion::{DataFusion, request_context_extension::get_current_datafusion},
+    model::run,
+    request::{AsyncMarker, RequestContext},
+};
 
 use app::App;
 use arrow::array::Float32Array;
 use axum::{
+    Extension, Json,
     extract::Path,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Extension, Json,
 };
 use model_components::{model::Model, modelsource};
 use serde::{Deserialize, Serialize};
@@ -133,10 +137,12 @@ pub enum PredictStatus {
 ))]
 pub(crate) async fn get(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
-    Extension(df): Extension<Arc<DataFusion>>,
     Path(model_name): Path<String>,
     Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
 ) -> Response {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
+
     let model_predict_response = run_inference(app, df, models, model_name).await;
 
     match model_predict_response.status {
@@ -201,10 +207,12 @@ pub(crate) async fn get(
 ))]
 pub(crate) async fn post(
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
-    Extension(df): Extension<Arc<DataFusion>>,
     Extension(models): Extension<Arc<RwLock<HashMap<String, Model>>>>,
     Json(payload): Json<BatchPredictRequest>,
 ) -> Response {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
+
     let start_time = Instant::now();
     let mut model_predictions = Vec::new();
     let mut model_prediction_futures = Vec::new();
@@ -296,7 +304,9 @@ async fn run_inference(
                 tracing::error!(
                     "Failed to cast inference result for model {model_name} to Float32Array"
                 );
-                tracing::debug!("Failed to cast inference result for model {model_name} to Float32Array: {column_data:?}");
+                tracing::debug!(
+                    "Failed to cast inference result for model {model_name} to Float32Array: {column_data:?}"
+                );
                 return PredictResponse {
                     status: PredictStatus::InternalError,
                     error_message: Some(

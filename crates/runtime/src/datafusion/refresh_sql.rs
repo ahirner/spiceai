@@ -22,7 +22,7 @@ use datafusion::arrow::datatypes::Schema;
 use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion::sql::{sqlparser, TableReference};
+use datafusion::sql::{TableReference, sqlparser};
 use itertools::Itertools;
 use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
@@ -46,7 +46,9 @@ pub enum Error {
     #[snafu(display("Expected a SQL query starting with SELECT <columns> FROM {expected_table}"))]
     InvalidSqlStatement { expected_table: TableReference },
 
-    #[snafu(display("Unexpected '{expr}' in the Refresh SQL statement.\nRewrite the SQL to only perform WHERE filters, i.e. SELECT col1, col2, col3 FROM {expected_table} WHERE col1 = 'foo'"))]
+    #[snafu(display(
+        "Unexpected '{expr}' in the Refresh SQL statement.\nRewrite the SQL to only perform WHERE filters, i.e. SELECT col1, col2, col3 FROM {expected_table} WHERE col1 = 'foo'"
+    ))]
     UnexpectedExpression {
         expr: &'static str,
         expected_table: TableReference,
@@ -164,7 +166,7 @@ pub fn validate_refresh_sql(
                                 let table_name_with_schema = name
                                     .0
                                     .iter()
-                                    .map(|x| x.value.as_str())
+                                    .map(ToString::to_string)
                                     .collect::<Vec<_>>()
                                     .join(".");
                                 ensure!(

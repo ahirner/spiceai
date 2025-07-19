@@ -1,0 +1,7 @@
+tests:
+  bench:
+    spicepod_path: ./test/spicepods/tpch/sf1/federated/spark[databricks].yaml
+    query_set: tpch
+    query_overrides: spark
+    runner_type: spiceai-dev-runners
+    validate_results: true

@@ -18,23 +18,22 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    datasource::{TableProvider, TableType},
+    datasource::{
+        TableProvider, TableType,
+        sink::{DataSink, DataSinkExec},
+    },
     error::DataFusionError,
     execution::{SendableRecordBatchStream, TaskContext},
-    logical_expr::{dml::InsertOp, Expr},
-    physical_plan::{
-        insert::{DataSink, DataSinkExec},
-        metrics::MetricsSet,
-        DisplayAs, DisplayFormatType, ExecutionPlan,
-    },
+    logical_expr::{Expr, dml::InsertOp},
+    physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, metrics::MetricsSet},
     sql::TableReference,
 };
+use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 use flight_client::FlightClient;
 use futures::StreamExt;
 use snafu::prelude::*;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::{any::Any, fmt, sync::Arc};
-
-use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -101,8 +100,8 @@ impl TableProvider for FlightTableWriter {
                 self.flight_client.clone(),
                 self.table_reference.clone(),
                 overwrite,
+                self.schema(),
             )),
-            self.schema(),
             None,
         )) as _)
     }
@@ -113,6 +112,7 @@ struct FlightDataSink {
     flight_client: FlightClient,
     table_reference: TableReference,
     _overwrite: InsertOp,
+    schema: SchemaRef,
 }
 
 #[async_trait]
@@ -125,26 +125,42 @@ impl DataSink for FlightDataSink {
         None
     }
 
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
     async fn write_all(
         &self,
-        mut data: SendableRecordBatchStream,
+        data: SendableRecordBatchStream,
         _context: &Arc<TaskContext>,
     ) -> datafusion::common::Result<u64> {
-        let mut num_rows = 0;
+        let num_rows = Arc::new(AtomicU64::new(0));
+
+        let data_stream = futures::stream::unfold(
+            (data, Arc::clone(&num_rows)),
+            |(mut data, num_rows)| async move {
+                match data.next().await {
+                    Some(Ok(batch)) => {
+                        num_rows.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
+                        Some((Ok(batch), (data, num_rows)))
+                    }
+                    Some(Err(e)) => Some((
+                        Err(check_and_mark_retriable_error(e).into()),
+                        (data, num_rows),
+                    )),
+                    None => None,
+                }
+            },
+        );
+
         let mut flight_client = self.flight_client.clone();
+        flight_client
+            .publish_streaming(&format!("{}", self.table_reference), data_stream)
+            .await
+            .context(UnableToPublishDataSnafu)
+            .map_err(to_external_error)?;
 
-        while let Some(batch) = data.next().await {
-            let batch = batch.map_err(check_and_mark_retriable_error)?;
-            num_rows += batch.num_rows() as u64;
-
-            flight_client
-                .publish(&format!("{}", self.table_reference), vec![batch])
-                .await
-                .context(UnableToPublishDataSnafu)
-                .map_err(to_external_error)?;
-        }
-
-        Ok(num_rows)
+        Ok(num_rows.load(Ordering::Relaxed))
     }
 }
 
@@ -153,11 +169,13 @@ impl FlightDataSink {
         flight_client: FlightClient,
         table_reference: TableReference,
         overwrite: InsertOp,
+        schema: SchemaRef,
     ) -> Self {
         Self {
             flight_client,
             table_reference,
             _overwrite: overwrite,
+            schema,
         }
     }
 }

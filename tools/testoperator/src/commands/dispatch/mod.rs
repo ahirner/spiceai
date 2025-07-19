@@ -15,11 +15,11 @@ limitations under the License.
 */
 
 use test_framework::{
+    TestType,
     anyhow::{self, Result},
-    gh_utils::{map_numbers_to_strings, GitHubWorkflow},
+    gh_utils::{GitHubWorkflow, map_numbers_to_strings},
     octocrab,
     utils::scan_directory_for_yamls,
-    TestType,
 };
 
 use crate::args::dispatch::{DispatchArgs, DispatchTestFile, DispatchTests, WorkflowArgs};
@@ -50,7 +50,8 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    for (path, test) in tests {
+    let total_tests = tests.len();
+    for (index, (path, test)) in tests.into_iter().enumerate() {
         let mut payload = match (test_type, &test.tests) {
             (
                 TestType::Benchmark,
@@ -59,7 +60,10 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
                 },
             ) => {
                 serde_json::json!(WorkflowArgs {
-                    specific_args: bench.clone(),
+                    specific_args: bench
+                        .clone()
+                        .with_update_snapshots(args.update_snapshots.into())
+                        .with_validate(args.validate),
                     spiced_commit: args.spiced_commit.clone(),
                 })
             }
@@ -133,13 +137,16 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             _ => {
                 return Err(anyhow::anyhow!(
                     "Test type {test_type} not supported for dispatching"
-                ))
+                ));
             }
         };
 
         payload = map_numbers_to_strings(payload);
 
-        println!("Dispatching {test_type} test from {path:#?}");
+        println!(
+            "{index}/{total_tests} - Dispatching {test_type} test from {path:#?}",
+            index = index + 1
+        );
         GitHubWorkflow::new(
             "spiceai",
             "spiceai",
@@ -151,7 +158,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
 
         // sleep to space out runs
         println!("Waiting for next run...");
-        tokio::time::sleep(std::time::Duration::from_secs(45)).await;
+        tokio::time::sleep(std::time::Duration::from_secs(80)).await;
     }
 
     Ok(())

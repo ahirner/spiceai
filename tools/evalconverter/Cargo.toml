@@ -3,10 +3,11 @@ description = "Converts https://github.com/openai/evals into SpiceAI compatible 
 edition = "2021"
 name = "evalconverter"
 version = "0.1.0"
+license.workspace = true
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4.5.28", features = ["derive"] }
+clap = { version = "4.5.36", features = ["derive"] }
 env_logger = "0.11"
 log = "0.4"
 path-clean = "1.0"

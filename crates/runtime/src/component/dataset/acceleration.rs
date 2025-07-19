@@ -16,14 +16,15 @@ limitations under the License.
 
 use datafusion_table_providers::util::column_reference::ColumnReference;
 use serde::{Deserialize, Serialize};
-use spicepod::component::{dataset::acceleration as spicepod_acceleration, params::Params};
-use std::{collections::HashMap, fmt::Display, time::Duration};
+use spicepod::{acceleration as spicepod_acceleration, param::Params};
+use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 
 pub mod constraints;
 pub mod on_conflict;
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub enum RefreshMode {
     Disabled,
     Full,
@@ -66,6 +67,33 @@ impl Display for Mode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum RefreshOnStartup {
+    /// Always start a new refresh when Spice starts.
+    Always,
+    /// Only start a refresh if an existing acceleration is not available.
+    #[default]
+    Auto,
+}
+
+impl From<spicepod_acceleration::RefreshOnStartup> for RefreshOnStartup {
+    fn from(refresh_on_startup: spicepod_acceleration::RefreshOnStartup) -> Self {
+        match refresh_on_startup {
+            spicepod_acceleration::RefreshOnStartup::Always => RefreshOnStartup::Always,
+            spicepod_acceleration::RefreshOnStartup::Auto => RefreshOnStartup::Auto,
+        }
+    }
+}
+
+impl Display for RefreshOnStartup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RefreshOnStartup::Always => write!(f, "always"),
+            RefreshOnStartup::Auto => write!(f, "auto"),
+        }
+    }
+}
+
 /// Behavior when a query on an accelerated table returns zero results.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum ZeroResultsAction {
@@ -99,17 +127,20 @@ pub enum Engine {
     #[default]
     Arrow,
     DuckDB,
+    PartitionedDuckDB,
     Sqlite,
     PostgreSQL,
+    Void,
 }
 
 impl Display for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Engine::Arrow => write!(f, "arrow"),
-            Engine::DuckDB => write!(f, "duckdb"),
+            Engine::DuckDB | Engine::PartitionedDuckDB => write!(f, "duckdb"),
             Engine::Sqlite => write!(f, "sqlite"),
             Engine::PostgreSQL => write!(f, "postgres"),
+            Engine::Void => write!(f, "void"),
         }
     }
 }
@@ -123,6 +154,7 @@ impl TryFrom<&str> for Engine {
             "duckdb" => Ok(Engine::DuckDB),
             "sqlite" => Ok(Engine::Sqlite),
             "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
+            "void" => Ok(Engine::Void),
             _ => crate::AcceleratorEngineNotAvailableSnafu {
                 name: engine.to_string(),
             }
@@ -218,7 +250,11 @@ pub struct Acceleration {
 
     pub refresh_mode: Option<RefreshMode>,
 
+    pub refresh_on_startup: RefreshOnStartup,
+
     pub refresh_check_interval: Option<Duration>,
+
+    pub refresh_cron: Option<Arc<str>>,
 
     pub refresh_sql: Option<String>,
 
@@ -238,6 +274,8 @@ pub struct Acceleration {
 
     pub retention_period: Option<String>,
 
+    pub retention_sql: Option<String>,
+
     pub retention_check_interval: Option<String>,
 
     pub retention_check_enabled: bool,
@@ -250,7 +288,9 @@ pub struct Acceleration {
 
     pub on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
 
-    pub disable_query_push_down: bool,
+    pub disable_federation: bool,
+
+    pub partition_by: Vec<String>,
 }
 
 impl Acceleration {
@@ -259,11 +299,21 @@ impl Acceleration {
         self.primary_key = Some(primary_key);
         self
     }
+
+    #[must_use]
+    pub fn with_on_conflict(
+        mut self,
+        on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
+    ) -> Self {
+        self.on_conflict = on_conflict;
+        self
+    }
 }
 
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
     type Error = crate::Error;
 
+    #[allow(clippy::too_many_lines)]
     fn try_from(
         acceleration: spicepod_acceleration::Acceleration,
     ) -> std::result::Result<Self, Self::Error> {
@@ -308,7 +358,13 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             );
         }
 
-        let engine = Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))?;
+        let engine =
+            match Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))? {
+                Engine::DuckDB if !acceleration.partition_by.is_empty() => {
+                    Engine::PartitionedDuckDB
+                }
+                engine => engine,
+            };
 
         if engine == Engine::Arrow && !indexes.is_empty() {
             tracing::warn!(
@@ -328,18 +384,19 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
 
         let mut params = acceleration.params.clone();
 
-        let disable_query_push_down = match params
-            .as_mut()
-            .and_then(|x| x.data.remove("disable_query_push_down"))
-        {
-            Some(spicepod::component::params::ParamValue::Bool(value)) => value,
-            _ => false,
-        };
+        let disable_federation = parse_is_query_federation_disabled(&mut params)?;
 
         let refresh_check_interval = try_parse_duration(
             "refresh_check_interval",
             acceleration.refresh_check_interval,
         )?;
+
+        let refresh_cron = acceleration.refresh_cron.map(Into::into);
+        if refresh_cron.is_some() && refresh_check_interval.is_some() {
+            return Err(crate::Error::InvalidSpicepodDataset {
+                source: super::Error::MultipleRefreshExpressionSpecified,
+            });
+        }
 
         let refresh_jitter_max =
             try_parse_duration("refresh_jitter_max", acceleration.refresh_jitter_max)?;
@@ -349,7 +406,9 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             mode: Mode::from(acceleration.mode),
             engine,
             refresh_mode: acceleration.refresh_mode.map(RefreshMode::from),
+            refresh_on_startup: RefreshOnStartup::from(acceleration.refresh_on_startup),
             refresh_check_interval,
+            refresh_cron,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
             refresh_append_overlap: try_parse_duration(
@@ -365,13 +424,15 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
                 .map(Params::as_string_map)
                 .unwrap_or_default(),
             retention_period: acceleration.retention_period,
+            retention_sql: acceleration.retention_sql,
             retention_check_interval: acceleration.retention_check_interval,
             retention_check_enabled: acceleration.retention_check_enabled,
-            disable_query_push_down,
+            disable_federation,
             on_zero_results: ZeroResultsAction::from(acceleration.on_zero_results),
             indexes,
             primary_key,
             on_conflict,
+            partition_by: acceleration.partition_by,
         })
     }
 }
@@ -384,6 +445,7 @@ impl Default for Acceleration {
             engine: Engine::default(),
             refresh_mode: None,
             refresh_check_interval: None,
+            refresh_cron: None,
             refresh_sql: None,
             refresh_data_window: None,
             refresh_append_overlap: None,
@@ -393,13 +455,71 @@ impl Default for Acceleration {
             refresh_jitter_max: None,
             params: HashMap::default(),
             retention_period: None,
+            retention_sql: None,
             retention_check_interval: None,
             retention_check_enabled: false,
             on_zero_results: ZeroResultsAction::ReturnEmpty,
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
-            disable_query_push_down: false,
+            disable_federation: false,
+            refresh_on_startup: RefreshOnStartup::default(),
+            partition_by: vec![],
         }
+    }
+}
+
+/// Returns true if the `query_federation` parameter is set to "disabled".
+fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<bool, crate::Error> {
+    if let Some(params) = params {
+        if let Some(value) = params.data.remove("query_federation") {
+            match value {
+                spicepod::param::ParamValue::String(s) if s == "enabled" => return Ok(false),
+                spicepod::param::ParamValue::String(s) if s == "disabled" => return Ok(true),
+                _ => {
+                    return Err(crate::Error::InvalidAccelerationConfiguration {
+                        source:
+                            format!("Invalid 'query_federation' param value: {value:?}. Expected 'enabled' or 'disabled'.").into(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_federation_disabled_param() {
+        let params_enabled = Params::from_string_map(HashMap::from([(
+            "query_federation".to_string(),
+            "enabled".to_string(),
+        )]));
+        let is_disabled =
+            parse_is_query_federation_disabled(&mut Some(params_enabled)).expect("to parse");
+        assert!(!is_disabled);
+
+        let params_disabled = Params::from_string_map(HashMap::from([(
+            "query_federation".to_string(),
+            "disabled".to_string(),
+        )]));
+        let is_disabled =
+            parse_is_query_federation_disabled(&mut Some(params_disabled)).expect("to parse");
+        assert!(is_disabled);
+
+        let params_invalid = Params::from_string_map(HashMap::from([(
+            "query_federation".to_string(),
+            "invalid".to_string(),
+        )]));
+        let result_invalid = parse_is_query_federation_disabled(&mut Some(params_invalid));
+        assert!(result_invalid.is_err());
+
+        let params_missing = Params::from_string_map(HashMap::new());
+        let is_disabled =
+            parse_is_query_federation_disabled(&mut Some(params_missing)).expect("to parse");
+        assert!(!is_disabled);
     }
 }

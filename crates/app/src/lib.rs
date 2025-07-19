@@ -21,19 +21,22 @@ use std::{collections::HashMap, path::PathBuf};
 use snafu::prelude::*;
 pub use spicepod;
 use spicepod::{
+    Spicepod,
     component::{
+        caching::{CacheConfig, ResultsCache},
         catalog::Catalog,
         dataset::Dataset,
         embeddings::Embeddings,
         eval::Eval,
-        extension::Extension,
+        management::Management,
         model::Model,
-        runtime::{CorsConfig, ResultsCache, Runtime, TlsConfig},
+        runtime::{CorsConfig, Runtime, TlsConfig},
         secret::Secret,
         tool::Tool,
         view::View,
+        worker::Worker,
     },
-    Spicepod,
+    extension::Extension,
 };
 
 pub mod runtime;
@@ -60,9 +63,13 @@ pub struct App {
 
     pub tools: Vec<Tool>,
 
+    pub workers: Vec<Worker>,
+
     pub spicepods: Vec<Spicepod>,
 
     pub runtime: Runtime,
+
+    pub management: Option<Management>,
 }
 
 impl App {
@@ -99,8 +106,10 @@ pub struct AppBuilder {
     embeddings: Vec<Embeddings>,
     evals: Vec<Eval>,
     tools: Vec<Tool>,
+    workers: Vec<Worker>,
     spicepods: Vec<Spicepod>,
     runtime: Runtime,
+    management: Option<Management>,
 }
 
 impl AppBuilder {
@@ -116,15 +125,19 @@ impl AppBuilder {
             embeddings: vec![],
             evals: vec![],
             tools: vec![],
+            workers: vec![],
             spicepods: vec![],
             runtime: Runtime::default(),
+            management: None,
         }
     }
 
     #[must_use]
     pub fn with_spicepod(mut self, spicepod: Spicepod) -> AppBuilder {
+        self.runtime = spicepod.runtime.clone();
         self.secrets.extend(spicepod.secrets.clone());
         self.extensions.extend(spicepod.extensions.clone());
+        self.management.clone_from(&spicepod.management);
         self.catalogs.extend(spicepod.catalogs.clone());
         self.datasets.extend(spicepod.datasets.clone());
         self.views.extend(spicepod.views.clone());
@@ -132,6 +145,7 @@ impl AppBuilder {
         self.embeddings.extend(spicepod.embeddings.clone());
         self.evals.extend(spicepod.evals.clone());
         self.tools.extend(spicepod.tools.clone());
+        self.workers.extend(spicepod.workers.clone());
         self.spicepods.push(spicepod);
         self
     }
@@ -191,8 +205,20 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_worker(mut self, worker: Worker) -> AppBuilder {
+        self.workers.push(worker);
+        self
+    }
+
+    #[must_use]
     pub fn with_results_cache(mut self, results_cache: ResultsCache) -> AppBuilder {
-        self.runtime.results_cache = results_cache;
+        self.runtime.results_cache = Some(results_cache);
+        self
+    }
+
+    #[must_use]
+    pub fn with_search_cache(mut self, search_cache: CacheConfig) -> AppBuilder {
+        self.runtime.caching.search_results = Some(search_cache);
         self
     }
 
@@ -221,6 +247,18 @@ impl AppBuilder {
     }
 
     #[must_use]
+    pub fn with_shutdown_timeout(mut self, timeout: impl Into<String>) -> AppBuilder {
+        self.runtime.shutdown_timeout = Some(timeout.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_management(mut self, management: Management) -> AppBuilder {
+        self.management = Some(management);
+        self
+    }
+
+    #[must_use]
     pub fn build(self) -> App {
         App {
             name: self.name,
@@ -233,18 +271,28 @@ impl AppBuilder {
             embeddings: self.embeddings,
             evals: self.evals,
             tools: self.tools,
+            workers: self.workers,
             spicepods: self.spicepods,
             runtime: self.runtime,
+            management: self.management,
         }
     }
 
-    pub fn build_from_filesystem_path(path: impl Into<PathBuf>) -> Result<App> {
+    pub async fn build_from_path(path: impl Into<PathBuf>) -> Result<App> {
         let path = path.into();
-        let spicepod_root =
-            Spicepod::load(&path).context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
-        let secrets = spicepod_root.secrets.clone();
-        let runtime = spicepod_root.runtime.clone();
-        let extensions = spicepod_root.extensions.clone();
+        let spicepod_root = Spicepod::load(&path)
+            .await
+            .context(UnableToLoadSpicepodSnafu { path: path.clone() })?;
+        Self::build_from_spicepod(spicepod_root, Spicepod::base_path(&path)).await
+    }
+
+    #[allow(clippy::too_many_lines)]
+    pub async fn build_from_spicepod(spicepod: Spicepod, path: impl Into<PathBuf>) -> Result<App> {
+        let path = path.into();
+        let secrets = spicepod.secrets.clone();
+        let runtime = spicepod.runtime.clone();
+        let extensions = spicepod.extensions.clone();
+        let management = spicepod.management.clone();
         let mut catalogs: Vec<Catalog> = vec![];
         let mut datasets: Vec<Dataset> = vec![];
         let mut views: Vec<View> = vec![];
@@ -252,44 +300,51 @@ impl AppBuilder {
         let mut embeddings: Vec<Embeddings> = vec![];
         let mut evals: Vec<Eval> = vec![];
         let mut tools: Vec<Tool> = vec![];
+        let mut workers: Vec<Worker> = vec![];
 
-        for catalog in &spicepod_root.catalogs {
+        for catalog in &spicepod.catalogs {
             catalogs.push(catalog.clone());
         }
 
-        for dataset in &spicepod_root.datasets {
+        for dataset in &spicepod.datasets {
             datasets.push(dataset.clone());
         }
 
-        for view in &spicepod_root.views {
+        for view in &spicepod.views {
             views.push(view.clone());
         }
 
-        for model in &spicepod_root.models {
+        for model in &spicepod.models {
             models.push(model.clone());
         }
 
-        for embedding in &spicepod_root.embeddings {
+        for embedding in &spicepod.embeddings {
             embeddings.push(embedding.clone());
         }
 
-        for eval in &spicepod_root.evals {
+        for eval in &spicepod.evals {
             evals.push(eval.clone());
         }
 
-        for tool in &spicepod_root.tools {
+        for tool in &spicepod.tools {
             tools.push(tool.clone());
         }
 
-        let root_spicepod_name = spicepod_root.name.clone();
+        for worker in &spicepod.workers {
+            workers.push(worker.clone());
+        }
+
+        let root_spicepod_name = spicepod.name.clone();
         let mut spicepods: Vec<Spicepod> = vec![];
 
-        for dependency in &spicepod_root.dependencies {
+        for dependency in &spicepod.dependencies {
             let dependency_path = path.join("spicepods").join(dependency);
             let dependent_spicepod =
-                Spicepod::load(&dependency_path).context(UnableToLoadSpicepodSnafu {
-                    path: &dependency_path,
-                })?;
+                Spicepod::load(&dependency_path)
+                    .await
+                    .context(UnableToLoadSpicepodSnafu {
+                        path: &dependency_path,
+                    })?;
             for catalog in &dependent_spicepod.catalogs {
                 catalogs.push(catalog.clone());
             }
@@ -313,10 +368,15 @@ impl AppBuilder {
             for tool in &dependent_spicepod.tools {
                 tools.push(tool.clone());
             }
+
+            for worker in &dependent_spicepod.workers {
+                workers.push(worker.clone());
+            }
+
             spicepods.push(dependent_spicepod);
         }
 
-        spicepods.push(spicepod_root);
+        spicepods.push(spicepod);
 
         Ok(App {
             name: root_spicepod_name,
@@ -329,8 +389,10 @@ impl AppBuilder {
             embeddings,
             evals,
             tools,
+            workers,
             spicepods,
             runtime,
+            management,
         })
     }
 }

@@ -14,9 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use super::component::HttpComponent;
 use super::HttpConfig;
-use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric};
+use super::component::HttpComponent;
+use crate::metrics::{
+    MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus, system_time_to_unix_epoch_ms,
+};
 use crate::spicetest::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 use crate::utils::get_random_element;
 use anyhow::Result;
@@ -93,7 +95,7 @@ impl SpiceTest<NotStarted> {
     //  - N workers to send requests to the baseline component
     //  - N (separate) workers to send requests the spice component.
     pub fn start(self) -> Result<SpiceTest<Running>> {
-        let spiced_client = self.spiced_instance.http_client()?;
+        let spiced_client = self.get_spiced()?.http_client()?;
 
         let baseline_handles = (0..self.state.config.concurrency)
             .map(|id| {
@@ -126,6 +128,9 @@ impl SpiceTest<NotStarted> {
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
+            api_key: self.api_key,
+            explain_plan_snapshot: self.explain_plan_snapshot,
+            results_snapshot_predicate: self.results_snapshot_predicate,
             state: Running {
                 baseline_handles,
                 spice_handles,
@@ -163,6 +168,9 @@ impl SpiceTest<Running> {
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
+            api_key: self.api_key,
+            explain_plan_snapshot: self.explain_plan_snapshot,
+            results_snapshot_predicate: self.results_snapshot_predicate,
             state: Completed {
                 baseline_results,
                 spice_results,
@@ -185,10 +193,30 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
         self.name.clone()
     }
 
+    fn spiced_version(&self) -> Result<&str> {
+        let spiced_instance = self.spiced_instance.as_ref().ok_or(
+            anyhow::anyhow!(
+                "Spiced instance is not available. SpiceTest must be started before metrics can be collected."
+            ))?;
+
+        Ok(spiced_instance.version())
+    }
+
     fn metrics(&self) -> Result<Vec<QueryMetric<NoExtendedMetrics>>> {
-        let baseline =
-            QueryMetric::new_from_durations("baseline", &self.state.baseline_results.durations)?;
-        let spice = QueryMetric::new_from_durations("spice", &self.state.spice_results.durations)?;
+        let baseline = QueryMetric::new_from_durations(
+            "baseline".into(),
+            &self.state.baseline_results.durations,
+            QueryStatus::Passed,
+            system_time_to_unix_epoch_ms(self.start_time)?,
+            system_time_to_unix_epoch_ms(self.state.end_time)?,
+        )?;
+        let spice = QueryMetric::new_from_durations(
+            "spice".into(),
+            &self.state.spice_results.durations,
+            QueryStatus::Passed,
+            system_time_to_unix_epoch_ms(self.start_time)?,
+            system_time_to_unix_epoch_ms(self.state.end_time)?,
+        )?;
         Ok(vec![baseline, spice])
     }
 }
@@ -241,7 +269,6 @@ impl OverHeadWorker {
                     Err(e) => {
                         eprintln!("Worker {} - Request failed: {}", self.id, e);
                         error_count += 1;
-                        continue;
                     }
                 }
             }

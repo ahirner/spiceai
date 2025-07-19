@@ -22,14 +22,15 @@ use std::{
 };
 
 use crate::{
-    component::catalog::Catalog,
-    dataconnector::{ConnectorComponent, ConnectorParams},
-    parameters::{ParameterSpec, Parameters},
     Runtime,
+    component::{ComponentInitialization, catalog::Catalog},
+    dataconnector::{ConnectorComponent, parameters::ConnectorParams, s3},
+    parameters::{ParameterSpec, Parameters},
 };
 use async_trait::async_trait;
 use data_components::RefreshableCatalogProvider;
 use datafusion::catalog::CatalogProvider;
+use deferred::DeferredCatalogProvider;
 use snafu::prelude::*;
 use tokio::{sync::Mutex, task::JoinHandle};
 
@@ -42,7 +43,9 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Cannot setup the {connector_component} ({connector}) with an invalid configuration.\n{message}"))]
+    #[snafu(display(
+        "Cannot setup the {connector_component} ({connector}) with an invalid configuration.\n{message}"
+    ))]
     InvalidConfiguration {
         connector: String,
         connector_component: ConnectorComponent,
@@ -50,25 +53,36 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Cannot setup the {connector_component} ({connector}) with an invalid configuration.\n{message}"))]
+    #[snafu(display(
+        "Cannot setup the {connector_component} ({connector}) with an invalid configuration.\n{message}"
+    ))]
     InvalidConfigurationNoSource {
         connector: String,
         connector_component: ConnectorComponent,
         message: String,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({connector}).\nAn unknown Catalog Connector Error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to load the {connector_component} ({connector}).\nAn unknown Catalog Connector Error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     InternalWithSource {
         connector: String,
         connector_component: ConnectorComponent,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Failed to initiate catalog, app reference cannot be obtained from the runtime\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
+    FailedToGetAppFromRuntime {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[cfg(feature = "databricks")]
 pub mod databricks;
+pub mod deferred;
+pub mod glue;
 pub mod iceberg;
 pub mod spice_cloud;
 #[cfg(feature = "delta_lake")]
@@ -129,6 +143,15 @@ pub async fn register_all() {
     );
 
     registry.insert(
+        glue::PREFIX.to_string(),
+        CatalogConnectorFactory::new(
+            glue::GlueCatalog::new_connector,
+            glue::PREFIX,
+            &s3::PARAMETERS,
+        ),
+    );
+
+    registry.insert(
         "spice.ai".to_string(),
         CatalogConnectorFactory::new(
             spice_cloud::SpiceCloudPlatformCatalog::new_connector,
@@ -184,19 +207,32 @@ pub trait CatalogConnector: Send + Sync {
     /// The returned provider must implement RefreshableCatalogProvider which will be used to refresh the catalog.
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
-        _runtime: &Runtime,
+        _runtime: Arc<Runtime>,
         _catalog: &Catalog,
     ) -> Result<Arc<dyn RefreshableCatalogProvider>>;
+
+    /// Returns whether the catalog connector should be initialized on startup or on trigger.
+    fn initialization(&self) -> ComponentInitialization {
+        ComponentInitialization::OnStartup
+    }
 }
 
 pub async fn get_catalog_provider(
     connector: Arc<dyn CatalogConnector>,
-    runtime: &Runtime,
+    runtime: Arc<Runtime>,
     catalog: &Catalog,
     refresh_interval: Option<Duration>,
 ) -> Result<Arc<dyn CatalogProvider>> {
+    if connector.initialization().is_on_trigger() {
+        return Ok(Arc::new(DeferredCatalogProvider::new(
+            runtime,
+            connector,
+            catalog.clone(),
+        )));
+    }
+
     let provider = RefreshingCatalogProvider::new(
-        connector
+        Arc::clone(&connector)
             .refreshable_catalog_provider(runtime, catalog)
             .await?,
     )

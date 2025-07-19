@@ -32,14 +32,15 @@ var datasetsCmd = &cobra.Command{
 spice datasets
 `,
 	Run: func(cmd *cobra.Command, args []string) {
-		rtcontext := context.NewContext()
-		if rootCertPath, err := cmd.Flags().GetString("tls-root-certificate-file"); err == nil && rootCertPath != "" {
-			rtcontext = context.NewHttpsContext(rootCertPath)
+		rtcontext, err := context.FromFlags(cmd.Flags())
+		if err != nil {
+			slog.Error("failed to initialize runtime context", "error", err)
+			return
 		}
 
-		apiKey, _ := cmd.Flags().GetString("api-key")
-		if apiKey != "" {
-			rtcontext.SetApiKey(apiKey)
+		if rtcontext.IsCloud() {
+			slog.Error("`spice datasets ` does not support `--cloud`.")
+			return
 		}
 
 		datasets, err := api.GetDatasetsWithStatus(rtcontext)
@@ -57,6 +58,5 @@ spice datasets
 }
 
 func init() {
-	datasetsCmd.Flags().String("tls-root-certificate-file", "", "The path to the root certificate file used to verify the Spice.ai runtime server certificate")
 	RootCmd.AddCommand(datasetsCmd)
 }

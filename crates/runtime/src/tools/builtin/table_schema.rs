@@ -30,19 +30,20 @@ use itertools::Itertools;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use spicepod::component::dataset::{column::Column, Dataset};
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use spicepod::semantic::Column;
+use std::{borrow::Cow, sync::Arc};
 
 use crate::{
-    tools::{utils::parameters, SpiceModelTool},
     Runtime,
+    tools::{SpiceModelTool, utils::parameters},
 };
 use snafu::ResultExt;
 use tracing_futures::Instrument;
 
+/// A tool to retrieve the schema of one or more available SQL tables.
 #[derive(Debug, Clone, JsonSchema, Serialize, Deserialize)]
 pub struct TableSchemaToolParams {
-    /// Which subset of tables to return results for. Default to all tables.
+    /// Which tables to return the schema of.
     tables: Vec<String>,
 
     /// If `full` return metadata and semantic details about the columns.
@@ -71,37 +72,48 @@ impl TableSchemaToolParams {
 pub struct TableSchemaTool {
     name: String,
     description: Option<String>,
+    rt: Arc<Runtime>,
 }
 
 impl TableSchemaTool {
     #[must_use]
-    pub fn new(name: &str, description: Option<String>) -> Self {
+    pub fn new(rt: Arc<Runtime>, name: Option<&str>, description: Option<&str>) -> Self {
         Self {
-            name: name.to_string(),
-            description,
+            name: name.unwrap_or("table_schema").to_string(),
+            description: Some(
+                description
+                    .unwrap_or("Retrieve the schema of all available SQL tables")
+                    .to_string(),
+            ),
+            rt,
         }
     }
 
     pub async fn get_schema(
         &self,
-        rt: Arc<Runtime>,
         req: &TableSchemaToolParams,
     ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::table_schema", tool = self.name().to_string(), input = serde_json::to_string(&req).boxed()?);
         let TableSchemaToolParams { tables, output } = req;
 
         // Precompute extra column details only if needed (for `full` output).
-        let column_info = match (output, rt.app.read().await.clone()) {
-            (OutputType::Full, Some(app)) => {
-                Self::column_information_for_tables(tables.as_slice(), &app)
-            }
+        let column_info = match (output, self.rt.app.read().await.clone()) {
+            (OutputType::Full, Some(app)) => tables
+                .iter()
+                .map(|t| {
+                    let tbl = TableReference::parse_str(t);
+                    let cols = Self::column_information_for_table(&tbl, &Arc::clone(&app));
+                    (tbl.clone(), cols)
+                })
+                .collect_vec(),
             _ => vec![],
         };
 
         let mut table_schemas: Vec<Value> = Vec::with_capacity(tables.len());
         for (i, t) in tables.iter().enumerate() {
-            let base_schema = rt
-                .df
+            let base_schema = self
+                .rt
+                .datafusion()
                 .get_arrow_schema(t)
                 .instrument(span.clone())
                 .await
@@ -115,23 +127,22 @@ impl TableSchemaTool {
                         metadata,
                     } = base_schema;
 
-                    if let Some(columns) = column_info.get(i) {
+                    if let Some((_tbl, Some(columns))) = column_info.get(i) {
                         fields = fields
                             .into_iter()
                             .map(|f| {
-                                columns.get(f.name()).map_or_else(
-                                    || Arc::clone(f),
-                                    |c| {
-                                        Arc::new(
-                                            Field::new(
-                                                f.name(),
-                                                f.data_type().clone(),
-                                                f.is_nullable(),
-                                            )
-                                            .with_metadata(c.metadata()),
+                                let col = columns.iter().find(|c| c.name == *f.name());
+                                match col {
+                                    Some(c) => Arc::new(
+                                        Field::new(
+                                            f.name(),
+                                            f.data_type().clone(),
+                                            f.is_nullable(),
                                         )
-                                    },
-                                )
+                                        .with_metadata(c.metadata().clone()),
+                                    ),
+                                    None => Arc::clone(f),
+                                }
                             })
                             .collect();
                     }
@@ -156,34 +167,23 @@ impl TableSchemaTool {
         Ok(Value::Array(table_schemas))
     }
 
-    /// Retrieve column information for the given tables. Output order is the same as the input order.
-    /// Output Hashmap is column name to [`Column`].
-    fn column_information_for_tables(
-        tables: &[String],
-        app: &Arc<App>,
-    ) -> Vec<HashMap<String, Column>> {
-        tables
-            .iter()
-            .map(|t| {
-                let Some(table) = Self::table_in_app(app, t) else {
-                    return HashMap::new();
-                };
-                table
-                    .columns
-                    .iter()
-                    .map(|c| (c.name.clone(), c.clone()))
-                    .collect()
-            })
-            .collect_vec()
-    }
-
-    /// Checks if a given table exists in the app, by resolving and comparing as [`TableReference`].
-    fn table_in_app<'a>(app: &'a App, table: &str) -> Option<&'a Dataset> {
-        let tbl = TableReference::parse_str(table);
-
-        app.datasets
+    /// Retrieve column information for the given table.
+    fn column_information_for_table(tbl: &TableReference, app: &Arc<App>) -> Option<Vec<Column>> {
+        if let Some(ds) = app
+            .datasets
             .iter()
             .find(|d| tbl.resolved_eq(&TableReference::parse_str(&d.name)))
+        {
+            return Some(ds.columns.clone());
+        }
+        if let Some(view) = app
+            .views
+            .iter()
+            .find(|v| tbl.resolved_eq(&TableReference::parse_str(&v.name)))
+        {
+            return Some(view.columns.clone());
+        }
+        None
     }
 
     /// Creates a [`ChatCompletionRequestToolMessage`] as if a language model had called this tool.
@@ -220,14 +220,6 @@ impl TableSchemaTool {
             .build()
     }
 }
-impl Default for TableSchemaTool {
-    fn default() -> Self {
-        Self::new(
-            "table_schema",
-            Some("Retrieve the schema of all available SQL tables".to_string()),
-        )
-    }
-}
 
 #[async_trait]
 impl SpiceModelTool for TableSchemaTool {
@@ -242,12 +234,8 @@ impl SpiceModelTool for TableSchemaTool {
         parameters::<TableSchemaToolParams>()
     }
 
-    async fn call(
-        &self,
-        arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let req: TableSchemaToolParams = serde_json::from_str(arg)?;
-        self.get_schema(rt, &req).await
+        self.get_schema(&req).await
     }
 }

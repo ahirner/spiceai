@@ -22,16 +22,17 @@ use datafusion::sql::TableReference;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
+use crate::Runtime;
 use crate::accelerated_table::{AcceleratedTableBuilderError, Retention};
-use crate::component::dataset::acceleration::Acceleration;
-use crate::component::dataset::{Dataset, Mode};
+use crate::component::dataset::{Mode, acceleration::Acceleration, builder::DatasetBuilder};
 use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::status;
 use crate::{
-    accelerated_table::{refresh::Refresh, AcceleratedTable},
-    dataaccelerator::{self, create_accelerator_table},
-    dataconnector::{sink::SinkConnector, DataConnector, DataConnectorError},
+    accelerated_table::{AcceleratedTable, refresh::Refresh},
+    dataaccelerator::{self},
+    dataconnector::{DataConnector, DataConnectorError, sink::SinkConnector},
+    datafusion::handle_accelerated_table_behavior,
 };
 
 #[derive(Debug, Snafu)]
@@ -68,19 +69,39 @@ async fn get_local_table_provider(
     name: &TableReference,
     schema: &Arc<Schema>,
     primary_key: Option<Vec<String>>,
+    runtime: Arc<Runtime>,
 ) -> Result<Arc<dyn TableProvider>, Error> {
     // This shouldn't error because we control the name passed in, and it shouldn't contain a catalog.
-    let mut dataset = Dataset::try_new("sink".to_string(), &name.to_string())
+    let dataset_builder = DatasetBuilder::try_new("sink".to_string(), &name.to_string())
         .boxed()
         .context(InternalSnafu {
-            code: "IT-GLTP-DTN".to_string(), // InternalTable - GetLocalTableProvider - DatasetTryNew
+            code: "IT-GLTP-BD".to_string(), // InternalTable - GetLocalTableProvider - DatasetBuilder
         })?;
+
+    let app_ref = runtime.app();
+    let app_lock = app_ref.read().await;
+    let Some(app) = app_lock.as_ref() else {
+        return Err(Error::Internal {
+            code: "IT-GLTP-GA".to_string(), // InternalTable - GetLocalTableProvider - GetApp
+            source: "No App instance found in Runtime".into(),
+        });
+    };
+
+    let mut dataset = dataset_builder
+        .with_app(Arc::clone(app))
+        .with_runtime(Arc::clone(&runtime))
+        .build()
+        .boxed()
+        .context(InternalSnafu {
+            code: "IT-GLTP-BD-B".to_string(), // InternalTable - GetLocalTableProvider - DatasetBuilder - Build
+        })?;
+
     dataset.mode = Mode::ReadWrite;
 
     let mut sink = SinkConnector::new(Arc::clone(schema));
     if let Some(pk) = primary_key {
         sink = sink.with_primary_key(&pk);
-    };
+    }
 
     let data_connector = Arc::new(sink) as Arc<dyn DataConnector>;
 
@@ -103,20 +124,32 @@ pub async fn create_internal_accelerated_table(
     refresh: Refresh,
     retention: Option<Retention>,
     secrets: Arc<RwLock<Secrets>>,
+    runtime: Arc<Runtime>,
 ) -> Result<Arc<AcceleratedTable>, Error> {
     let source_table_provider =
-        get_local_table_provider(&name, &schema, primary_key.clone()).await?;
-    let federated_table = Arc::new(FederatedTable::new(Arc::clone(&source_table_provider)));
-    let accelerated_table_provider = create_accelerator_table(
-        name.clone(),
-        Arc::clone(&schema),
-        Arc::clone(&source_table_provider).constraints(),
-        &acceleration,
-        secrets,
-        None,
-    )
-    .await
-    .context(UnableToCreateAcceleratedTableProviderSnafu)?;
+        get_local_table_provider(&name, &schema, primary_key.clone(), Arc::clone(&runtime)).await?;
+    let federated_table = Arc::new(FederatedTable::new_unchecked(Arc::clone(
+        &source_table_provider,
+    )));
+    let (accelerated_table_provider, accelerated_table_behaviors) = runtime
+        .accelerator_engine_registry()
+        .create_accelerator_table(
+            name.clone(),
+            Arc::clone(&schema),
+            Arc::clone(&source_table_provider).constraints(),
+            &acceleration,
+            secrets,
+            None,
+            Arc::clone(&runtime.df.ctx),
+        )
+        .await
+        .context(UnableToCreateAcceleratedTableProviderSnafu)?;
+
+    handle_accelerated_table_behavior(accelerated_table_behaviors, &federated_table, name.table())
+        .boxed()
+        .context(InternalSnafu {
+            code: "IT-CIA-HATB".to_string(), // InternalTable - CreateInternalAcceleratedTable - HandleAcceleratedTableBehavior
+        })?;
 
     let mut builder = AcceleratedTable::builder(
         runtime_status,
@@ -129,7 +162,7 @@ pub async fn create_internal_accelerated_table(
 
     builder.retention(retention);
 
-    let (accelerated_table, _) = builder
+    let accelerated_table = builder
         .build()
         .await
         .context(UnableToBuildAcceleratedTableSnafu)?;

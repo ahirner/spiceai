@@ -9,19 +9,23 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+ahash.workspace = true
 arrow.workspace = true
 async-stream.workspace = true
 async-trait.workspace = true
-byte-unit = "5.1.4"
+byte-unit.workspace = true
 datafusion.workspace = true
 fundu = { workspace = true }
 futures.workspace = true
-moka = { version = "0.12", features = ["future"] }
+moka.workspace = true
 opentelemetry.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tokio.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+rstest = "0.25.0"
 
 [features]
 default = []

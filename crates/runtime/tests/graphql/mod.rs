@@ -17,21 +17,28 @@ limitations under the License.
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use app::AppBuilder;
 
+use arrow::array::RecordBatch;
 use async_graphql::{EmptyMutation, EmptySubscription, SimpleObject};
 use async_graphql::{Object, Schema};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
-use axum::{routing::post, Extension, Router};
-use runtime::{status, Runtime};
-use spicepod::component::{dataset::Dataset, params::Params as DatasetParams};
+use axum::{Extension, Router, routing::post};
+
+use runtime::Runtime;
+use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use tokio::net::TcpListener;
 
 use crate::utils::test_request_context;
-use crate::{get_test_datafusion, init_tracing, run_query_and_check_results, ValidateFn};
+use crate::{ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results};
 
 type ServiceSchema = Schema<QueryRoot, EmptyMutation, EmptySubscription>;
+
+// Static string buffer to collect GraphQL queries
+static QUERY_LOG: std::sync::LazyLock<Mutex<String>> =
+    std::sync::LazyLock::new(|| Mutex::new(String::new()));
 
 #[derive(SimpleObject, Clone, Debug)]
 struct Post {
@@ -172,11 +179,39 @@ impl QueryRoot {
         };
         UsersPaginated { users, page_info }
     }
+
+    async fn single_paginated_users(&self, first: usize, after: Option<String>) -> UsersPaginated {
+        let users_service = UserService::new();
+        let users = users_service.paginated_users(std::cmp::min(first, 1), after);
+        let all_users = users_service.users();
+        let last_id = unsafe { all_users.last().unwrap_unchecked().id.clone() };
+
+        let (has_next_page, end_cursor) = if let Some(last_fetched) = users.last() {
+            (last_fetched.id < last_id, last_fetched.id.clone())
+        } else {
+            (false, String::new())
+        };
+
+        let page_info = PageInfo {
+            has_next_page,
+            end_cursor,
+        };
+        UsersPaginated { users, page_info }
+    }
 }
 
 async fn graphql_handler(schema: Extension<ServiceSchema>, req: GraphQLRequest) -> GraphQLResponse {
-    let response = schema.execute(req.into_inner()).await;
+    let query = &req.0.query.clone();
 
+    // Append query to log for snapshot testing
+    if let Ok(mut log) = QUERY_LOG.lock() {
+        // Push_str works because MutexGuard<String> implements DerefMut
+        // and allows us to modify the underlying String.
+        log.push_str(query);
+        log.push_str("\n---\n");
+    }
+
+    let response = schema.execute(req.into_inner()).await;
     response.into()
 }
 
@@ -224,7 +259,7 @@ fn make_graphql_dataset(
 
     if let Some(unnest_depth) = unnest_depth {
         params.insert("unnest_depth".to_string(), unnest_depth.to_string());
-    };
+    }
 
     dataset.params = Some(DatasetParams::from_string_map(params));
     dataset
@@ -248,20 +283,20 @@ async fn test_graphql() -> Result<(), String> {
                     None,
                 ))
                 .build();
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
 
+            let cloned_rt = Arc::new(rt.clone());
+
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             let queries: QueryTests = vec![
@@ -325,20 +360,20 @@ async fn test_graphql_pagination() -> Result<(), String> {
                 None
             ))
             .build();
-        let status = status::RuntimeStatus::new();
-        let df = get_test_datafusion(Arc::clone(&status));
-        let mut rt = Runtime::builder()
-            .with_app(app)
-            .with_datafusion(df)
-            .with_runtime_status(status)
-            .build()
-            .await;
+        let mut rt =
+            Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+
+        let cloned_rt = Arc::new(rt.clone());
 
         tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                 return Err("Timed out waiting for datasets to load".to_string());
             }
-            () = rt.load_components() => {}
+            () = cloned_rt.load_components() => {}
         }
 
         let queries: QueryTests = vec![
@@ -389,4 +424,75 @@ async fn test_graphql_pagination() -> Result<(), String> {
         Ok(())
     })
     .await
+}
+
+#[tokio::test]
+async fn test_graphql_pagination_with_limit() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context().scope(async {
+        let (tx, addr) = start_server().await?;
+        tracing::debug!("Server started at {}", addr);
+        let app = AppBuilder::new("graphql_integration_test")
+            .with_dataset(make_graphql_dataset(
+                &format!("http://{addr}/graphql"),
+                "test_graphql",
+                "query { singlePaginatedUsers(first: 1) { users { id name posts { id title content } } pageInfo { hasNextPage endCursor } } }",
+                "/data/singlePaginatedUsers/users",
+                None
+            ))
+            .build();
+
+        let mut rt =
+            Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+
+        let cloned_rt = Arc::new(rt.clone());
+
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                return Err("Timed out waiting for datasets to load".to_string());
+            }
+            () = cloned_rt.load_components() => {}
+        }
+
+        run_query_and_check_results(&mut rt, "test_graphql_pagination_with_limit", "select * from test_graphql limit 3;", false, Some(Box::new(|result_batches| {
+            let mut total = 0;
+            for batch in result_batches {
+                let batch: RecordBatch = batch;
+                assert_eq!(batch.num_columns(), 3, "num_cols: {}", batch.num_columns());
+                total += batch.num_rows();
+            }
+            assert_eq!(total, 3);
+
+            if let Ok(log) = QUERY_LOG.lock() {
+                // We want to snapshot the `first` and `after` parameters to ensure pagination is working correctly with a `LIMIT`
+                // We don't need the body of the query to do so, so we can split on all lines and only take the ones containing `singlePaginatedUsers`
+                // This way, we know the lines we take have the `first` and `after` parameters and no other irrelevant details.
+                let filtered_log = log.lines()
+                    .filter(|line| line.contains("singlePaginatedUsers"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                insta::with_settings!({
+                        description => format!("GraphQL Pagination With Limit Results"),
+                        omit_expression => true,
+                        snapshot_path => "../snapshots"
+                    }, {
+                        insta::assert_snapshot!("graphql_pagination_with_limit", filtered_log);
+                });
+            }
+        }))).await?;
+
+
+        tx.send(()).map_err(|()| {
+            tracing::error!("Failed to send shutdown signal");
+            "Failed to send shutdown signal".to_string()
+        })?;
+
+        Ok(())
+
+    }).await
 }

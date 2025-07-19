@@ -20,19 +20,19 @@ use crate::datafusion::error::find_datafusion_root;
 use crate::{dataupdate::StreamingDataUpdateExecutionPlan, status};
 use arrow::array::{Int32Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
-use cache::QueryResultsCacheProvider;
+use cache::Caching;
 use data_components::cdc::{ChangeBatch, ChangeOperation, ChangesStream};
 use data_components::delete::get_deletion_provider;
 use datafusion::logical_expr::dml::InsertOp;
 use datafusion::logical_expr::lit;
-use datafusion::logical_expr::{col, Expr};
+use datafusion::logical_expr::{Expr, col};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::{execution::context::SessionContext, physical_plan::collect};
-use futures::{stream, StreamExt};
+use futures::{StreamExt, stream};
 use snafu::{OptionExt, ResultExt};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use tokio::sync::{oneshot, RwLock};
+use std::sync::{Arc, Weak};
+use tokio::sync::{Notify, RwLock};
 
 /// Extracts the primary key value from the data, as a tuple of (String, Expr).
 ///
@@ -66,16 +66,14 @@ impl RefreshTask {
         &self,
         refresh: Arc<RwLock<Refresh>>,
         mut changes_stream: ChangesStream,
-        cache_provider: Option<Arc<QueryResultsCacheProvider>>,
-        ready_sender: Option<oneshot::Sender<()>>,
+        caching: Option<Weak<Caching>>,
+        ready_sender: Option<Arc<Notify>>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated_table::Result<()> {
         let dataset_name = self.dataset_name.clone();
         let sql = refresh.read().await.sql.clone();
-        self.mark_dataset_status(sql.as_deref(), status::ComponentStatus::Refreshing)
+        self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
             .await;
-
-        let mut ready_sender = ready_sender;
 
         while let Some(update) = changes_stream.next().await {
             match update {
@@ -85,8 +83,8 @@ impl RefreshTask {
                         .await
                     {
                         Ok(()) => {
-                            if let Some(ready_sender) = ready_sender.take() {
-                                ready_sender.send(()).ok();
+                            if let Some(ready_sender) = ready_sender.as_ref() {
+                                ready_sender.notify_waiters();
                             }
                             initial_load_completed.store(true, Ordering::Relaxed);
 
@@ -94,20 +92,22 @@ impl RefreshTask {
                                 tracing::debug!("Failed to commit CDC change envelope: {e}");
                             }
 
-                            if let Some(cache_provider) = &cache_provider {
-                                if let Err(e) = cache_provider
-                                    .invalidate_for_table(dataset_name.clone())
-                                    .await
-                                {
-                                    tracing::error!(
-                                        "Failed to invalidate cached results for dataset {}: {e}",
-                                        &dataset_name.to_string()
-                                    );
+                            if let Some(cache_provider_ref) = caching.as_ref() {
+                                // No cache provider means runtime is shutting down and cache is already cleaned up
+                                if let Some(cache_provider) = cache_provider_ref.upgrade() {
+                                    if let Err(e) =
+                                        cache_provider.invalidate_for_table(dataset_name.clone())
+                                    {
+                                        tracing::error!(
+                                            "Failed to invalidate cached results for dataset {}: {e}",
+                                            &dataset_name.to_string()
+                                        );
+                                    }
                                 }
                             }
                         }
                         Err(e) => {
-                            self.mark_dataset_status(
+                            self.set_refresh_status(
                                 refresh.read().await.sql.clone().as_deref(),
                                 status::ComponentStatus::Error,
                             )
@@ -118,7 +118,7 @@ impl RefreshTask {
                 }
                 Err(e) => {
                     tracing::error!("Changes stream error for {dataset_name}: {e}");
-                    self.mark_dataset_status(
+                    self.set_refresh_status(
                         refresh.read().await.sql.clone().as_deref(),
                         status::ComponentStatus::Error,
                     )

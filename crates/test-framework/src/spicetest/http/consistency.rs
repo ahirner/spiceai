@@ -15,7 +15,9 @@ limitations under the License.
 */
 
 use super::HttpConfig;
-use crate::metrics::{MetricCollector, NoExtendedMetrics, QueryMetric};
+use crate::metrics::{
+    MetricCollector, NoExtendedMetrics, QueryMetric, QueryStatus, system_time_to_unix_epoch_ms,
+};
 use crate::spicetest::{SpiceTest, TestCompleted, TestNotStarted, TestState};
 use crate::utils::get_random_element;
 use anyhow::Result;
@@ -103,7 +105,7 @@ impl TestCompleted for Completed {
 
 impl SpiceTest<NotStarted> {
     pub fn start(self) -> Result<SpiceTest<Running>> {
-        let client = self.spiced_instance.http_client()?;
+        let client = self.get_spiced()?.http_client()?;
 
         let ConsistencyConfig {
             http:
@@ -140,6 +142,9 @@ impl SpiceTest<NotStarted> {
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
+            api_key: self.api_key,
+            explain_plan_snapshot: self.explain_plan_snapshot,
+            results_snapshot_predicate: self.results_snapshot_predicate,
             state: Running {
                 worker_handles,
                 config: self.state.config,
@@ -173,6 +178,9 @@ impl SpiceTest<Running> {
             start_time: self.start_time,
             spiced_instance: self.spiced_instance,
             use_progress_bars: self.use_progress_bars,
+            api_key: self.api_key,
+            explain_plan_snapshot: self.explain_plan_snapshot,
+            results_snapshot_predicate: self.results_snapshot_predicate,
             state: Completed {
                 result: ConsistencyResult {
                     durations,
@@ -204,6 +212,15 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
         self.name.clone()
     }
 
+    fn spiced_version(&self) -> Result<&str> {
+        let spiced_instance = self.spiced_instance.as_ref().ok_or(
+            anyhow::anyhow!(
+                "Spiced instance is not available. SpiceTest must be started before metrics can be collected."
+            ))?;
+
+        Ok(spiced_instance.version())
+    }
+
     fn metrics(&self) -> Result<Vec<QueryMetric<NoExtendedMetrics>>> {
         self.state
             .result
@@ -211,7 +228,13 @@ impl MetricCollector<NoExtendedMetrics, NoExtendedMetrics> for SpiceTest<Complet
             .iter()
             .enumerate()
             .map(|(i, durations)| {
-                QueryMetric::new_from_durations(format!("{i}").as_str(), durations)
+                QueryMetric::new_from_durations(
+                    format!("{i}").into(),
+                    durations,
+                    QueryStatus::Passed,
+                    system_time_to_unix_epoch_ms(self.start_time)?,
+                    system_time_to_unix_epoch_ms(self.state.end_time)?,
+                )
             })
             .collect()
     }
@@ -303,11 +326,9 @@ impl ConsistencyWorker {
                     Ok(Err(e)) => {
                         eprintln!("Worker {} - Request failed: {}", self.id, e);
                         error_count += 1;
-                        continue;
                     }
                     Err(_) => {
                         eprintln!("Worker {} - Request timed out.", self.id);
-                        continue;
                     }
                 }
             }

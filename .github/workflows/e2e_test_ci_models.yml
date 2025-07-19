@@ -62,14 +62,14 @@ jobs:
     timeout-minutes: 30
     runs-on: ${{ matrix.target.builder }}
     env:
-      GOVER: 1.23.4
+      GOVER: 1.24.2
       GOOS: ${{ matrix.target.target_os }}
       GOARCH: ${{ matrix.target.target_arch_go }}
     strategy:
       matrix:
         target:
           - name: 'Linux x64'
-            builder: 'spiceai-runners'
+            builder: 'spiceai-dev-runners'
             target_os: 'linux'
             target_arch: 'x86_64'
           - name: 'macOS aarch64 (Apple Silicon)'
@@ -78,7 +78,7 @@ jobs:
             target_arch: 'aarch64'
     steps:
       - uses: actions/checkout@v4
-
+      
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
@@ -116,6 +116,10 @@ jobs:
 
       - name: Build spiced (macOS)
         if: matrix.target.target_os == 'darwin'
+        env:
+          # Metal runners do not have `xcrun metal`
+          # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
+          MISTRALRS_METAL_PRECOMPILE: 0
         run: |
           make -C bin/spiced SPICED_NON_DEFAULT_FEATURES="models,metal"
 
@@ -220,7 +224,7 @@ jobs:
           sudo apt-get install -y expect
 
       - name: Install expect (macOS)
-        if: matrix.target.target_os == 'darwin'
+        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
         run: |
           brew install expect
 
@@ -290,7 +294,7 @@ jobs:
           sudo apt-get install -y expect
 
       - name: Install expect (macOS)
-        if: matrix.target.target_os == 'darwin'
+        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
         run: |
           brew install expect
 

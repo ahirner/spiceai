@@ -14,21 +14,111 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use anyhow::Result;
-use arrow::record_batch::RecordBatch;
+use std::sync::Arc;
+
+use anyhow::{Result, anyhow};
+use arrow::{
+    array::ArrayRef,
+    datatypes::{Field, FieldRef, Schema},
+    record_batch::RecordBatch,
+};
 use flight_client::FlightClient;
 use futures::StreamExt;
+use spiceai::{Client as SpiceClient, SpiceClientError};
 
 /// Query a flight client and return the result as a vector of record batches
 ///
 /// # Errors
 ///
 /// - If the flight client fails to query
-pub async fn query_to_batches(client: &FlightClient, sql: &str) -> Result<Vec<RecordBatch>> {
-    let mut stream = client.query(sql).await?;
+pub async fn query_to_batches(
+    spice_client: Arc<SpiceClient>,
+    sql: &str,
+    params: Option<RecordBatch>,
+) -> Result<Vec<RecordBatch>> {
+    let mut stream = spice_client.query_with_params(sql, params).await?;
+
     let mut batches = Vec::new();
     while let Some(batch) = stream.next().await {
-        batches.push(batch?);
+        match batch {
+            Ok(batch) => batches.push(batch),
+            Err(e) => match e {
+                SpiceClientError::ConnectionReset { .. } => {
+                    batches.clear();
+                }
+                _ => {
+                    return Err(anyhow!(e.to_string()));
+                }
+            },
+        }
     }
     Ok(batches)
+}
+
+pub async fn put_batches(
+    client: &mut FlightClient,
+    dataset_path: &str,
+    batches: Vec<RecordBatch>,
+) -> Result<()> {
+    Ok(client.publish(dataset_path, batches).await?)
+}
+
+pub struct PreparedStatementParamColumn {
+    name: String,
+    dtype: arrow::datatypes::DataType,
+    nullable: bool,
+    array: ArrayRef,
+}
+
+impl PreparedStatementParamColumn {
+    pub fn new(
+        name: String,
+        dtype: arrow::datatypes::DataType,
+        nullable: bool,
+        array: ArrayRef,
+    ) -> Self {
+        Self {
+            name,
+            dtype,
+            nullable,
+            array,
+        }
+    }
+}
+
+/// # Usage
+///
+/// ```rust
+/// create_param_batch(vec![
+///   PreparedStatementParamColumn::new(
+///     "$1",
+///     arrow::datatypes::DataType::Int64,
+///     false,
+///     Arc::new(Int64Array::from(vec![41])) as Arc<dyn arrow::array::Array>
+///   ),
+///   PreparedStatementParamColumn::new(
+///     "$2",
+///     arrow::datatypes::DataType::Utf8,
+///     true,
+///     Arc::new(StringArray::from(vec![Some(41), 42])) as Arc<dyn arrow::array::Array>
+///   )
+/// ])?;
+/// ```
+pub fn create_param_batch(
+    params: Vec<PreparedStatementParamColumn>,
+) -> Result<RecordBatch, anyhow::Error> {
+    let (fields, columns): (Vec<FieldRef>, Vec<ArrayRef>) = params
+        .into_iter()
+        .map(|col| {
+            let PreparedStatementParamColumn {
+                name,
+                dtype,
+                nullable,
+                array,
+            } = col;
+            (Arc::new(Field::new(name, dtype, nullable)), array)
+        })
+        .unzip();
+
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(Into::into)
 }

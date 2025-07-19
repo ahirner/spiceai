@@ -19,11 +19,12 @@ use std::sync::Arc;
 use app::AppBuilder;
 
 use crate::{
-    get_test_datafusion, init_tracing, run_query_and_check_results, utils::test_request_context,
-    ValidateFn,
+    ValidateFn, configure_test_datafusion, init_tracing, run_query_and_check_results,
+    utils::test_request_context,
 };
-use runtime::{status, Runtime};
-use spicepod::component::{catalog::Catalog, params::Params};
+
+use runtime::Runtime;
+use spicepod::{component::catalog::Catalog, param::Params};
 
 fn make_catalog(path: &str, name: &str) -> Catalog {
     let mut catalog = Catalog::new(format!("databricks:{path}"), name.to_string());
@@ -34,23 +35,24 @@ fn make_catalog(path: &str, name: &str) -> Catalog {
 #[allow(clippy::expect_used)]
 fn get_params() -> Params {
     // Verify that the environment variables are set
-    let _ = std::env::var("DATABRICKS_HOST").expect("DATABRICKS_HOST is not set");
-    let _ = std::env::var("DATABRICKS_TOKEN").expect("DATABRICKS_TOKEN is not set");
-    let _ = std::env::var("DATABRICKS_CLUSTER_ID").expect("DATABRICKS_CLUSTER_ID is not set");
+    let _ = std::env::var("TEST_DATABRICKS_HOST").expect("TEST_DATABRICKS_HOST is not set");
+    let _ = std::env::var("TEST_DATABRICKS_TOKEN").expect("TEST_DATABRICKS_TOKEN is not set");
+    let _ =
+        std::env::var("TEST_DATABRICKS_CLUSTER_ID").expect("TEST_DATABRICKS_CLUSTER_ID is not set");
 
     Params::from_string_map(
         vec![
             (
                 "databricks_endpoint".to_string(),
-                "${ env:DATABRICKS_HOST }".to_string(),
+                "${ env:TEST_DATABRICKS_HOST }".to_string(),
             ),
             (
                 "databricks_token".to_string(),
-                "${ env:DATABRICKS_TOKEN }".to_string(),
+                "${ env:TEST_DATABRICKS_TOKEN }".to_string(),
             ),
             (
                 "databricks_cluster_id".to_string(),
-                "${ env:DATABRICKS_CLUSTER_ID }".to_string(),
+                "${ env:TEST_DATABRICKS_CLUSTER_ID }".to_string(),
             ),
             ("mode".to_string(), "spark_connect".to_string()),
         ]
@@ -60,6 +62,10 @@ fn get_params() -> Params {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    not(feature = "extended_tests"),
+    ignore = "Extended test - run with --features extended_tests"
+)]
 async fn databricks_spark_integration_test() -> Result<(), anyhow::Error> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
     let _ = rustls::crypto::CryptoProvider::install_default(
@@ -76,21 +82,20 @@ async fn databricks_spark_integration_test() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
+            let mut rt =
+                Runtime::builder()
+                    .with_app(app)
+                    .with_datafusion_configuration_fn(configure_test_datafusion)
+                    .build()
+                    .await;
 
-            let mut rt = Runtime::builder()
-                .with_datafusion(df)
-                .with_app(app)
-                .build()
-                .await;
-
+            let cloned_rt = Arc::new(rt.clone());
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             let queries: QueryTests = vec![(

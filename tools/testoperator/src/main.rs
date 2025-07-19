@@ -19,6 +19,7 @@ use test_framework::{anyhow, rustls};
 
 mod args;
 mod commands;
+mod metrics;
 
 use args::{
     Commands, DataConsistencyArgs, DatasetTestArgs, EvalsTestArgs, HttpConsistencyTestArgs,
@@ -52,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
                 ..
             }),
         ) => {
-            commands::env_export(&common)?;
+            commands::env_export(&common).await?;
         }
         Commands::Run(TestCommands::Throughput(args)) => commands::throughput::run(&args).await?,
         Commands::Run(TestCommands::Load(args)) => commands::load::run(&args).await?,
@@ -73,6 +74,20 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Run(TestCommands::Evals(args)) => {
             commands::evals::run(&args).await?;
+        }
+        #[cfg(feature = "append")]
+        Commands::Run(TestCommands::Append(args)) => {
+            commands::append::run(&args).await?;
+        }
+        #[cfg(feature = "append")]
+        Commands::Export(TestCommands::Append(args)) => {
+            commands::env_export(&args.common).await?;
+        }
+        Commands::Run(TestCommands::VectorSearch(args)) => {
+            commands::vector_search::run(&args).await?;
+        }
+        Commands::Export(TestCommands::VectorSearch(args)) => {
+            commands::env_export(&args).await?;
         }
     }
 

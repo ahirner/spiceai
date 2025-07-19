@@ -18,10 +18,13 @@ use std::sync::Arc;
 
 use common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container};
 use mysql_async::prelude::Queryable;
-use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
+
+use spicepod::component::dataset::Dataset;
+use spicepod::param::ParamValue;
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
-use crate::utils::test_request_context;
+use crate::utils::{runtime_ready_check, test_request_context};
 
 pub mod common;
 
@@ -33,8 +36,9 @@ use mysql_async::{Params, Row};
 use runtime::Runtime;
 use tracing::instrument;
 
-const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-types-mysql";
-const MYSQL_PORT: u16 = 13316;
+const MYSQL_PORT1: u16 = 13316;
+const MYSQL_PORT2: u16 = 13317;
+const MYSQL_PORT3: u16 = 13318;
 
 #[instrument]
 async fn init_mysql_db(port: u16) -> Result<(), anyhow::Error> {
@@ -172,6 +176,47 @@ CREATE TABLE test (
     Ok(())
 }
 
+#[instrument]
+async fn init_mysql_utf8mb4_db(port: u16) -> Result<(), anyhow::Error> {
+    let pool = get_mysql_conn(port)?;
+    let mut conn = pool.get_conn().await?;
+
+    tracing::debug!("DROP TABLE IF EXISTS test_utf8mb4");
+    let _: Vec<Row> = conn
+        .exec("DROP TABLE IF EXISTS test_utf8mb4", Params::Empty)
+        .await?;
+
+    let _: Vec<Row> = conn
+        .exec(
+            "
+CREATE TABLE test_utf8mb4 (
+  id SERIAL PRIMARY KEY,
+  col_text_utf8mb4 TEXT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+  col_varchar_utf8mb4 VARCHAR(255) CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci,
+  col_normal_text TEXT
+);",
+            Params::Empty,
+        )
+        .await?;
+
+    let _: Vec<Row> = conn
+        .exec(
+            "INSERT INTO test_utf8mb4 (
+  col_text_utf8mb4,
+  col_varchar_utf8mb4,
+  col_normal_text
+) VALUES (
+  '🚀 This text contains UTF8MB4 characters that are not in UTF8MB3 😊',
+  '🦄 Another UTF8MB4 string with emojis 🎉',
+  'Regular text with no special characters'
+);",
+            Params::Empty,
+        )
+        .await?;
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn mysql_integration_test() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
@@ -180,7 +225,7 @@ async fn mysql_integration_test() -> Result<(), String> {
     test_request_context()
         .scope(async {
             let running_container =
-                start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
+                start_mysql_docker_container(MYSQL_PORT1)
                     .await
                     .map_err(|e| {
                         tracing::error!("start_mysql_docker_container: {e}");
@@ -189,7 +234,7 @@ async fn mysql_integration_test() -> Result<(), String> {
             tracing::debug!("Container started");
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mysql_db(MYSQL_PORT)
+                init_mysql_db(MYSQL_PORT1)
                     .await
                     .map_err(RetryError::transient)
             })
@@ -199,25 +244,23 @@ async fn mysql_integration_test() -> Result<(), String> {
                 e.to_string()
             })?;
             let app = AppBuilder::new("mysql_integration_test")
-                .with_dataset(make_mysql_dataset("test", "test", MYSQL_PORT, false))
+                .with_dataset(make_mysql_dataset("test", "test", MYSQL_PORT1, false))
                 .build();
-
-            let status = status::RuntimeStatus::new();
-            let df = get_test_datafusion(Arc::clone(&status));
 
             let mut rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
-                .with_runtime_status(status)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
 
+            let cloned_rt = Arc::new(rt.clone());
+
             // Set a timeout for the test
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             let queries: QueryTests = vec![(
@@ -261,4 +304,241 @@ async fn mysql_integration_test() -> Result<(), String> {
             Ok(())
         })
         .await
+}
+
+#[tokio::test]
+async fn mysql_character_set_results_test() -> Result<(), String> {
+    type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let running_container =
+                start_mysql_docker_container(MYSQL_PORT2)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("start_mysql_docker_container: {e}");
+                        e.to_string()
+                    })?;
+            tracing::debug!("Container started");
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                init_mysql_utf8mb4_db(MYSQL_PORT2)
+                    .await
+                    .map_err(RetryError::transient)
+            })
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to initialize MySQL database: {e}");
+                e.to_string()
+            })?;
+
+            let app = AppBuilder::new("mysql_character_set_results_test")
+                .with_dataset(make_mysql_dataset(
+                    "test_utf8mb4",
+                    "test_default",
+                    MYSQL_PORT2,
+                    false,
+                ))
+                .build();
+
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            // Set a timeout for the test
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let queries: QueryTests = vec![(
+                "SELECT * FROM test_default",
+                "character_set_results_default",
+                Some(Box::new(|result_batches| {
+                    // snapshot the values of the results
+                    let results = arrow::util::pretty::pretty_format_batches(&result_batches)
+                        .expect("should pretty print result batch");
+
+                    insta::with_settings!({
+                        description => format!("MySQL Integration Test Results"),
+                        omit_expression => true,
+                        snapshot_path => "../snapshots"
+                    }, {
+                        insta::assert_snapshot!(format!("character_set_results_default"), results);
+                    });
+                })),
+            )];
+
+            for (query, snapshot_suffix, validate_result) in queries {
+                run_query_and_check_results(
+                    &mut rt,
+                    &format!("mysql_integration_test_{snapshot_suffix}"),
+                    query,
+                    false,
+                    validate_result,
+                )
+                .await?;
+            }
+
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                e.to_string()
+            })?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn mysql_timezone_test() -> Result<(), String> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let running_container =
+                start_mysql_docker_container(MYSQL_PORT3)
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("start_mysql_docker_container: {e}");
+                        e.to_string()
+                    })?;
+            tracing::debug!("Container started");
+
+            let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
+            retry(retry_strategy, || async {
+                init_mysql_tz_test_db(MYSQL_PORT3)
+                    .await
+                    .map_err(RetryError::transient)
+            })
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to initialize MySQL timezone database: {e}");
+                e.to_string()
+            })?;
+
+            let mut ds_system = make_mysql_dataset("tz_test", "tz_system_tbl", MYSQL_PORT3, false);
+            set_dataset_time_zone(&mut ds_system, "system")?;
+
+            let mut ds_custom = make_mysql_dataset("tz_test", "tz_custom_tbl", MYSQL_PORT3, false);
+            set_dataset_time_zone(&mut ds_custom, "+02:00")?;
+
+            let app = AppBuilder::new("mysql_timezone_test")
+                .with_dataset(ds_system)
+                .with_dataset(ds_custom)
+                .build();
+
+            let mut rt = Runtime::builder()
+                .with_app(app)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
+                .build()
+                .await;
+
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err("Timed out waiting for datasets to load".to_string());
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            run_query_and_check_results(
+                &mut rt,
+                "mysql_timezone_test",
+                "SELECT * FROM tz_system_tbl ORDER BY id",
+                false,
+                Some(Box::new(
+                    |result_batches: Vec<arrow::array::RecordBatch>| {
+                        let results = arrow::util::pretty::pretty_format_batches(&result_batches)
+                            .expect("should pretty print result batch");
+
+                        insta::assert_snapshot!("system_time_zone", results);
+                    },
+                )),
+            )
+            .await?;
+
+            run_query_and_check_results(
+                &mut rt,
+                "mysql_timezone_test",
+                "SELECT * FROM tz_custom_tbl ORDER BY id",
+                false,
+                Some(Box::new(
+                    |result_batches: Vec<arrow::array::RecordBatch>| {
+                        let results = arrow::util::pretty::pretty_format_batches(&result_batches)
+                            .expect("should pretty print result batch");
+
+                        insta::assert_snapshot!("custom_time_zone", results);
+                    },
+                )),
+            )
+            .await?;
+
+            running_container.remove().await.map_err(|e| {
+                tracing::error!("running_container.remove: {e}");
+                e.to_string()
+            })?;
+
+            Ok(())
+        })
+        .await
+}
+
+#[instrument]
+async fn init_mysql_tz_test_db(port: u16) -> Result<(), anyhow::Error> {
+    let pool = get_mysql_conn(port)?;
+    let mut conn = pool.get_conn().await?;
+
+    // Set timezone to UTC
+    conn.query_drop("SET time_zone = '+00:00'").await?;
+
+    tracing::debug!("DROP TABLE IF EXISTS tz_test");
+    let _: Vec<Row> = conn
+        .exec("DROP TABLE IF EXISTS tz_test", Params::Empty)
+        .await?;
+
+    let _: Vec<Row> = conn
+        .exec(
+            "CREATE TABLE tz_test (
+                id INT PRIMARY KEY AUTO_INCREMENT,
+                ts TIMESTAMP
+            )",
+            Params::Empty,
+        )
+        .await?;
+
+    let _: Vec<Row> = conn
+        .exec(
+            "INSERT INTO tz_test (ts) VALUES 
+                ('2024-06-01 08:00:00'),
+                ('2024-06-01 12:00:00'),
+                ('2024-06-01 16:00:00')",
+            Params::Empty,
+        )
+        .await?;
+
+    Ok(())
+}
+
+fn set_dataset_time_zone(ds: &mut Dataset, tz: &str) -> Result<(), String> {
+    let Some(params) = ds.params.as_mut() else {
+        return Err("Dataset params are missing".to_string());
+    };
+    params.data.insert(
+        "mysql_time_zone".to_string(),
+        ParamValue::String(tz.to_string()),
+    );
+    Ok(())
 }

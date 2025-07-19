@@ -31,18 +31,18 @@ use futures::future::join_all;
 use snafu::ResultExt;
 use tei_backend::{Backend, DType, ModelType, Pool};
 use tei_core::{
+    TextEmbeddingsError,
     infer::{Infer, PooledEmbeddingsInferResponse},
     queue::Queue,
     tokenization::{EncodingInput, Tokenization},
-    TextEmbeddingsError,
 };
 use tokenizers::{Tokenizer, TruncationDirection};
 
 use crate::{
     chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker},
     embeddings::{
-        candle::util::link_files_into_tmp_dir, encode_embedding, Embed, Error,
-        FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu, Result,
+        Embed, Error, FailedToCreateEmbeddingSnafu, FailedToInstantiateEmbeddingModelSnafu, Result,
+        candle::util::link_files_into_tmp_dir, encode_embedding,
     },
 };
 
@@ -51,6 +51,7 @@ use super::util::{
     max_seq_length_from_st_config, pool_from_str, position_offset,
 };
 
+#[derive(Debug)]
 pub struct TeiEmbed {
     pub infer: Infer,
     pub model_size: i32,     // Used for `size` method.
@@ -60,7 +61,7 @@ pub struct TeiEmbed {
 impl TeiEmbed {
     const DEFAULT_POOLING_OPERATOR: Pool = Pool::Mean;
 
-    pub fn from_local(
+    pub async fn from_local(
         model_path: &Path,
         config_path: &Path,
         tokenizer_path: &Path,
@@ -106,7 +107,7 @@ impl TeiEmbed {
             Self::DEFAULT_POOLING_OPERATOR
         };
 
-        Self::from_dir(&model_root, Some(pool), max_seq_length_overwrite)
+        Self::from_dir(&model_root, Some(pool), max_seq_length_overwrite).await
     }
 
     pub async fn from_hf(
@@ -130,11 +131,11 @@ impl TeiEmbed {
             .transpose()?
             .flatten();
         let model_root = download_hf_artifacts(model_id, revision, hf_token).await?;
-        Self::from_dir(&model_root, pool, max_seq_length_overwrite)
+        Self::from_dir(&model_root, pool, max_seq_length_overwrite).await
     }
 
     /// Instantiates a text-embedding-inference service with model, tokenizer, config, etc files in a single directory.
-    pub fn from_dir(
+    pub async fn from_dir(
         root: &Path,
         pooling_overwrite: Option<Pool>,
         max_seq_length_overwrite: Option<usize>,
@@ -177,12 +178,14 @@ impl TeiEmbed {
         // Last 3 parameters are not used (since we are using `candle` feature flag).
         let backend = Backend::new(
             root.into(),
+            None,
             DType::Float32,
             model_type,
             String::new(), // Not used
             None,          // Not used
             String::new(), // Not used
         )
+        .await
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
 

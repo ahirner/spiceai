@@ -21,14 +21,15 @@ use datafusion::{
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::postgres::{
-    write::PostgresTableWriter, PostgresTableProviderFactory,
+    PostgresTableProviderFactory, write::PostgresTableWriter,
 };
+use runtime_table_partition::expression::PartitionBy;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::{component::dataset::Dataset, parameters::ParameterSpec};
+use crate::parameters::ParameterSpec;
 
-use super::DataAccelerator;
+use super::{AccelerationSource, Behaviors, DataAccelerator};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -86,12 +87,26 @@ impl DataAccelerator for PostgresAccelerator {
     /// Creates a new table in the accelerator engine, returning a `TableProvider` that supports reading and writing.
     async fn create_external_table(
         &self,
-        cmd: &CreateExternalTable,
-        _dataset: Option<&Dataset>,
-    ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        mut cmd: CreateExternalTable,
+        _source: Option<&dyn AccelerationSource>,
+        partition_by: Option<PartitionBy>,
+    ) -> Result<(Arc<dyn TableProvider>, Behaviors), Box<dyn std::error::Error + Send + Sync>> {
+        ensure!(
+            partition_by.is_none(),
+            super::InvalidConfigurationSnafu {
+                msg: "Postgres data accelerator does not support the `partition_by` parameter but it was provided".to_string()
+            }
+        );
+
         let ctx = SessionContext::new();
+
+        cmd.options.insert(
+            "application_name".to_string(),
+            format!("Spice.ai {}", env!("CARGO_PKG_VERSION")),
+        );
+
         let table_provider =
-            TableProviderFactory::create(&self.postgres_factory, &ctx.state(), cmd)
+            TableProviderFactory::create(&self.postgres_factory, &ctx.state(), &cmd)
                 .await
                 .context(UnableToCreateTableSnafu)
                 .boxed()?;
@@ -107,11 +122,13 @@ impl DataAccelerator for PostgresAccelerator {
         let postgres_writer = Arc::new(postgres_writer.clone());
         let cloned_writer = Arc::clone(&postgres_writer);
 
-        Ok(Arc::new(PolyTableProvider::new(
+        let table_provider = Arc::new(PolyTableProvider::new(
             cloned_writer,
             postgres_writer,
             read_provider,
-        )))
+        ));
+
+        Ok((table_provider, Behaviors::default()))
     }
 
     fn prefix(&self) -> &'static str {

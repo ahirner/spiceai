@@ -33,7 +33,10 @@ const SPICE_KEY_PREFIX: &str = "spice_";
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("AWS identity verification failed, check configuration with `aws configure list` and `aws sts get-caller-identity`: {}", source))]
+    #[snafu(display(
+        "AWS identity verification failed, check configuration with `aws configure list` and `aws sts get-caller-identity`: {}",
+        source
+    ))]
     UnableToVerifyAwsIdentity {
         source: SdkError<GetCallerIdentityError>,
     },
@@ -71,7 +74,7 @@ impl AwsSecretsManager {
     /// - If the AWS configuration cannot be loaded.
     /// - If the call to STS `get_caller_identity` fails, which might be due to invalid or expired AWS credentials.
     pub async fn init(&self) -> Result<()> {
-        let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+        let config = aws_config::defaults(BehaviorVersion::v2025_01_17())
             .load()
             .await;
 
@@ -96,7 +99,7 @@ impl SecretStore for AwsSecretsManager {
             self.secret_name
         );
 
-        let config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+        let config = aws_config::defaults(BehaviorVersion::v2025_01_17())
             .load()
             .await;
 
@@ -128,9 +131,9 @@ impl SecretStore for AwsSecretsManager {
         if let Some(secret_str) = secret_value.secret_string() {
             let data = parse_json_to_hashmap(secret_str)?;
             if let Some(value) = data.get(&prefixed_key) {
-                return Ok(Some(SecretString::new(value.clone())));
+                return Ok(Some(SecretString::from(value.clone())));
             }
-            return Ok(data.get(key).cloned().map(SecretString::new));
+            return Ok(data.get(key).cloned().map(SecretString::from));
         }
 
         Ok(None)

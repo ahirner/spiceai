@@ -14,39 +14,53 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::embeddings::vector_search;
+use crate::datafusion::DataFusion;
+use crate::datafusion::request_context_extension::DataFusionContextExtension;
+use crate::model::ModelContextLayer;
+use crate::{search::vector_search, status::RuntimeStatus};
 
+use crate::Runtime;
 #[cfg(feature = "openapi")]
 use crate::http::v1::{
-    datasets::{DatasetFilter, DatasetQueryParams},
     Format,
+    datasets::{DatasetFilter, DatasetQueryParams},
 };
 use crate::request::Protocol;
-use crate::Runtime;
 use crate::{config, request::RequestContext};
 
+#[cfg(feature = "mcp")]
+use crate::tools::mcp::server::RuntimeServer;
 use app::App;
-use axum::routing::patch;
+use axum::{extract::State, routing::patch};
+use http::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE};
 use opentelemetry::KeyValue;
+#[cfg(feature = "mcp")]
+use rmcp::transport::SseServer;
+#[cfg(feature = "mcp")]
+use rmcp::transport::sse_server::SseServerConfig;
 use spicepod::component::runtime::CorsConfig;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
 #[cfg(feature = "openapi")]
-use utoipa::OpenApi;
+use utoipa::{
+    OpenApi,
+    openapi::{HttpMethod, path::Operation},
+};
 
 #[cfg(feature = "dev")]
 use utoipa_swagger_ui::SwaggerUi;
 
 use super::{metrics, v1};
+
 use axum::{
+    Extension,
     body::Body,
     extract::MatchedPath,
     http::{HeaderValue, Method, Request},
     middleware::{self, Next},
     response::IntoResponse,
-    routing::{get, post, Router},
-    Extension,
+    routing::{Router, get, post},
 };
 use runtime_auth::layer::http::AuthLayer;
 use tokio::time::Instant;
@@ -90,8 +104,84 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 
     components(schemas(DatasetQueryParams, DatasetFilter, Format)) // These schemas, for some reason, weren't getting picked up.
 )]
-pub struct ApiDoc;
+pub(crate) struct ApiDoc;
 
+/// Returns the `OpenAPI` documentation for the HTTP API. Adds MCP endpoints if the feature is enabled.
+#[cfg(feature = "openapi")]
+#[must_use]
+pub fn get_api_doc() -> utoipa::openapi::OpenApi {
+    use utoipa::openapi::{
+        Required,
+        path::{Parameter, ParameterIn},
+    };
+
+    let mut openai = ApiDoc::openapi();
+
+    #[cfg(feature = "mcp")]
+    {
+        openai.paths.add_path_operation(
+            "/v1/mcp/sse",
+            vec![HttpMethod::Get],
+            Operation::builder()
+                .operation_id(Some("operation_id"))
+                .tag("mcp")
+                .summary(Some("Establish an MCP SSE Connection"))
+                .description(Some(
+                    "Initiates a Server-Sent Events (SSE) connection using the Model Context Protocol (MCP) to interact with Spice tools.\n\n
+             Once connected, clients can send messages via `POST /v1/mcp/sse` and receive responses through this SSE stream.",
+                ))
+                .build(),
+        );
+        openai.paths.add_path_operation(
+            "/v1/mcp/sse",
+            vec![HttpMethod::Post],
+            Operation::builder()
+                .operation_id(Some("mcp_event"))
+                .tag("mcp")
+                .summary(Some("Send message to MCP server"))
+                .description(Some(
+                    "Send message to the MCP endoint, for a given session.",
+                ))
+                .parameter(
+                    Parameter::builder()
+                        .name("sessionId")
+                        .parameter_in(ParameterIn::Query)
+                        .required(Required::True)
+                        .build(),
+                )
+                .response(
+                    "202",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("Message accepted. Response will stream via SSE.")
+                        .build(),
+                )
+                .response(
+                    "404",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description(
+                            "Session not found. No active session for the given `session_id`.",
+                        )
+                        .build(),
+                )
+                .response(
+                    "413",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("Payload too large. Maximum allowed size is 4MB.")
+                        .build(),
+                )
+                .response(
+                    "500",
+                    utoipa::openapi::ResponseBuilder::new()
+                        .description("Internal server error. An unexpected issue occurred.")
+                        .build(),
+                )
+                .build(),
+        );
+    }
+    openai
+}
+
+#[allow(clippy::too_many_lines)]
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
     config: Arc<config::Config>,
@@ -105,11 +195,11 @@ pub(crate) fn routes(
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/datasets", get(v1::datasets::get))
         .route(
-            "/v1/datasets/:name/acceleration/refresh",
+            "/v1/datasets/{name}/acceleration/refresh",
             post(v1::datasets::refresh),
         )
         .route(
-            "/v1/datasets/:name/acceleration",
+            "/v1/datasets/{name}/acceleration",
             patch(v1::datasets::acceleration),
         )
         .route("/v1/spicepods", get(v1::spicepods::get))
@@ -119,15 +209,15 @@ pub(crate) fn routes(
         .route("/v1/config", get(v1::iceberg::get_config))
         .route("/v1/namespaces", get(v1::iceberg::get_namespaces))
         .route(
-            "/v1/namespaces/:namespace",
+            "/v1/namespaces/{namespace}",
             get(v1::iceberg::get_namespace).head(v1::iceberg::head_namespace),
         )
         .route(
-            "/v1/namespaces/:namespace/tables",
+            "/v1/namespaces/{namespace}/tables",
             get(v1::iceberg::list_tables),
         )
         .route(
-            "/v1/namespaces/:namespace/tables/:table",
+            "/v1/namespaces/{namespace}/tables/{table}",
             get(v1::iceberg::tables::get).head(v1::iceberg::tables::head),
         );
 
@@ -137,33 +227,56 @@ pub(crate) fn routes(
     #[cfg(feature = "dev")]
     {
         authenticated_router = authenticated_router
-            .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", ApiDoc::openapi()));
+            .merge(SwaggerUi::new("/docs").url("/docs/openapi.json", get_api_doc()));
     }
 
     if cfg!(feature = "models") {
         authenticated_router = authenticated_router
             .route("/v1/models", get(v1::models::get))
-            .route("/v1/models/:name/predict", get(v1::inference::get))
+            .route("/v1/models/{name}/predict", get(v1::inference::get))
             .route("/v1/predict", post(v1::inference::post))
-            .route("/v1/nsql", post(v1::nsql::post))
-            .route("/v1/chat/completions", post(v1::chat::post))
+            .route("/v1/nsql", post(v1::nsql::post).layer(ModelContextLayer))
+            .route(
+                "/v1/chat/completions",
+                post(v1::chat::post).layer(ModelContextLayer),
+            )
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route("/v1/search", post(v1::search::post))
             .route("/v1/tools", get(v1::tools::list))
-            .route("/v1/tools/*name", post(v1::tools::post))
+            .route("/v1/tools/{*name}", post(v1::tools::post))
             // Deprecated, use /v1/evals/:name instead
-            .route("/v1/tool/:name", post(v1::tools::post))
-            .route("/v1/evals/:name", post(v1::eval::post))
-            .route("/v1/evals/", get(v1::eval::list))
+            .route("/v1/tool/{name}", post(v1::tools::post))
+            .route(
+                "/v1/evals/{name}",
+                post(v1::eval::post).layer(ModelContextLayer),
+            )
+            .route("/v1/evals", get(v1::eval::list))
+            .route("/v1/workers", get(v1::workers::get))
             .layer(Extension(Arc::clone(&rt.llms)))
             .layer(Extension(Arc::clone(&rt.models)))
             .layer(Extension(Arc::clone(&rt.eval_scorers)))
             .layer(Extension(vector_search))
-            .layer(Extension(Arc::clone(&rt.embeds)));
+            .layer(Extension(Arc::clone(&rt.embeds)))
+            .layer(Extension(Arc::clone(&rt.workers)));
     }
+
+    #[cfg(feature = "mcp")]
+    {
+        let (sse_server, mcp_router) = SseServer::new(SseServerConfig {
+            bind: config.http_bind_address,
+            sse_path: "/v1/mcp/sse".to_string(),
+            post_path: "/v1/mcp/sse".to_string(),
+            ct: tokio_util::sync::CancellationToken::new(),
+            sse_keep_alive: None,
+        });
+
+        let runtime_arc = Arc::clone(rt);
+        let _cancellation_token =
+            sse_server.with_service(move || RuntimeServer::from(&runtime_arc));
+        authenticated_router = mcp_router.merge(authenticated_router);
+    }
+
     authenticated_router = authenticated_router
-        .layer(Extension(Arc::clone(&rt.app)))
-        .layer(Extension(Arc::clone(&rt.df)))
         .layer(Extension(Arc::clone(rt)))
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(config));
@@ -181,12 +294,17 @@ pub(crate) fn routes(
 
     unauthenticated_router
         .merge(authenticated_router)
-        .route_layer(middleware::from_fn(track_metrics))
+        .route_layer(middleware::from_fn_with_state(rt.status(), check_shutdown))
+        .route_layer(middleware::from_fn_with_state(
+            Arc::clone(&rt.df),
+            track_metrics,
+        ))
         .layer(Extension(Arc::clone(&rt.app)))
         .layer(cors_layer(cors_config))
 }
 
 async fn track_metrics(
+    State(df): State<Arc<DataFusion>>,
     Extension(app): Extension<Arc<RwLock<Option<Arc<App>>>>>,
     headers: http::HeaderMap,
     req: Request<Body>,
@@ -196,9 +314,12 @@ async fn track_metrics(
     let request_context = Arc::new(
         RequestContext::builder(Protocol::Http)
             .with_app_opt(app_lock.as_ref().map(Arc::clone))
+            .with_df_opt(Some(Arc::clone(&df)))
             .from_headers(&headers)
             .build(),
     );
+
+    request_context.insert_extension(DataFusionContextExtension::new(Arc::clone(&df)));
 
     let request_dimensions = request_context.to_dimensions();
 
@@ -211,7 +332,10 @@ async fn track_metrics(
     let method = req.method().clone();
 
     let response = Arc::clone(&request_context)
-        .scope(async move { next.run(req).await })
+        .scope(async move {
+            request_context.load_extensions().await;
+            next.run(req).await
+        })
         .await;
 
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -257,6 +381,28 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
         cors_config.allowed_origins
     );
 
-    cors.allow_methods([Method::GET, Method::POST, Method::PATCH])
+    cors.allow_methods([Method::GET, Method::POST, Method::PATCH, Method::OPTIONS])
+        .allow_headers([ACCEPT, CONTENT_TYPE, AUTHORIZATION])
         .allow_origin(allowed_origins)
+}
+
+async fn check_shutdown(
+    State(status): State<Arc<RuntimeStatus>>,
+    req: axum::http::Request<Body>,
+    next: Next,
+) -> impl IntoResponse {
+    // Allow /health to bypass shutdown check
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+
+    if status.is_shutdown() {
+        return (
+            http::StatusCode::SERVICE_UNAVAILABLE,
+            "Runtime is shutting down",
+        )
+            .into_response();
+    }
+
+    next.run(req).await
 }

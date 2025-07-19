@@ -16,13 +16,18 @@ limitations under the License.
 
 #![allow(clippy::missing_errors_doc)]
 
+pub mod app_utils;
 pub mod flight;
 pub mod gh_utils;
+pub mod git;
 pub mod metrics;
+pub mod process;
 pub mod queries;
+pub mod snapshot;
 pub mod spiced;
 pub mod spicepod_utils;
 pub mod spicetest;
+pub mod telemetry;
 pub mod utils;
 
 use std::fmt::Display;
@@ -33,9 +38,12 @@ pub use arrow;
 pub use flight_client;
 pub use futures;
 pub use octocrab;
+pub use opentelemetry;
+pub use opentelemetry_sdk;
 pub use rustls;
 pub use serde_yaml;
 pub use spicepod;
+pub use tokio_util;
 
 #[derive(Debug, Clone, Copy)]
 pub enum TestType {
@@ -45,6 +53,7 @@ pub enum TestType {
     DataConsistency,
     HttpConsistency,
     HttpOverhead,
+    VectorSearch,
 }
 
 impl TestType {
@@ -57,6 +66,7 @@ impl TestType {
             TestType::DataConsistency => "testoperator_run_data_consistency.yml",
             TestType::HttpConsistency => "testoperator_run_http_consistency.yml",
             TestType::HttpOverhead => "testoperator_run_http_overhead.yml",
+            TestType::VectorSearch => "testoperator_run_vector_search.yml",
         }
     }
 }
@@ -70,6 +80,7 @@ impl Display for TestType {
             TestType::DataConsistency => write!(f, "data_consistency"),
             TestType::HttpConsistency => write!(f, "http_consistency"),
             TestType::HttpOverhead => write!(f, "http_overhead"),
+            TestType::VectorSearch => write!(f, "vector_search"),
         }
     }
 }

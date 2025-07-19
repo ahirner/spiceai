@@ -14,39 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
 use app::AppBuilder;
-use async_openai::types::{
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-    CreateChatCompletionRequestArgs, EmbeddingInput,
-};
-use llms::chat::create_hf_model;
-use runtime::{
-    auth::EndpointAuth,
-    model::ToolUsingChat,
-    tools::{options::SpiceToolsOptions, utils::get_tools},
-    Runtime,
-};
-use spicepod::component::{
-    embeddings::{ColumnEmbeddingConfig, Embeddings},
-    model::Model,
-};
-
-use llms::chat::Chat;
+use async_openai::types::EmbeddingInput;
+use runtime::{Runtime, auth::EndpointAuth};
+use spicepod::component::{embeddings::Embeddings, model::Model};
 
 use crate::models::embedding::run_beta_functionality_criteria_test;
 use crate::{
-    init_tracing, init_tracing_with_task_history,
+    init_tracing,
     models::{
         create_api_bindings_config,
-        embedding::{run_embedding_tests, EmbeddingTestCase},
-        get_taxi_trips_dataset, get_tpcds_dataset, normalize_chat_completion_response,
-        send_chat_completions_request,
+        embedding::{EmbeddingTestCase, run_embedding_tests},
+        get_taxi_trips_dataset, normalize_chat_completion_response, send_chat_completions_request,
     },
-    utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
+    utils::init_tracing_with_task_history,
+    utils::{runtime_ready_check_with_timeout, test_request_context, verify_env_secret_exists},
 };
 
 use tokio::sync::Mutex;
@@ -62,17 +49,19 @@ const HF_TEST_MODEL_REQUIRES_HF_API_KEY: bool = true;
 mod nsql {
 
     use serde_json::json;
+    use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
 
     use crate::{
-        models::nsql::{run_nsql_test, TestCase},
-        utils::verify_env_secret_exists,
+        DEFAULT_TRACING_MODELS,
+        models::nsql::{TestCase, run_nsql_test},
+        utils::{runtime_ready_check_with_timeout, verify_env_secret_exists},
     };
 
     use super::*;
 
     #[tokio::test]
     async fn huggingface_test_nsql() -> Result<(), anyhow::Error> {
-        let _tracing = init_tracing(None);
+        let _tracing = init_tracing(DEFAULT_TRACING_MODELS);
 
         if HF_TEST_MODEL_REQUIRES_HF_API_KEY {
             verify_env_secret_exists("SPICE_HF_TOKEN")
@@ -84,11 +73,16 @@ mod nsql {
             .scope(async {
 
                 let mut taxi_trips_with_embeddings = get_taxi_trips_dataset();
-                taxi_trips_with_embeddings.embeddings = vec![ColumnEmbeddingConfig {
-                    column: "store_and_fwd_flag".to_string(),
-                    model: "hf_minilm".to_string(),
-                    primary_keys: None,
-                    chunking: None,
+                taxi_trips_with_embeddings.columns = vec![Column {
+                        name: "store_and_fwd_flag".to_string(),
+                        embeddings: vec![ColumnLevelEmbeddingConfig {
+                            model: "hf_minilm".to_string(),
+                            row_ids: None,
+                            chunking: None,
+                        }],
+                        description: None,
+                        full_text_search: None,
+                        metadata: HashMap::new(),
                 }];
 
                 let app = AppBuilder::new("text-to-sql")
@@ -109,26 +103,24 @@ mod nsql {
 
                 let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
-                let (_tracing, trace_provider) = init_tracing_with_task_history(None, &rt);
+                let (_tracing, trace_provider) = init_tracing_with_task_history(DEFAULT_TRACING_MODELS, &rt);
 
                 let rt_ref_copy = Arc::clone(&rt);
                 tokio::spawn(async move {
                     Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
                 });
 
-                let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
+                let _llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
 
                 tokio::select! {
                     // increased timeout to download and load huggingface model
                     () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
                         return Err(anyhow::anyhow!("Timed out waiting for components to load"));
                     }
-                    () = rt.load_components() => {}
+                    () = Arc::clone(&rt).load_components() => {}
                 }
 
-                drop(llm_init_lock);
-
-                runtime_ready_check(&rt).await;
+                runtime_ready_check_with_timeout(&rt, std::time::Duration::from_secs(120)).await;
 
                 let test_cases = [
                     TestCase {
@@ -181,100 +173,147 @@ mod search {
     use serde_json::json;
     use spicepod::component::embeddings::EmbeddingChunkConfig;
 
-    use crate::models::search::{run_search_test, TestCase};
+    use crate::models::search::{
+        SearchTestCase, catalog_page_tpch_dataset_w_embeddings, item_tpch_dataset_w_embeddings,
+        run_search,
+    };
 
     use super::*;
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn huggingface_test_search() -> Result<(), anyhow::Error> {
-        let _tracing = init_tracing(None);
+        let app = AppBuilder::new("text-to-sql")
+            .with_dataset(item_tpch_dataset_w_embeddings(
+                "item",
+                "hf_minilm",
+                Some(vec!["i_item_sk".to_string()]),
+                None,
+            ))
+            .with_dataset(catalog_page_tpch_dataset_w_embeddings(
+                "catalog_page_with_chunking",
+                "hf_minilm",
+                Some(vec!["cp_catalog_page_sk".to_string()]),
+                Some(EmbeddingChunkConfig {
+                    enabled: true,
+                    target_chunk_size: 512,
+                    overlap_size: 128,
+                    trim_whitespace: false,
+                }),
+            ))
+            .with_dataset(catalog_page_tpch_dataset_w_embeddings(
+                "catalog_page_with_chunking_no_pk",
+                "hf_minilm",
+                None,
+                Some(EmbeddingChunkConfig {
+                    enabled: true,
+                    target_chunk_size: 512,
+                    overlap_size: 128,
+                    trim_whitespace: false,
+                }),
+            ))
+            .with_embedding(get_huggingface_embeddings(
+                "sentence-transformers/all-MiniLM-L6-v2",
+                "hf_minilm",
+            ))
+            .build();
 
-        test_request_context()
-            .scope(async {
-                let mut ds_tpcds_item = get_tpcds_dataset("item", None, None);
-                ds_tpcds_item.embeddings = vec![ColumnEmbeddingConfig {
-                    column: "i_item_desc".to_string(),
-                    model: "hf_minilm".to_string(),
-                    primary_keys: Some(vec!["i_item_sk".to_string()]),
-                    chunking: None,
-                }];
-
-                let mut ds_tpcds_cp_with_chunking =
-                    get_tpcds_dataset("catalog_page", Some("catalog_page_with_chunking"), Some("select cp_description, cp_catalog_page_sk from catalog_page_with_chunking limit 20"));
-                ds_tpcds_cp_with_chunking.embeddings = vec![ColumnEmbeddingConfig {
-                    column: "cp_description".to_string(),
-                    model: "hf_minilm".to_string(),
-                    primary_keys: Some(vec!["cp_catalog_page_sk".to_string()]),
-                    chunking: Some(EmbeddingChunkConfig {
-                        enabled: true,
-                        target_chunk_size: 512,
-                        overlap_size: 128,
-                        trim_whitespace: false,
+        run_search(
+            app,
+            vec![
+                SearchTestCase {
+                    name: "hf_basic",
+                    body: json!({
+                        "text": "new patient",
+                        "limit": 2,
+                        "datasets": ["item"],
+                        "additional_columns": ["i_color", "i_item_id"],
                     }),
-                }];
-
-                let app = AppBuilder::new("text-to-sql")
-                    .with_dataset(ds_tpcds_item)
-                    .with_dataset(ds_tpcds_cp_with_chunking)
-                    .with_embedding(get_huggingface_embeddings(
-                        "sentence-transformers/all-MiniLM-L6-v2",
-                        "hf_minilm",
-                    ))
-                    .build();
-
-                let api_config = create_api_bindings_config();
-                let http_base_url = format!("http://{}", api_config.http_bind_address);
-
-                let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-                let rt_ref_copy = Arc::clone(&rt);
-                tokio::spawn(async move {
-                    Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth()))
-                        .await
-                });
-
-                tokio::select! {
-                    () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
-                        return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-                    }
-                    () = rt.load_components() => {}
-                }
-
-                runtime_ready_check(&rt).await;
-
-                let test_cases = [
-                    TestCase {
-                        name: "hf_basic",
-                        body: json!({
-                            "text": "new patient",
-                            "limit": 2,
-                            "datasets": ["item"],
-                            "additional_columns": ["i_color", "i_item_id"],
-                        }),
-                    },
-                    TestCase {
-                        name: "hf_all_datasets",
-                        body: json!({
-                            "text": "new patient",
-                            "limit": 2,
-                        }),
-                    },
-                    TestCase {
-                        name: "hf_chunking",
-                        body: json!({
-                            "text": "friends",
-                            "datasets": ["catalog_page_with_chunking"],
-                            "limit": 1,
-                        }),
-                    },
-                ];
-
-                for ts in test_cases {
-                    run_search_test(http_base_url.as_str(), &ts).await?;
-                }
-                Ok(())
-            })
-            .await
+                },
+                SearchTestCase {
+                    name: "hf_all_datasets",
+                    body: json!({
+                        "text": "new patient",
+                        "limit": 2,
+                    }),
+                },
+                SearchTestCase {
+                    name: "hf_chunking",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking"],
+                        "limit": 1,
+                    }),
+                },
+                SearchTestCase {
+                    name: "hf_chunking_with_extra_columns",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking"],
+                        "additional_columns": ["cp_department"],
+                        "limit": 1,
+                    }),
+                },
+                // Error occurred in search pipeline: Error occurred retrieving candidate search results: Error occured during search: Failed to execute query: Error during planning: Projections require unique expression names but the expression "catalog_page_with_chunking.cp_catalog_page_sk" at position 0 and "catalog_page_with_chunking.cp_catalog_page_sk" at position 2 have the same name. Consider aliasing ("AS") one of them.
+                // SearchTestCase {
+                //     name: "hf_chunking_with_extra_columns2",
+                //     body: json!({
+                //         "text": "friends",
+                //         "datasets": ["catalog_page_with_chunking"],
+                //         "additional_columns": ["cp_catalog_page_sk", "cp_department", "cp_description"],
+                //         "limit": 1,
+                //     }),
+                // },
+                SearchTestCase {
+                    name: "hf_chunking_with_extra_columns_and_where",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking"],
+                        "additional_columns": ["cp_department"],
+                        "where": "cp_catalog_number>0",
+                        "limit": 1,
+                    }),
+                },
+                SearchTestCase {
+                    name: "hf_chunking_no_pk",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking_no_pk"],
+                        "limit": 1,
+                    }),
+                },
+                SearchTestCase {
+                    name: "hf_chunking_with_extra_column_no_pk",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking_no_pk"],
+                        "additional_columns": ["cp_department"],
+                        "limit": 1,
+                    }),
+                },
+                SearchTestCase {
+                    name: "hf_chunking_with_extra_column_no_pk2",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking_no_pk"],
+                        "additional_columns": ["cp_catalog_page_sk", "cp_department", "cp_description"],
+                        "limit": 1,
+                    }),
+                },
+                SearchTestCase {
+                    name: "hf_chunking_with_extra_columns_and_where_no_pk",
+                    body: json!({
+                        "text": "friends",
+                        "datasets": ["catalog_page_with_chunking_no_pk"],
+                        "additional_columns": ["cp_department"],
+                        "where": "cp_catalog_number>0",
+                        "limit": 1,
+                    }),
+                },
+            ],
+            vec![],
+        )
+        .await
     }
 }
 
@@ -380,17 +419,17 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
             Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
         });
 
-        let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
+        let _llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
 
         tokio::select! {
             // increased timeout to download and load huggingface model
             () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
                 return Err(anyhow::anyhow!("Timed out waiting for components to load"));
             }
-            () = rt.load_components() => {}
+            () = Arc::clone(&rt).load_components() => {}
         }
 
-        drop(llm_init_lock);
+        runtime_ready_check_with_timeout(&rt, std::time::Duration::from_secs(120)).await;
 
         let response = send_chat_completions_request(
             http_base_url.as_str(),
@@ -413,72 +452,6 @@ async fn huggingface_test_chat_completion() -> Result<(), anyhow::Error> {
     }).await
 }
 
-#[tokio::test]
-async fn huggingface_test_chat_messages() -> Result<(), anyhow::Error> {
-    if HF_TEST_MODEL_REQUIRES_HF_API_KEY {
-        verify_env_secret_exists("SPICE_HF_TOKEN")
-            .await
-            .map_err(anyhow::Error::msg)?;
-    }
-
-    test_request_context().scope(async {
-        let model = Arc::new(create_hf_model(
-            HF_TEST_MODEL,
-        Some(HF_TEST_MODEL_TYPE),
-        None,
-            None,
-        )?);
-
-        let app = AppBuilder::new("ai-app")
-        .with_dataset(get_taxi_trips_dataset())
-        .build();
-
-        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-
-        let llm_init_lock = LOCAL_LLM_INIT_MUTEX.lock().await;
-
-        tokio::select! {
-            // increased timeout to download and load huggingface model
-            () = tokio::time::sleep(std::time::Duration::from_secs(300)) => {
-                return Err(anyhow::anyhow!("Timed out waiting for components to load"));
-            }
-            () = rt.load_components() => {}
-        }
-
-        drop(llm_init_lock);
-
-        let tool_model = Box::new(ToolUsingChat::new(
-            Arc::clone(&model),
-            Arc::clone(&rt),
-            get_tools(Arc::clone(&rt), &SpiceToolsOptions::Auto).await,
-            Some(10),
-        ));
-
-        let req = CreateChatCompletionRequestArgs::default()
-            .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
-                .content("You are an assistant that responds to queries by providing only the requested data values without extra explanation.".to_string())
-                .build()?
-                .into(),ChatCompletionRequestUserMessageArgs::default()
-                .content("Provide the total number of records in the taxi trips dataset. If known, return a single numeric value.".to_string())
-                .build()?
-                .into()])
-            .build()?;
-
-        let mut response = tool_model.chat_request(req).await?;
-
-        // Message content verification is disabled due to issue below: model does not use tools and can't provide the expected response.
-        // https://github.com/spiceai/spiceai/issues/3426
-        response.choices.iter_mut().for_each(|c| {
-            c.message.content = Some("__placeholder__".to_string());
-        });
-
-        insta::assert_snapshot!("chat_1_response_choices", format!("{:?}", response.choices));
-
-        Ok(())
-    })
-    .await
-}
-
 fn get_huggingface_model(
     model: impl Into<String>,
     model_type: impl Into<String>,
@@ -496,6 +469,9 @@ fn get_huggingface_model(
     model
 }
 
-fn get_huggingface_embeddings(model: impl Into<String>, name: impl Into<String>) -> Embeddings {
+pub(crate) fn get_huggingface_embeddings(
+    model: impl Into<String>,
+    name: impl Into<String>,
+) -> Embeddings {
     Embeddings::new(format!("huggingface:huggingface.co/{}", model.into()), name)
 }

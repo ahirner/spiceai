@@ -9,6 +9,15 @@ inputs:
     description: 'spiced build commit'
     required: false
     type: string
+  ref: # optionally override the branch to fetch latest 10 commits from
+    description: 'target ref'
+    required: false
+    default: 'refs/heads/trunk'
+    type: string
+  with_odbc: # whether to download the ODBC-enabled binary
+    description: 'download the ODBC-enabled spiced binary'
+    required: false
+    type: boolean
 outputs:
   spiced_commit:
     value: ${{ steps.output_spiced_commit.outputs.spiced_commit }}
@@ -19,12 +28,20 @@ runs:
       if: ${{ !inputs.spiced_commit }}
       shell: bash
       run: |
-        git fetch --depth=10 origin trunk
-        commit_hashes=($(git log origin/trunk --pretty=format:"%H" -n 10))
+        git fetch --depth=10 origin ${{ inputs.ref }}
+        echo "Fetching latest 10 commits from ${{ inputs.ref }}"
+
+        commit_hashes=($(git log FETCH_HEAD --pretty=format:"%H" -n 10))
+        
+        if [[ "${{ inputs.with_odbc }}" == "true" ]]; then
+          features="odbc_models"
+        else
+          features="models"
+        fi
 
         for hash in "${commit_hashes[@]}"; do
           echo "Checking $hash in MinIO"
-          if mc stat spice-minio/artifacts/spiced/linux-x86_64/$hash/spiced_models_linux_x86_64.tar.gz; then
+          if mc stat spice-minio/artifacts/spiced/linux-x86_64/$hash/spiced_${features}_linux_x86_64.tar.gz; then
             echo "Found $hash in MinIO"
             echo "SPICED_COMMIT=$hash" >> $GITHUB_ENV
             exit 0
@@ -48,6 +65,11 @@ runs:
     - name: Download spiced from MinIO
       shell: bash
       run: |
-        mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_models_linux_x86_64.tar.gz spiced_models_linux_x86_64.tar.gz
-        tar -xzf spiced_models_linux_x86_64.tar.gz
+        if [[ "${{ inputs.with_odbc }}" == "true" ]]; then
+          features="odbc_models"
+        else
+          features="models"
+        fi
+        mc cp spice-minio/artifacts/spiced/linux-x86_64/$SPICED_COMMIT/spiced_${features}_linux_x86_64.tar.gz spiced_${features}_linux_x86_64.tar.gz
+        tar -xzf spiced_${features}_linux_x86_64.tar.gz
         sudo cp ./spiced /usr/local/bin/spiced

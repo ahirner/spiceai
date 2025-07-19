@@ -16,12 +16,14 @@ limitations under the License.
 
 use std::{
     cmp,
+    sync::Arc,
     time::{Duration, SystemTime, SystemTimeError},
 };
 
 pub mod fibonacci_backoff;
-pub use backoff::future::retry;
 pub use backoff::Error as RetryError;
+pub use backoff::future::retry;
+use tokio::{sync::oneshot, time::Instant};
 
 #[allow(clippy::cast_precision_loss)]
 #[allow(clippy::cast_sign_loss)]
@@ -59,9 +61,40 @@ pub async fn shutdown_signal() {
     shutdown_signal_impl().await;
 }
 
+/// Waits for an additional Ctrl-C after the initial shutdown signal to trigger a forced shutdown.
+pub async fn force_shutdown_signal() {
+    shutdown_signal().await;
+
+    // use 500ms as a debounce window to prevent the same Ctrl-C signal from being handled multiple times
+    let last_signal_time = Instant::now();
+
+    let (notify_ctrl_c, on_second_ctrl_c) = oneshot::channel::<()>();
+    let notify_ctrl_c = Arc::new(std::sync::Mutex::new(Some(notify_ctrl_c)));
+
+    if let Err(err) = ctrlc::set_handler({
+        move || {
+            if Instant::now().duration_since(last_signal_time) < Duration::from_millis(500) {
+                return;
+            }
+            if let Some(tx) = notify_ctrl_c
+                .lock()
+                .ok()
+                .and_then(|mut tx_opt| tx_opt.take())
+            {
+                tracing::debug!("Received Ctrl-C after the initial shutdown signal");
+                tx.send(()).ok();
+            }
+        }
+    }) {
+        tracing::error!("Failed to set listener for Ctrl-C: {err}");
+        // do not exit; otherwise, it will be interpreted as a force shutdown signal
+    }
+    on_second_ctrl_c.await.ok();
+}
+
 #[cfg(unix)]
 async fn shutdown_signal_impl() {
-    use tokio::signal::unix::{signal, SignalKind};
+    use tokio::signal::unix::{SignalKind, signal};
 
     let Ok(mut signal_terminate) = signal(SignalKind::terminate()) else {
         tracing::error!("Failed to listen to terminate signal");

@@ -18,12 +18,13 @@ use crate::dbconnection::odbcconn::ODBCConnection;
 use crate::dbconnection::odbcconn::{ODBCDbConnection, ODBCParameter};
 use async_trait::async_trait;
 use datafusion_table_providers::sql::db_connection_pool::{DbConnectionPool, JoinPushDown};
-use odbc_api::{sys::AttrConnectionPooling, Connection, ConnectionOptions, Environment};
-use secrecy::{ExposeSecret, Secret, SecretString};
+use odbc_api::{Connection, ConnectionOptions, Environment, sys::AttrConnectionPooling};
+use secrecy::{ExposeSecret, SecretBox, SecretString};
 use sha2::{Digest, Sha256};
 use snafu::prelude::*;
 use std::{
     collections::HashMap,
+    fmt::Write,
     sync::{Arc, LazyLock},
 };
 
@@ -34,7 +35,7 @@ static ENV: LazyLock<Environment> = LazyLock::new(|| unsafe {
     // See <https://docs.microsoft.com/en-us/sql/odbc/reference/develop-app/driver-aware-connection-pooling>
     if let Err(e) = Environment::set_connection_pooling(AttrConnectionPooling::DriverAware) {
         tracing::error!("Failed to set ODBC connection pooling: {e}");
-    };
+    }
     match Environment::new() {
         Ok(env) => env,
         Err(e) => {
@@ -63,7 +64,7 @@ fn hash_string(val: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(val);
     hasher.finalize().iter().fold(String::new(), |mut hash, b| {
-        hash.push_str(&format!("{b:02x}"));
+        let _ = write!(hash, "{b:02x}");
         hash
     })
 }
@@ -77,7 +78,7 @@ impl ODBCPool {
     pub fn new(params: HashMap<String, SecretString>) -> Result<Self, Error> {
         let connection_string = params
             .get("connection_string")
-            .map(Secret::expose_secret)
+            .map(SecretBox::expose_secret)
             .map(ToString::to_string)
             .context(MissingConnectionStringSnafu)?;
 

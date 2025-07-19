@@ -16,22 +16,36 @@ limitations under the License.
 
 #![allow(clippy::large_futures)]
 
-use opentelemetry::InstrumentationScope;
-use opentelemetry_sdk::{runtime::TokioCurrentThread, trace::TracerProvider};
-use runtime::{task_history::otel_exporter::TaskHistoryExporter, Runtime};
-use spicepod::component::runtime::TaskHistoryCapturedOutput;
 use tracing::subscriber::DefaultGuard;
-use tracing_subscriber::{filter, fmt, layer::SubscriberExt, EnvFilter, Layer};
-
+use tracing_subscriber::EnvFilter;
 #[cfg(feature = "models")]
 mod models;
 mod utils;
+#[cfg(feature = "models")]
+mod workers;
+
+pub(crate) const DEFAULT_TRACING_MODELS: Option<&str> = Some(
+    "runtime=TRACE,search=TRACE,llms=TRACE,model_components=TRACE,task_history=WARN,runtime::embeddings=INFO,INFO",
+);
+
+/// Modifies the `DataFusion` configuration to make test results reproducible across all machines.
+///
+/// 1) Sets the number of `target_partitions` to 3, by default its the number of CPU cores available.
+fn configure_test_datafusion(df: &mut runtime::datafusion::DataFusion) {
+    let state = df.ctx.state_ref();
+    let mut state_lock = state.write();
+    state_lock
+        .config_mut()
+        .options_mut()
+        .execution
+        .target_partitions = 3;
+}
 
 fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
         (_, Some(log)) => EnvFilter::new(log),
         (Some(level), None) => EnvFilter::new(level),
-        _ => EnvFilter::new("runtime=TRACE,llms=TRACE,model_components=TRACE,task_history=WARN,runtime::embeddings=INFO,INFO"),
+        _ => EnvFilter::new(DEFAULT_TRACING_MODELS.unwrap_or_default()),
     };
 
     let subscriber = tracing_subscriber::FmtSubscriber::builder()
@@ -39,44 +53,4 @@ fn init_tracing(default_level: Option<&str>) -> DefaultGuard {
         .with_ansi(true)
         .finish();
     tracing::subscriber::set_default(subscriber)
-}
-
-fn init_tracing_with_task_history(
-    default_level: Option<&str>,
-    rt: &Runtime,
-) -> (DefaultGuard, TracerProvider) {
-    let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
-        (_, Some(log)) => EnvFilter::new(log),
-        (Some(level), None) => EnvFilter::new(level),
-        _ => EnvFilter::new("runtime=TRACE,llms=TRACE,model_components=TRACE,INFO"),
-    };
-
-    let fmt_layer = fmt::layer().with_ansi(true).with_filter(filter);
-
-    let task_history_exporter =
-        TaskHistoryExporter::new(rt.datafusion(), TaskHistoryCapturedOutput::Truncated);
-
-    // Tests hang if we don't use TokioCurrentThread here (similar to https://github.com/open-telemetry/opentelemetry-rust/issues/868)
-    let provider = TracerProvider::builder()
-        .with_batch_exporter(task_history_exporter, TokioCurrentThread)
-        .build();
-
-    let scope = InstrumentationScope::builder("task_history")
-        .with_version(env!("CARGO_PKG_VERSION"))
-        .build();
-    let tracer = opentelemetry::trace::TracerProvider::tracer_with_scope(&provider, scope);
-
-    let task_history_layer = tracing_opentelemetry::layer()
-        .with_tracer(tracer)
-        .with_filter(filter::filter_fn(|metadata| {
-            metadata.target() == "task_history"
-        }));
-
-    let subscriber = tracing_subscriber::registry()
-        .with(fmt_layer)
-        .with(task_history_layer);
-
-    let guard = tracing::subscriber::set_default(subscriber);
-
-    (guard, provider)
 }

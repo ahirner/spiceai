@@ -27,23 +27,22 @@ use app::spicepod::component::runtime::{Runtime as SpicepodRuntime, TelemetryCon
 use app::{App, AppBuilder};
 use clap::{ArgAction, Parser};
 use flightrepl::ReplConfig;
-use opentelemetry::{global, KeyValue};
+use opentelemetry::{KeyValue, global};
+use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::runtime::Tokio;
-use opentelemetry_sdk::Resource;
 use otel_arrow::OtelArrowExporter;
 use runtime::config::Config as RuntimeConfig;
 use runtime::datafusion::DataFusion;
 use runtime::podswatcher::PodsWatcher;
 use runtime::spice_metrics;
-use runtime::{auth::EndpointAuth, extension::ExtensionFactory, Runtime};
+use runtime::{Runtime, auth::EndpointAuth, extension::ExtensionFactory, in_tracing_context};
 use serde_yaml::Value;
 use snafu::prelude::*;
 use spice_cloud::SpiceExtensionFactory;
 use spiced_tracing::LogVerbosity;
 #[cfg(feature = "tpc-extension")]
 use tpc_extension::TpcExtensionFactory;
-use tracing::subscriber;
 
 #[path = "tracing.rs"]
 mod spiced_tracing;
@@ -162,6 +161,12 @@ pub struct Args {
     #[arg(long)]
     pub very_verbose: bool,
 
+    /// Path to the Spicepod directory or file. Supports local paths and remote URLs (i.e. `s3://my_bucket/spicepod.yaml`)
+    ///
+    /// When specified, the behavior to automatically reload changes to the Spicepod is disabled.
+    #[arg(value_name = "PATH")]
+    pub spicepod: Option<PathBuf>,
+
     /// Overrides for the runtime configuration (--set-runtime key1.subkey=value1)
     #[arg(long, action = ArgAction::Append, value_parser = parse_set_string)]
     pub set_runtime: Vec<(String, String)>,
@@ -170,8 +175,11 @@ pub struct Args {
 pub async fn run(args: Args) -> Result<()> {
     let prometheus_registry = args.metrics.map(|_| prometheus::Registry::new());
 
-    let current_dir = env::current_dir().unwrap_or(PathBuf::from("."));
-    let app: Option<Arc<App>> = match AppBuilder::build_from_filesystem_path(current_dir.clone()) {
+    let spicepod_path = args
+        .spicepod
+        .clone()
+        .unwrap_or_else(|| env::current_dir().unwrap_or(PathBuf::from(".")));
+    let app: Option<Arc<App>> = match AppBuilder::build_from_path(spicepod_path.clone()).await {
         Ok(mut app) => {
             app.runtime = apply_overrides(app.runtime, &args.set_runtime)?;
             Some(Arc::new(app))
@@ -215,8 +223,8 @@ pub async fn run(args: Args) -> Result<()> {
         .with_datasets_health_monitor()
         .with_metrics_server_opt(args.metrics, prometheus_registry.clone());
 
-    if args.pods_watcher_enabled {
-        let pods_watcher = PodsWatcher::new(current_dir.clone());
+    if args.pods_watcher_enabled && args.spicepod.is_none() {
+        let pods_watcher = PodsWatcher::new(spicepod_path.clone());
         builder = builder.with_pods_watcher(pods_watcher);
     }
 
@@ -236,7 +244,7 @@ pub async fn run(args: Args) -> Result<()> {
     .context(UnableToInitializeTracingSnafu)?;
 
     if let Some(metrics_registry) = prometheus_registry {
-        init_metrics(rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
+        init_metrics(&rt.datafusion(), metrics_registry).context(UnableToInitializeMetricsSnafu)?;
     }
 
     let tls_config = tls::load_tls_config(&args, spicepod_tls_config.as_ref(), rt.secrets())
@@ -245,37 +253,41 @@ pub async fn run(args: Args) -> Result<()> {
 
     start_anonymous_telemetry(&args, telemetry_config.as_ref(), app_name.as_ref()).await;
 
-    let cloned_rt = rt.clone();
+    let rt = Arc::new(rt);
+
+    let cloned_rt = Arc::clone(&rt);
     let endpoint_auth = match app.as_ref() {
         Some(app) => EndpointAuth::new(rt.secrets(), app).await,
         None => EndpointAuth::no_auth(),
     };
 
     let server_thread = tokio::spawn(async move {
-        Box::pin(Arc::new(cloned_rt).start_servers(args.runtime, tls_config, endpoint_auth)).await
+        Box::pin(cloned_rt.start_servers(args.runtime, tls_config, endpoint_auth)).await
     });
 
     tokio::select! {
-        () = rt.load_components() => {},
+        () = Arc::clone(&rt).load_components() => {},
         () = runtime::shutdown_signal() => {
             tracing::debug!("Cancelling runtime initializing!");
         },
     }
 
     let result = match server_thread.await {
+        // Don't treat force terminated as an error
+        Ok(Err(runtime::Error::ForceTerminated)) => Ok(()),
         Ok(ok) => ok.context(UnableToStartServersSnafu),
         Err(_) => Err(Error::GenericError {
             reason: "Unable to start spiced".into(),
         }),
     };
 
-    rt.close().await;
+    rt.shutdown().await;
 
     result
 }
 
 fn init_metrics(
-    df: Arc<DataFusion>,
+    df: &Arc<DataFusion>,
     registry: prometheus::Registry,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let resource = Resource::default();
@@ -374,7 +386,7 @@ fn apply_overrides(
                 }
                 .fail();
             }
-        };
+        }
     }
 
     match serde_yaml::from_value(yaml) {
@@ -440,14 +452,4 @@ fn apply_override(
     }
 
     Ok(())
-}
-
-pub fn in_tracing_context<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_ansi(true)
-        .finish();
-    subscriber::with_default(subscriber, f)
 }

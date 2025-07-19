@@ -25,8 +25,8 @@ use crate::{
     utils::{test_request_context, wait_until_true},
 };
 use rand::Rng;
-use runtime::{auth::EndpointAuth, config::Config, Runtime};
-use runtime_auth::{api_key::ApiKeyAuth, HttpAuth};
+use runtime::{Runtime, auth::EndpointAuth, config::Config};
+use runtime_auth::{HttpAuth, api_key::ApiKeyAuth};
 use spicepod::component::runtime::ApiKey;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -42,8 +42,8 @@ async fn test_http_auth() -> Result<(), anyhow::Error> {
         let span = tracing::info_span!("test_http_auth");
         let _span_guard = span.enter();
 
-        let mut rng = rand::thread_rng();
-        let http_port: u16 = rng.gen_range(50000..60000);
+        let mut rng = rand::rng();
+        let http_port: u16 = rng.random_range(50000..60000);
         let flight_port: u16 = http_port + 1;
         let otel_port: u16 = http_port + 2;
         let metrics_port: u16 = http_port + 3;
@@ -59,17 +59,22 @@ async fn test_http_auth() -> Result<(), anyhow::Error> {
 
         let registry = prometheus::Registry::new();
 
+        let app = app::AppBuilder::new("test_app").build();
+
         let rt = Runtime::builder()
             .with_metrics_server(SocketAddr::new(LOCALHOST, metrics_port), registry)
+            .with_app(app)
             .build()
             .await;
+
+        let cloned_rt = Arc::new(rt.clone());
 
         let api_key_auth =
             Arc::new(ApiKeyAuth::new(vec![ApiKey::parse_str("valid")])) as Arc<dyn HttpAuth + Send + Sync>;
 
         // Start the servers
         tokio::spawn(async move {
-            Box::pin(Arc::new(rt).start_servers(
+            Box::pin(Arc::clone(&cloned_rt).start_servers(
                 api_config,
                 None,
                 EndpointAuth::default().with_http_auth(api_key_auth),

@@ -17,10 +17,42 @@ limitations under the License.
 use clap::Parser;
 use opentelemetry::global;
 use rustls::crypto::{self, CryptoProvider};
+use telemetry::noop::NoopMeterProvider;
 use tokio::runtime::Runtime;
 
+#[cfg(feature = "alloc-jemalloc")]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(feature = "alloc-mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+#[cfg(feature = "alloc-system")]
+#[global_allocator]
+static ALLOC: std::alloc::System = std::alloc::System;
+
+// snmalloc is the default allocator if no other allocator is selected
+#[cfg(not(any(
+    feature = "alloc-jemalloc",
+    feature = "alloc-mimalloc",
+    feature = "alloc-system"
+)))]
 #[global_allocator]
 static ALLOC: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
+
+// Function to determine the allocator name at compile time
+const fn get_allocator_name() -> Option<&'static str> {
+    if cfg!(feature = "alloc-jemalloc") {
+        Some("jemalloc")
+    } else if cfg!(feature = "alloc-mimalloc") {
+        Some("mimalloc")
+    } else if cfg!(feature = "alloc-system") {
+        Some("system")
+    } else {
+        None
+    }
+}
 
 fn main() {
     let args = spiced::Args::parse();
@@ -44,22 +76,32 @@ fn main() {
     if args.repl {
         if let Err(e) = tokio_runtime.block_on(flightrepl::run(args.repl_config)) {
             eprintln!("SQL REPL Error: {e}");
-        };
+        }
         return;
     }
 
     if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
-        spiced::in_tracing_context(|| {
+        runtime::in_tracing_context(|| {
             tracing::error!("{err}");
         });
     }
 
     global::shutdown_tracer_provider();
+    // There is no global::shutdown_meter_provider, so we replace currently used meter provider with a noop one to clean up resources
+    global::set_meter_provider(NoopMeterProvider::new());
+    tracing::info!("Goodbye!");
 }
 
 async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
-    spiced::in_tracing_context(|| {
-        tracing::info!("Starting runtime {version}", version = get_version_string());
+    runtime::in_tracing_context(|| {
+        if let Some(allocator_name) = get_allocator_name() {
+            tracing::info!(
+                "Starting runtime {version} (allocator: {allocator_name})",
+                version = get_version_string(),
+            );
+        } else {
+            tracing::info!("Starting runtime {version}", version = get_version_string());
+        }
     });
     spiced::run(args).await?;
     Ok(())

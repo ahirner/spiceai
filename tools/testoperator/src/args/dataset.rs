@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::{Parser, ValueEnum};
+use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use test_framework::queries::{QueryOverrides, QuerySet};
@@ -36,6 +36,13 @@ pub struct DatasetTestArgs {
 
     #[arg(long)]
     pub(crate) query_overrides: Option<QueryOverridesArg>,
+
+    #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]
+    pub(crate) validate: bool,
+
+    /// Whether to disable results caching, by supplying the cache control header through flight
+    #[arg(long)]
+    pub(crate) disable_caching: bool,
 }
 
 #[derive(Clone, ValueEnum, Debug)]
@@ -43,6 +50,8 @@ pub enum QuerySetArg {
     Tpch,
     Tpcds,
     Clickbench,
+    #[value(name = "tpch[parameterized]")]
+    ParameterizedTpch,
 }
 
 #[derive(Clone, ValueEnum, Debug, Deserialize, Serialize)]
@@ -59,14 +68,26 @@ pub enum QueryOverridesArg {
     Spark,
     #[serde(rename = "odbc-athena")]
     ODBCAthena,
+    #[serde(rename = "odbc-databricks")]
+    ODBCDatabricks,
     #[serde(rename = "duckdb")]
     Duckdb,
+    #[serde(rename = "duckdb-zero-results")]
+    DuckdbZeroResults,
     #[serde(rename = "snowflake")]
     Snowflake,
+    #[serde(rename = "oracle")]
+    Oracle,
     #[serde(rename = "iceberg-sf1")]
     IcebergSF1,
     #[serde(rename = "spicecloud-catalog")]
     SpicecloudCatalog,
+    #[serde(rename = "glue-catalog")]
+    GlueCatalog,
+    #[serde(rename = "databricks-catalog")]
+    DatabricksCatalog,
+    #[serde(rename = "spicecloud")]
+    Spicecloud,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -75,6 +96,7 @@ impl From<QuerySetArg> for QuerySet {
             QuerySetArg::Tpch => QuerySet::Tpch,
             QuerySetArg::Tpcds => QuerySet::Tpcds,
             QuerySetArg::Clickbench => QuerySet::Clickbench,
+            QuerySetArg::ParameterizedTpch => QuerySet::ParameterizedTpch,
         }
     }
 }
@@ -88,10 +110,17 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::Dremio => QueryOverrides::Dremio,
             QueryOverridesArg::Spark => QueryOverrides::Spark,
             QueryOverridesArg::ODBCAthena => QueryOverrides::ODBCAthena,
+            QueryOverridesArg::ODBCDatabricks => QueryOverrides::ODBCDatabricks,
             QueryOverridesArg::Duckdb => QueryOverrides::DuckDB,
+            QueryOverridesArg::DuckdbZeroResults => QueryOverrides::DuckDBOnZeroResults,
             QueryOverridesArg::Snowflake => QueryOverrides::Snowflake,
+            QueryOverridesArg::Oracle => QueryOverrides::Oracle,
             QueryOverridesArg::IcebergSF1 => QueryOverrides::IcebergSF1,
-            QueryOverridesArg::SpicecloudCatalog => QueryOverrides::SpicecloudCatalog,
+            QueryOverridesArg::SpicecloudCatalog | QueryOverridesArg::DatabricksCatalog => {
+                QueryOverrides::SpicecloudCatalog
+            }
+            QueryOverridesArg::Spicecloud => QueryOverrides::Spicecloud,
+            QueryOverridesArg::GlueCatalog => QueryOverrides::GlueCatalog,
         }
     }
 }

@@ -15,22 +15,39 @@ limitations under the License.
 */
 
 use std::{
+    fmt::Display,
     path::PathBuf,
     process::{Child, Command},
     time::Duration,
 };
 
-use anyhow::Result;
-use flight_client::{Credentials, FlightClient};
+use anyhow::{Result, anyhow};
+use spiceai::{Client as SpiceClient, ClientBuilder};
 use spicepod::spec::SpicepodDefinition;
-use sysinfo::{Pid, ProcessesToUpdate, System};
+use sysinfo::Pid;
 use tempfile::TempDir;
 
-use crate::utils::wait_until_true;
+use crate::{process::Process, utils::wait_until_true};
+
+#[derive(Debug, Clone)]
+pub struct SpicedVersion(String);
+impl SpicedVersion {
+    #[must_use]
+    pub fn new(version: String) -> Self {
+        Self(version)
+    }
+}
+
+impl Display for SpicedVersion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 pub struct SpicedInstance {
     child: Child,
-    _tempdir: TempDir,
+    tempdir: TempDir,
+    version: SpicedVersion,
 }
 
 pub struct StartRequest {
@@ -113,6 +130,26 @@ impl SpicedInstance {
 
         let tempdir = start_request.tempdir;
 
+        // Get spiced version
+        let version_cmd = Command::new(start_request.spiced_path.clone())
+            .arg("--version")
+            .output()?;
+
+        if !version_cmd.status.success() {
+            anyhow::bail!(
+                "Failed to get spiced version: {}",
+                String::from_utf8_lossy(&version_cmd.stderr)
+            );
+        }
+
+        let version = String::from_utf8_lossy(&version_cmd.stdout).to_string();
+        // take just the v1.0.0 part of the version
+        let version = match (version.contains('-'), version.contains('+')) {
+            (true, _) => version.split('-').next().unwrap_or(&version).to_string(),
+            (false, true) => version.split('+').next().unwrap_or(&version).to_string(),
+            (false, false) => version,
+        };
+
         // Start the spiced instance
         let mut cmd = Command::new(start_request.spiced_path);
         cmd.current_dir(tempdir.path());
@@ -121,27 +158,49 @@ impl SpicedInstance {
 
         Ok(Self {
             child,
-            _tempdir: tempdir,
+            tempdir,
+            version: SpicedVersion::new(version),
         })
     }
 
-    /// Get a flight client for the spiced instance
+    #[must_use]
+    pub fn version(&self) -> &str {
+        self.version.0.as_str()
+    }
+
+    #[must_use]
+    pub fn get_tempdir_path(&self) -> PathBuf {
+        self.tempdir.path().to_path_buf()
+    }
+
+    /// Get a spice client for the spiced instance
     ///
     /// # Errors
     ///
-    /// - If the flight client fails to be created
-    pub async fn flight_client(&self) -> Result<FlightClient> {
-        let mut metadata = tonic::metadata::MetadataMap::new();
-        metadata.insert("user-agent", "spice-test-framework/1.0".parse()?);
-        Ok(FlightClient::try_new(
-            "http://localhost:50051".into(),
-            Credentials::UsernamePassword {
-                username: "".into(),
-                password: "".into(),
-            },
-            Some(metadata),
-        )
-        .await?)
+    /// - If the spice client fails to be created
+    pub async fn spice_client(
+        &self,
+        api_key: Option<String>,
+        disable_caching: bool,
+    ) -> Result<SpiceClient> {
+        let mut spice_client = ClientBuilder::new();
+
+        if let Some(key) = api_key {
+            spice_client = spice_client.api_key(key.as_str());
+        }
+
+        if disable_caching {
+            spice_client = spice_client.cache_control("no-cache");
+        }
+
+        let spice_client = spice_client
+            .flight_url("http://localhost:50051")
+            .user_agent("spice-test-framework/1.0")
+            .build()
+            .await
+            .map_err(|e| anyhow!("{e}"))?;
+
+        Ok(spice_client)
     }
 
     /// Get an http client for the spiced instance
@@ -217,29 +276,11 @@ impl SpicedInstance {
         Ok(())
     }
 
-    /// Returns the memory usage in bytes for the process
-    pub fn memory_usage(&self) -> Result<u64> {
-        let mut system = System::new();
-        let pid = Pid::from_u32(self.child.id());
-        system.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
-
-        let Some(process) = system.process(pid) else {
-            return Err(anyhow::anyhow!("Failed to get process"));
-        };
-
-        Ok(process.memory())
-    }
-
-    /// Show the memory usage of the spiced instance in GB
-    /// Also returns the memory usage in GB as a float
-    pub fn show_memory_usage(&self) -> Result<f64> {
-        let memory_usage = self.memory_usage()?;
-        // drop memory usage to MB as a u32 before converting to GB as a float
-        // we don't really care about the fractional memory usage of KB/MB
-        let memory_usage_gb = f64::from(u32::try_from(memory_usage / 1024 / 1024)?) / 1024.0;
-        println!("Memory usage: {memory_usage_gb:.2} GB");
-
-        Ok(memory_usage_gb)
+    /// Returns an instance of a `Process` for the spiced instance
+    /// This allows tracking the spiced process, without owning the spiced instance
+    #[must_use]
+    pub fn process(&self) -> Process {
+        Process::new(Pid::from_u32(self.child.id()))
     }
 }
 

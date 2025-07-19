@@ -16,6 +16,8 @@ limitations under the License.
 
 use std::collections::HashMap;
 
+use crate::metric::Metrics;
+
 use super::{Nameable, WithDependsOn};
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
@@ -32,9 +34,15 @@ pub struct Tool {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub params: HashMap<String, String>,
 
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
     pub depends_on: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<Metrics>,
 }
 
 impl Nameable for Tool {
@@ -50,7 +58,9 @@ impl WithDependsOn<Tool> for Tool {
             name: self.name.clone(),
             description: self.description.clone(),
             params: self.params.clone(),
+            env: self.env.clone(),
             depends_on: depends_on.to_vec(),
+            metrics: self.metrics.clone(),
         }
     }
 }

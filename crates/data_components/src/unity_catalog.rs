@@ -14,26 +14,38 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::sync::Arc;
+
 use datafusion::sql::TableReference;
-use secrecy::{ExposeSecret, SecretString};
 use serde::Deserialize;
 use snafu::prelude::*;
+use std::fmt::Write;
 use url::Url;
+
+use token_provider::TokenProvider;
 
 pub mod provider;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#configuration"))]
+    #[snafu(display(
+        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#configuration"
+    ))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Failed to connect to the Unity Catalog API.\nCheck the Unity Catalog API endpoint is valid and accessible.\nThe following connection error occurred: {source}"))]
+    #[snafu(display(
+        "Failed to connect to the Unity Catalog API.\nCheck the Unity Catalog API endpoint is valid and accessible.\nThe following connection error occurred: {source}"
+    ))]
     ConnectionError { source: reqwest::Error },
 
-    #[snafu(display("Failed to connect to the Unity Catalog API.\nCheck the Unity Catalog API endpoint is valid and accessible.\nThe following HTTP status code was received when connecting: {status}"))]
+    #[snafu(display(
+        "Failed to connect to the Unity Catalog API.\nCheck the Unity Catalog API endpoint is valid and accessible.\nThe following HTTP status code was received when connecting: {status}"
+    ))]
     UnexpectedStatusCode { status: reqwest::StatusCode },
 
-    #[snafu(display("Expected a valid URL, but '{url}' was provided.\nFor details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#configuration"))]
+    #[snafu(display(
+        "Expected a valid URL, but '{url}' was provided.\nFor details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#configuration"
+    ))]
     URLParseError {
         url: String,
         source: url::ParseError,
@@ -44,11 +56,18 @@ pub enum Error {
     ))]
     InvalidCatalogURL { url: String },
 
-    #[snafu(display("Failed to find the catalog with ID '{catalog_id}'.\nVerify the catalog exists, and try again."))]
+    #[snafu(display(
+        "Failed to find the catalog with ID '{catalog_id}'.\nVerify the catalog exists, and try again."
+    ))]
     CatalogDoesntExist { catalog_id: String },
 
-    #[snafu(display("Failed to find the schema '{schema}' in the catalog '{catalog_id}'.\nVerify the schema and catalog exist, and try again."))]
+    #[snafu(display(
+        "Failed to find the schema '{schema}' in the catalog '{catalog_id}'.\nVerify the schema and catalog exist, and try again."
+    ))]
     SchemaDoesntExist { schema: String, catalog_id: String },
+
+    #[snafu(display("Failed to get token.\n{source}"))]
+    UnableToGetToken { source: token_provider::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -59,8 +78,9 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug)]
 pub struct UnityCatalog {
     endpoint: String,
-    token: Option<SecretString>,
+    token_provider: Option<Arc<dyn TokenProvider>>,
     client: reqwest::Client,
+    user_agent: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,16 +92,24 @@ pub struct CatalogId(pub String);
 impl UnityCatalog {
     #[must_use]
     #[allow(clippy::needless_pass_by_value)]
-    pub fn new(endpoint: Endpoint, token: Option<SecretString>) -> Self {
+    pub fn new(endpoint: Endpoint, token_provider: Option<Arc<dyn TokenProvider>>) -> Self {
         let mut endpoint_str = endpoint.0.trim_end_matches('/').to_string();
         if !endpoint_str.starts_with("http") {
             endpoint_str = format!("https://{endpoint_str}");
         }
 
+        let mut user_agent: Option<String> = None;
+        #[cfg(feature = "databricks")]
+        // Include user_agent, if connects to Databricks instance
+        if endpoint.0.contains("databricks") {
+            user_agent = Some(crate::databricks::user_agent().to_string());
+        }
+
         Self {
             endpoint: endpoint_str,
-            token,
+            token_provider,
             client: reqwest::Client::new(),
+            user_agent,
         }
     }
 
@@ -111,7 +139,7 @@ impl UnityCatalog {
         );
 
         if let Some(port) = parsed_url.port() {
-            endpoint.push_str(&format!(":{port}"));
+            let _ = write!(endpoint, ":{port}");
         }
 
         tracing::debug!("parse_catalog_url: endpoint: {}", endpoint);
@@ -229,10 +257,15 @@ impl UnityCatalog {
         let full_url = format!("{}{path}", self.endpoint);
         tracing::debug!("Sending request to {full_url}");
         let mut builder = self.client.get(full_url);
-        if let Some(token) = &self.token {
+
+        if let Some(token_provider) = &self.token_provider {
             tracing::debug!("Adding bearer token to request");
-            builder = builder.bearer_auth(token.expose_secret());
+            builder = builder.bearer_auth(token_provider.get_token());
         }
+        if let Some(user_agent) = &self.user_agent {
+            builder = builder.header("User-Agent", user_agent);
+        }
+
         builder
     }
 }

@@ -16,15 +16,17 @@ limitations under the License.
 
 use std::collections::HashMap;
 
-use column::Column;
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{
-    embeddings::ColumnEmbeddingConfig, is_default, params::Params, Nameable, WithDependsOn,
-};
+use super::{Nameable, WithDependsOn, embeddings::ColumnEmbeddingConfig, is_default};
+use crate::acceleration::Acceleration;
+use crate::metric::Metrics;
+use crate::param::Params;
+use crate::semantic::Column;
+use crate::vector::VectorStore;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -122,7 +124,7 @@ pub struct Dataset {
     pub time_partition_format: Option<TimeFormat>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub acceleration: Option<acceleration::Acceleration>,
+    pub acceleration: Option<Acceleration>,
 
     #[serde(rename = "embeddings", default, skip_serializing_if = "Vec::is_empty")]
     pub embeddings: Vec<ColumnEmbeddingConfig>,
@@ -135,6 +137,12 @@ pub struct Dataset {
 
     #[serde(default, skip_serializing_if = "is_default")]
     pub ready_state: ReadyState,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics: Option<Metrics>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vectors: Option<VectorStore>,
 }
 
 impl Nameable for Dataset {
@@ -165,12 +173,49 @@ impl Dataset {
             depends_on: Vec::default(),
             unsupported_type_action: None,
             ready_state: ReadyState::default(),
+            metrics: None,
+            vectors: None,
         }
     }
 
     #[must_use]
     pub fn has_embeddings(&self) -> bool {
         !self.embeddings.is_empty() || self.columns.iter().any(|c| !c.embeddings.is_empty())
+    }
+
+    /// Find any primary keys explicitly defined in the [`Dataset`]. Order of precedence:
+    ///  1. Primary key defined in `.columns[].embeddings[].row_id`
+    ///  2. Primary key defined in `.columns[].full_text_search[].row_id`
+    ///  3. Primary key defined in `.embeddings[].column_pk` (on the path to deprecation)
+    pub fn primary_key_override(&self) -> Option<Vec<String>> {
+        let pks_from_embeddings: Option<Vec<String>> =
+            self.embeddings.iter().find_map(|e| e.primary_keys.clone());
+
+        let mut pks_from_columns: Option<Vec<String>> = self
+            .columns
+            .iter()
+            .find_map(|c| c.embeddings.iter().find_map(|e| e.row_ids.clone()));
+
+        let pks_from_fts: Option<Vec<String>> = self
+            .columns
+            .iter()
+            .find_map(|c| c.full_text_search.as_ref().and_then(|f| f.row_ids.clone()));
+
+        pks_from_columns = pks_from_columns.or(pks_from_fts);
+
+        let primary_keys = match (pks_from_columns, pks_from_embeddings) {
+            (Some(pks), None) | (None, Some(pks)) => pks,
+            (Some(pks), Some(_)) => {
+                tracing::warn!(
+                    "Dataset '{}' provided primary keys in both `.columns[].embeddings[].row_id` and `.embeddings[].primary_keys`. Using the former.",
+                    self.name
+                );
+                pks
+            }
+            (None, None) => return None,
+        };
+
+        Some(primary_keys)
     }
 }
 
@@ -195,209 +240,8 @@ impl WithDependsOn<Dataset> for Dataset {
             depends_on: depends_on.to_vec(),
             unsupported_type_action: self.unsupported_type_action,
             ready_state: self.ready_state,
-        }
-    }
-}
-
-pub mod acceleration {
-    #[cfg(feature = "schemars")]
-    use schemars::JsonSchema;
-    use serde::{Deserialize, Serialize};
-    use std::{collections::HashMap, fmt::Display};
-
-    use crate::component::params::Params;
-
-    use super::ReadyState;
-
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-    #[serde(rename_all = "lowercase")]
-    pub enum RefreshMode {
-        Full,
-        Append,
-        Changes,
-    }
-
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-    #[serde(rename_all = "lowercase")]
-    pub enum Mode {
-        #[default]
-        Memory,
-        File,
-    }
-
-    impl Display for Mode {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Mode::Memory => write!(f, "memory"),
-                Mode::File => write!(f, "file"),
-            }
-        }
-    }
-
-    /// Behavior when a query on an accelerated table returns zero results.
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-    #[serde(rename_all = "snake_case")]
-    pub enum ZeroResultsAction {
-        /// Return an empty result set. This is the default.
-        #[default]
-        ReturnEmpty,
-        /// Fallback to querying the source table.
-        UseSource,
-    }
-
-    impl Display for ZeroResultsAction {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                ZeroResultsAction::ReturnEmpty => write!(f, "return_empty"),
-                ZeroResultsAction::UseSource => write!(f, "use_source"),
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
-    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-    #[serde(rename_all = "lowercase")]
-    pub enum IndexType {
-        #[default]
-        Enabled,
-        Unique,
-    }
-
-    impl Display for IndexType {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                IndexType::Enabled => write!(f, "enabled"),
-                IndexType::Unique => write!(f, "unique"),
-            }
-        }
-    }
-
-    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
-    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-    #[serde(rename_all = "lowercase")]
-    pub enum OnConflictBehavior {
-        #[default]
-        Drop,
-        Upsert,
-    }
-
-    impl Display for OnConflictBehavior {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                OnConflictBehavior::Drop => write!(f, "drop"),
-                OnConflictBehavior::Upsert => write!(f, "upsert"),
-            }
-        }
-    }
-
-    #[allow(clippy::struct_excessive_bools)]
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-    #[serde(deny_unknown_fields)]
-    pub struct Acceleration {
-        #[serde(default = "default_true")]
-        pub enabled: bool,
-
-        #[serde(default)]
-        pub mode: Mode,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub engine: Option<String>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub refresh_mode: Option<RefreshMode>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub refresh_check_interval: Option<String>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub refresh_sql: Option<String>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub refresh_data_window: Option<String>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub refresh_append_overlap: Option<String>,
-
-        #[serde(default = "default_true")]
-        pub refresh_retry_enabled: bool,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub refresh_retry_max_attempts: Option<usize>,
-
-        #[serde(default)]
-        pub refresh_jitter_enabled: bool,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub refresh_jitter_max: Option<String>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub params: Option<Params>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub retention_period: Option<String>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub retention_check_interval: Option<String>,
-
-        #[serde(default, skip_serializing_if = "is_false")]
-        pub retention_check_enabled: bool,
-
-        #[serde(default)]
-        pub on_zero_results: ZeroResultsAction,
-
-        #[serde(default)]
-        #[deprecated(since = "1.0.0-rc.1", note = "Use `dataset.ready_state` instead.")]
-        pub ready_state: Option<ReadyState>,
-
-        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-        pub indexes: HashMap<String, IndexType>,
-
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub primary_key: Option<String>,
-
-        #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-        pub on_conflict: HashMap<String, OnConflictBehavior>,
-    }
-
-    #[allow(clippy::trivially_copy_pass_by_ref)]
-    fn is_false(b: &bool) -> bool {
-        !b
-    }
-
-    const fn default_true() -> bool {
-        true
-    }
-
-    impl Default for Acceleration {
-        #[allow(deprecated)]
-        fn default() -> Self {
-            Self {
-                enabled: true,
-                mode: Mode::Memory,
-                engine: None,
-                refresh_mode: None,
-                refresh_check_interval: None,
-                refresh_sql: None,
-                refresh_data_window: None,
-                refresh_append_overlap: None,
-                refresh_retry_enabled: true,
-                refresh_retry_max_attempts: None,
-                refresh_jitter_enabled: false,
-                refresh_jitter_max: None,
-                params: None,
-                retention_period: None,
-                retention_check_interval: None,
-                retention_check_enabled: false,
-                on_zero_results: ZeroResultsAction::ReturnEmpty,
-                ready_state: None,
-                indexes: HashMap::default(),
-                primary_key: None,
-                on_conflict: HashMap::default(),
-            }
+            metrics: self.metrics.clone(),
+            vectors: self.vectors.clone(),
         }
     }
 }
@@ -412,189 +256,6 @@ pub mod replication {
     pub struct Replication {
         #[serde(default)]
         pub enabled: bool,
-    }
-}
-
-pub mod column {
-    use std::collections::HashMap;
-
-    #[cfg(feature = "schemars")]
-    use schemars::JsonSchema;
-    use serde::{de::Error, Deserialize, Serialize};
-
-    use crate::component::embeddings::EmbeddingChunkConfig;
-
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-    pub struct Column {
-        pub name: String,
-
-        /// Optional semantic details about the column
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub description: Option<String>,
-
-        #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        pub embeddings: Vec<ColumnLevelEmbeddingConfig>,
-    }
-
-    impl Column {
-        /// Return the column-level metadata that should be added to a [`arrow::datatypes::Field`].
-        #[must_use]
-        pub fn metadata(&self) -> HashMap<String, String> {
-            let mut metadata = HashMap::new();
-            if let Some(d) = self.description.as_ref() {
-                metadata.insert("description".to_string(), d.to_string());
-            }
-            metadata
-        }
-    }
-
-    /// Configuration for if and how a dataset's column should be embedded.
-    /// Different to [`crate::component::embeddings::ColumnEmbeddingConfig`],
-    /// as [`ColumnLevelEmbeddingConfig`] should be a property of [`Column`],
-    /// not [`super::Dataset`].
-    ///
-    /// [`crate::component::embeddings::ColumnEmbeddingConfig`] will be
-    /// deprecated long term in favour of [`ColumnLevelEmbeddingConfig`].
-    ///
-    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-    #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-    pub struct ColumnLevelEmbeddingConfig {
-        #[serde(rename = "from", default)]
-        pub model: String,
-
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub chunking: Option<EmbeddingChunkConfig>,
-
-        #[serde(
-            rename = "row_id",
-            default,
-            deserialize_with = "deserialize_row_ids",
-            skip_serializing_if = "Option::is_none"
-        )]
-        pub row_ids: Option<Vec<String>>,
-    }
-
-    // Let `row_id` handle single string or arrays. All acceptable
-    // ```yaml
-    // row_id: foo
-    //
-    // row_id: foo, bar
-    //
-    // row_id:
-    //  - foo
-    //  - bar
-    // ```
-    fn deserialize_row_ids<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        match serde_yaml::Value::deserialize(deserializer)? {
-            serde_yaml::Value::Null => Ok(None),
-            serde_yaml::Value::String(s) => {
-                Ok(Some(s.split(',').map(|s| s.trim().to_string()).collect()))
-            }
-            serde_yaml::Value::Sequence(seq) => {
-                seq.iter()
-                    .map(|v| {
-                        v.as_str().map(ToString::to_string).ok_or_else(|| {
-                            D::Error::custom(format!("Invalid format for row_id. Expected a string, or array of strings. Found {v:?}"))
-                        })
-                    })
-                    .collect::<Result<Vec<String>, D::Error>>()
-                    .map(Some)
-            }
-            other => Err(D::Error::custom(format!("Invalid format for row_id. Expected a string, or array of strings. Found {other:?}"))),
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-        use serde_yaml;
-
-        #[test]
-        fn test_deserialize_row_ids_single_string() {
-            let yaml = r"
-                from: foo
-                row_id: foo
-            ";
-            let parsed: ColumnLevelEmbeddingConfig =
-                serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
-            assert_eq!(parsed.row_ids, Some(vec!["foo".to_string()]));
-        }
-
-        #[test]
-        fn test_deserialize_row_ids_comma_separated() {
-            let yaml = r"
-                from: foo
-                row_id: foo, bar
-            ";
-            let parsed: ColumnLevelEmbeddingConfig =
-                serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
-            assert_eq!(
-                parsed.row_ids,
-                Some(vec!["foo".to_string(), "bar".to_string()])
-            );
-        }
-
-        #[test]
-        fn test_deserialize_row_ids_list() {
-            let yaml = r"
-                from: foo
-                row_id:
-                 - foo
-                 - bar
-            ";
-            let parsed: ColumnLevelEmbeddingConfig =
-                serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
-            assert_eq!(
-                parsed.row_ids,
-                Some(vec!["foo".to_string(), "bar".to_string()])
-            );
-        }
-
-        #[test]
-        fn test_deserialize_row_ids_errors() {
-            match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
-                r"
-                from: foo
-                row_id:
-                  - foo: bar
-            ",
-            ) {
-                Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
-                Err(e) => assert_eq!(e.to_string(), "Invalid format for row_id. Expected a string, or array of strings. Found Mapping {\"foo\": String(\"bar\")} at line 2 column 17"),
-            };
-
-            match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
-                r"
-                from: foo
-                row_id: {foo: bar, extra: value}
-            ",
-            ) {
-                Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
-                Err(e) => assert_eq!(e.to_string(), "Invalid format for row_id. Expected a string, or array of strings. Found Mapping {\"foo\": String(\"bar\"), \"extra\": String(\"value\")} at line 2 column 17"),
-            };
-
-            match serde_yaml::from_str::<ColumnLevelEmbeddingConfig>(
-                r"
-                from: foo
-                row_id: [foo, bar
-            ",
-            ) {
-                Ok(v) => panic!("Expected an error, but successfully parsed to {v:?}"),
-                Err(e) => assert_eq!(e.to_string(), "did not find expected ',' or ']' at line 5 column 1, while parsing a flow sequence at line 3 column 25"),
-            };
-        }
-
-        #[test]
-        fn test_deserialize_row_ids_missing() {
-            let yaml = "from: model_name";
-            let parsed: ColumnLevelEmbeddingConfig =
-                serde_yaml::from_str(yaml).expect("Failed to parse ColumnLevelEmbeddingConfig");
-            assert_eq!(parsed.row_ids, None);
-        }
     }
 }
 
@@ -638,7 +299,7 @@ struct DatasetDeserializer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     time_partition_format: Option<TimeFormat>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    acceleration: Option<acceleration::Acceleration>,
+    acceleration: Option<Acceleration>,
     #[serde(rename = "embeddings", default, skip_serializing_if = "Vec::is_empty")]
     embeddings: Vec<ColumnEmbeddingConfig>,
     #[serde(rename = "dependsOn", default, skip_serializing_if = "Vec::is_empty")]
@@ -650,6 +311,11 @@ struct DatasetDeserializer {
     unsupported_type_action: Option<UnsupportedTypeAction>,
     #[serde(default, skip_serializing_if = "is_default")]
     ready_state: ReadyState,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    metrics: Option<Metrics>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vectors: Option<VectorStore>,
 }
 
 #[allow(deprecated)]
@@ -698,6 +364,8 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             depends_on: deserializer.depends_on,
             unsupported_type_action,
             ready_state: deserializer.ready_state,
+            metrics: deserializer.metrics,
+            vectors: deserializer.vectors,
         })
     }
 }

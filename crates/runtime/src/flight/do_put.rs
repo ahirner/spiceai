@@ -18,7 +18,10 @@ use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use arrow::array::RecordBatch;
 use arrow_flight::{
-    flight_service_server::FlightService, utils::flight_data_to_arrow_batch, FlightData, PutResult,
+    FlightData, PutResult,
+    flight_service_server::FlightService,
+    sql::{Any, Command},
+    utils::flight_data_to_arrow_batch,
 };
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::SchemaRef;
@@ -27,71 +30,115 @@ use datafusion::{
     error::DataFusionError, execution::SendableRecordBatchStream,
     physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
 };
+use prost::Message as _;
 use runtime_auth::AuthRequestContext;
 use tokio::{
     sync::mpsc::{self, Sender},
     time::sleep,
 };
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::{StreamExt as _, adapters::Peekable, wrappers::ReceiverStream};
 use tonic::{Request, Response, Status, Streaming};
 
 use async_stream::stream;
 
 use crate::{
-    datafusion::DataFusion,
+    datafusion::{DataFusion, request_context_extension::get_current_datafusion},
     dataupdate::{StreamingDataUpdate, UpdateType},
-    request::RequestContext,
+    request::{AsyncMarker, RequestContext},
     timing::TimedStream,
 };
 
-use super::{metrics, Service};
+use super::{
+    Service, flightsql::prepared_statement_query, metrics,
+    middleware::rate_limit::RateLimiterExtension,
+};
 
 pub(crate) async fn handle(
-    flight_svc: &Service,
     request: Request<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
-    match RequestContext::current(crate::request::AsyncMarker::new().await).auth_principal() {
-            Some(principal) => {
-                if !principal.groups().iter().any(|group| *group == "write" || *group == "read_write") {
-                    return Err(Status::permission_denied("Write access denied. Verify that authentication key used has write access and try again."));
-                }
-            },
-            None => return Err(Status::unauthenticated("Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth")),
-     }
+    let rate_limit_check_fn = request
+        .extensions()
+        .get::<RateLimiterExtension>()
+        .map(RateLimiterExtension::check_fn);
 
-    let mut streaming_flight = request.into_inner();
+    let mut streaming_flight = request.into_inner().peekable();
 
-    let Ok(Some(message)) = streaming_flight.message().await else {
+    // We need to peek at the stream in case we branch below to prepared statements
+    let Some(Ok(first_message)) = streaming_flight.peek().await else {
         let _start = metrics::track_flight_request("do_put", None);
         return Err(Status::invalid_argument("No flight data provided"));
     };
-    let Some(fd) = &message.flight_descriptor else {
+    let Some(fd) = &first_message.flight_descriptor else {
         let _start = metrics::track_flight_request("do_put", None);
         return Err(Status::invalid_argument("No flight descriptor provided"));
     };
+
+    if let Ok(message) = Any::decode(&*fd.cmd) {
+        if let Command::CommandPreparedStatementQuery(query) =
+            Command::try_from(message).map_err(|e| Status::internal(format!("{e:?}")))?
+        {
+            return prepared_statement_query::do_put_query(query, streaming_flight).await;
+        }
+    }
+
+    // Check if the request should be rate limited.
+    if let Some(rate_limit_check) = rate_limit_check_fn {
+        rate_limit_check()?;
+    }
+
+    match RequestContext::current(crate::request::AsyncMarker::new().await).auth_principal() {
+        Some(principal) => {
+            if !principal
+                .groups()
+                .iter()
+                .any(|group| *group == "write" || *group == "read_write")
+            {
+                return Err(Status::permission_denied(
+                    "Write access denied. Verify that authentication key used has write access and try again.",
+                ));
+            }
+        }
+        None => {
+            return Err(Status::unauthenticated(
+                "Flight DoPut requires authentication.\nFor auth details, visit https://spiceai.org/docs/api/auth",
+            ));
+        }
+    }
+
+    // Since it is not a prepared statement we can take from the stream
+    let Some(Ok(first_message)) = streaming_flight.next().await else {
+        let _start = metrics::track_flight_request("do_put", None);
+        return Err(Status::invalid_argument("No flight data provided"));
+    };
+    let Some(fd) = &first_message.flight_descriptor else {
+        let _start = metrics::track_flight_request("do_put", None);
+        return Err(Status::invalid_argument("No flight descriptor provided"));
+    };
+
     if fd.path.is_empty() {
         let _start = metrics::track_flight_request("do_put", None);
         return Err(Status::invalid_argument("No path provided"));
-    };
+    }
 
     let path = TableReference::parse_str(&fd.path.join("."));
 
     // Initializing tracking here so that both counter and duration have consistent path dimensions
     let start = metrics::track_flight_request("do_put", Some(&path.to_string())).await;
 
-    if !flight_svc.datafusion.is_writable(&path) {
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let datafusion = get_current_datafusion(&context);
+
+    if !datafusion.is_writable(&path) {
         return Err(Status::invalid_argument(format!(
             "Path doesn't exist or is not writable: {path}",
         )));
-    };
+    }
 
-    let schema = try_schema_from_flatbuffer_bytes(&message.data_header)
+    let schema = try_schema_from_flatbuffer_bytes(&first_message.data_header)
         .map_err(|e| Status::internal(format!("Failed to get schema from data header: {e}")))?;
     let schema = Arc::new(schema);
 
-    let df = Arc::clone(&flight_svc.datafusion);
-
-    let target_schema = df
+    let target_schema = datafusion
         .get_arrow_schema(path.clone())
         .await
         .map_err(|e| Status::internal(format!("Failed to get target dataset schema: {e}")))?;
@@ -102,7 +149,9 @@ pub(crate) async fn handle(
         )));
     }
 
-    let response_stream = create_response_stream(path, schema, df, streaming_flight, &message);
+    let first_message = first_message.clone();
+    let response_stream =
+        create_response_stream(path, schema, datafusion, streaming_flight, &first_message);
 
     let timed_stream = TimedStream::new(response_stream, move || start);
 
@@ -113,10 +162,11 @@ fn create_response_stream(
     path: TableReference,
     schema: SchemaRef,
     df: Arc<DataFusion>,
-    mut streaming_flight: Streaming<FlightData>,
+    mut streaming_flight: Peekable<Streaming<FlightData>>,
     first_message: &FlightData,
-) -> impl futures::Stream<Item = Result<PutResult, Status>> {
+) -> impl futures::Stream<Item = Result<PutResult, Status>> + use<> {
     let dictionaries_by_id = Arc::new(HashMap::new());
+    tracing::debug!("Starting writing data into dataset: {path}");
 
     // Sometimes the first message only contains the schema and no data
     let first_batch = arrow_flight::utils::flight_data_to_arrow_batch(
@@ -157,9 +207,9 @@ fn create_response_stream(
                         }
                     }
                 },
-                message = streaming_flight.message() => {
+                message = streaming_flight.next() => {
                     match message {
-                        Ok(Some(message)) => {
+                        Some(Ok(message)) => {
                             let new_batch = match flight_data_to_arrow_batch(
                                 &message,
                                 Arc::clone(&schema),
@@ -173,20 +223,27 @@ fn create_response_stream(
                                 }
                             };
 
-                            yield handle_record_batch(new_batch, &batch_tx).await;
+                            // Only report errors; a success message is sent as the final step upon successful write completion
+                            if let Err(err) = handle_record_batch(new_batch, &batch_tx).await {
+                                yield Err(err);
+                                break;
+                            }
                         }
-                        Ok(None) => {
+                        None => {
                             // End of the stream; signal that stream is completed and data write should be finalized
                             drop(batch_tx);
+                            tracing::trace!("No more messages in the stream, finalizing write operation for path: {path}");
 
                             // Wait for the write operation to complete
                             if let Err(e) = write_future.await {
                                 tracing::error!("Write operation failed. Details included in the response.");
                                 yield Err(Status::internal(format!("Write operation failed: {e}")));
                             }
+                            tracing::debug!("Write operation completed successfully for dataset: {path}");
+                            yield Ok(PutResult::default())
                             break;
                         }
-                        Err(e) => {
+                        Some(Err(e)) => {
                             tracing::error!("Error reading message: {e}");
                             yield Err(Status::internal(format!("Error reading message: {e}")));
                             break;
@@ -196,7 +253,7 @@ fn create_response_stream(
             }
         };
 
-        tracing::trace!("Finished writing data to path: {path}");
+        tracing::debug!("Finished writing data into dataset: {path}");
     }
 }
 

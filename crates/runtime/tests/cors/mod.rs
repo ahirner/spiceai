@@ -26,7 +26,7 @@ use crate::{
 };
 use app::AppBuilder;
 use rand::Rng;
-use runtime::{auth::EndpointAuth, config::Config, Runtime};
+use runtime::{Runtime, auth::EndpointAuth, config::Config};
 use spicepod::component::runtime::CorsConfig;
 
 const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
@@ -40,8 +40,8 @@ async fn test_enabled_cors_endpoints() -> Result<(), anyhow::Error> {
             let span = tracing::info_span!("test_cors_endpoints");
             let _span_guard = span.enter();
 
-            let mut rng = rand::thread_rng();
-            let http_port: u16 = rng.gen_range(50000..60000);
+            let mut rng = rand::rng();
+            let http_port: u16 = rng.random_range(50000..60000);
             let flight_port: u16 = http_port + 1;
             let otel_port: u16 = http_port + 2;
             let metrics_port: u16 = http_port + 3;
@@ -55,7 +55,7 @@ async fn test_enabled_cors_endpoints() -> Result<(), anyhow::Error> {
                 .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
                 .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
 
-            let rt = Runtime::builder()
+            let rt = Arc::new(Runtime::builder()
                 .with_app(
                     AppBuilder::new("test")
                         .with_cors_config(CorsConfig {
@@ -65,11 +65,11 @@ async fn test_enabled_cors_endpoints() -> Result<(), anyhow::Error> {
                         .build(),
                 )
                 .build()
-                .await;
+                .await);
 
             // Start the servers
             tokio::spawn(async move {
-                Box::pin(Arc::new(rt).start_servers(api_config, None, EndpointAuth::no_auth())).await
+                Box::pin(Arc::clone(&rt).start_servers(api_config, None, EndpointAuth::no_auth())).await
             });
 
             let http_client = reqwest::Client::builder().build()?;
@@ -102,7 +102,7 @@ async fn test_enabled_cors_endpoints() -> Result<(), anyhow::Error> {
                 .headers()
                 .get("access-control-allow-methods")
                 .expect("cors header is present");
-            assert_eq!(cors_allow_methods_header, "GET,POST,PATCH");
+            assert_eq!(cors_allow_methods_header, "GET,POST,PATCH,OPTIONS");
 
             Ok(())
         }).await
@@ -116,8 +116,8 @@ async fn test_disabled_cors_endpoints() -> Result<(), anyhow::Error> {
         let span = tracing::info_span!("test_disabled_cors_endpoints");
         let _span_guard = span.enter();
 
-        let mut rng = rand::thread_rng();
-        let http_port: u16 = rng.gen_range(50000..60000);
+        let mut rng = rand::rng();
+        let http_port: u16 = rng.random_range(50000..60000);
         let flight_port: u16 = http_port + 1;
         let otel_port: u16 = http_port + 2;
         let metrics_port: u16 = http_port + 3;
@@ -132,14 +132,14 @@ async fn test_disabled_cors_endpoints() -> Result<(), anyhow::Error> {
             .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
 
         // Default cors config is disabled
-        let rt = Runtime::builder()
+        let rt = Arc::new(Runtime::builder()
             .with_app(AppBuilder::new("test").build())
             .build()
-            .await;
+            .await);
 
         // Start the servers
         tokio::spawn(async move {
-            Box::pin(Arc::new(rt).start_servers(api_config, None, EndpointAuth::no_auth())).await
+            Box::pin(Arc::clone(&rt).start_servers(api_config, None, EndpointAuth::no_auth())).await
         });
 
         let http_client = reqwest::Client::builder().build()?;

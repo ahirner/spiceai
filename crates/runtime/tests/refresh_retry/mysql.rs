@@ -16,6 +16,7 @@ limitations under the License.
 //! Runs federation integration tests for `MySQL`.
 //!
 //! Expects a Docker daemon to be running.
+use crate::configure_test_datafusion;
 use crate::{
     docker::RunningContainer,
     mysql::common::{get_mysql_conn, make_mysql_dataset, start_mysql_docker_container},
@@ -32,18 +33,17 @@ use datafusion::{
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,
 };
-use mysql_async::{prelude::Queryable, Params, Row};
+use mysql_async::{Params, Row, prelude::Queryable};
 use runtime::{
-    accelerated_table::{refresh::Refresh, refresh_task::RefreshTask, AcceleratedTable},
     Runtime,
+    accelerated_table::{AcceleratedTable, refresh::Refresh, refresh_task::RefreshTask},
 };
-use spicepod::component::dataset::acceleration::Acceleration;
+use spicepod::acceleration::Acceleration;
 use tokio::time;
 use tracing::instrument;
-use util::{fibonacci_backoff::FibonacciBackoffBuilder, retry, RetryError};
+use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
-const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-refresh-retry-mysql";
-const MYSQL_PORT: u16 = 13307;
+const MYSQL_PORT: u16 = 13327;
 
 #[instrument]
 async fn init_mysql_db() -> Result<(), anyhow::Error> {
@@ -76,7 +76,7 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
 #[instrument]
 async fn prepare_test_environment() -> Result<RunningContainer<'static>, String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
-    let running_container = start_mysql_docker_container(MYSQL_DOCKER_CONTAINER, MYSQL_PORT)
+    let running_container = start_mysql_docker_container(MYSQL_PORT)
         .await
         .map_err(|e| {
             tracing::error!("start_mysql_docker_container: {e}");
@@ -112,13 +112,14 @@ async fn create_refresh_task(
         .ok_or("table is not an AcceleratedTable")?;
 
     Ok((
-        RefreshTask::new(
+        RefreshTask::builder(
             rt.status(),
             table_name.into(),
             Arc::clone(&accelerated_table.get_federated_table()),
             None,
             accelerated_table.get_accelerator(),
-        ),
+        )
+        .build(),
         accelerated_table.refresh_params().read().await.clone(),
     ))
 }
@@ -168,20 +169,18 @@ async fn mysql_refresh_retries() -> Result<(), String> {
                 .with_dataset(ds_default_retries)
                 .build();
 
-            let status = runtime::status::RuntimeStatus::new();
-            let df = crate::get_test_datafusion(Arc::clone(&status));
-
             let rt = Runtime::builder()
                 .with_app(app)
-                .with_datafusion(df)
+                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
+            let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10)) => {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
                     return Err("Timed out waiting for datasets to load".to_string());
                 }
-                () = rt.load_components() => {}
+                () = cloned_rt.load_components() => {}
             }
 
             let (refresh_task_no_retries, request) =
@@ -210,14 +209,16 @@ async fn mysql_refresh_retries() -> Result<(), String> {
                 // restore connectivity after few seconds
                 time::sleep(Duration::from_secs(2)).await;
                 tracing::debug!("Restoring connectivity...");
-                assert!(running_container_reference_copy
-                    .start()
-                    .await
-                    .map_err(|e| {
-                        tracing::error!("running_container.start: {e}");
-                        e.to_string()
-                    })
-                    .is_ok());
+                assert!(
+                    running_container_reference_copy
+                        .start()
+                        .await
+                        .map_err(|e| {
+                            tracing::error!("running_container.start: {e}");
+                            e.to_string()
+                        })
+                        .is_ok()
+                );
             });
 
             // set custom refresh sql to check number of items loaded later

@@ -31,28 +31,29 @@ use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
 use datafusion::sql::TableReference;
 use indexmap::IndexMap;
-use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsService;
-use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsPartialSuccess;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
 use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceResponse;
-use opentelemetry_proto::tonic::common::v1::any_value;
+use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsService;
+use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
 use opentelemetry_proto::tonic::common::v1::KeyValue;
-use opentelemetry_proto::tonic::metrics::v1::metric::Data;
-use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
+use opentelemetry_proto::tonic::common::v1::any_value;
 use opentelemetry_proto::tonic::metrics::v1::DataPointFlags;
 use opentelemetry_proto::tonic::metrics::v1::NumberDataPoint;
-use runtime_auth::layer::grpc::make_interceptor;
+use opentelemetry_proto::tonic::metrics::v1::metric::Data;
+use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
 use runtime_auth::GrpcAuth;
+use runtime_auth::layer::grpc::make_interceptor;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
+use tokio_util::sync::CancellationToken;
+use tonic::Request;
+use tonic::Response;
+use tonic::Status;
 use tonic::async_trait;
 use tonic::codec::CompressionEncoding;
 use tonic::service::interceptor;
 use tonic::transport::{Identity, Server, ServerTlsConfig};
-use tonic::Request;
-use tonic::Response;
-use tonic::Status;
 use tonic_health::pb::health_server::Health;
 use tonic_health::pb::health_server::HealthServer;
 
@@ -97,6 +98,11 @@ pub enum Error {
 
     #[snafu(display("Unable to configure TLS on the Flight server: {source}"))]
     UnableToConfigureTls { source: tonic::transport::Error },
+
+    #[snafu(display(
+        "Address {addr} is already in use by another process. Either stop the existing process or change the address: https://spiceai.org/docs/cli/reference/run"
+    ))]
+    AddressAlreadyInUse { addr: String },
 }
 
 const VALUE_COLUMN_NAME: &str = "value";
@@ -121,10 +127,7 @@ impl MetricsService for Service {
                 for metric in scope_metric.metrics {
                     if let Some(data) = metric.data {
                         let existing_schema =
-                            match self.datafusion.get_arrow_schema(metric.name.as_str()).await {
-                                Ok(schema) => Some(schema),
-                                Err(_) => None,
-                            };
+                            (self.datafusion.get_arrow_schema(metric.name.as_str()).await).ok();
                         let (record_batch_result, data_points_count) = metric_data_to_record_batch(
                             metric.name.as_str(),
                             &data,
@@ -145,7 +148,7 @@ impl MetricsService for Service {
                                     );
                                     rejected_data_points += data_points_count;
                                     continue;
-                                };
+                                }
 
                                 let schema = record_batch.schema();
                                 let data_update = DataUpdate {
@@ -165,7 +168,7 @@ impl MetricsService for Service {
                                 {
                                     write_failed = true;
                                     tracing::debug!("Failed to add OpenTelemetry data: {e}");
-                                };
+                                }
 
                                 if write_failed {
                                     rejected_data_points += data_points_count;
@@ -501,7 +504,7 @@ fn attributes_to_fields_and_columns(
                     "Metric {metric} has attribute {key_str} with no value, appending null for attribute if possible"
                 );
                 append_null(&mut fields, &mut columns, key_str);
-            };
+            }
         }
 
         // If an attribute previously existed but is missing from this metric, append a null value.
@@ -589,6 +592,7 @@ pub async fn start(
     datafusion: Arc<DataFusion>,
     tls_config: Option<Arc<TlsConfig>>,
     grpc_auth: Option<Arc<dyn GrpcAuth + Send + Sync>>,
+    shutdown_signal: Option<CancellationToken>,
 ) -> Result<()> {
     let service = Service {
         datafusion,
@@ -610,13 +614,40 @@ pub async fn start(
             .context(UnableToConfigureTlsSnafu)?;
     }
 
-    server
+    let server = server
         .layer(interceptor(make_interceptor(grpc_auth)))
         .add_service(create_health_service().await)
-        .add_service(svc)
-        .serve(bind_address)
-        .await
-        .context(UnableToServeSnafu)?;
+        .add_service(svc);
+
+    if let Some(token) = shutdown_signal {
+        server
+            .serve_with_shutdown(bind_address, token.cancelled())
+            .await
+    } else {
+        server.serve(bind_address).await
+    }
+    .map_err(|e| {
+        if is_address_in_use_error(&e) {
+            Error::AddressAlreadyInUse {
+                addr: bind_address.to_string(),
+            }
+        } else {
+            Error::UnableToServe { source: e }
+        }
+    })?;
+
+    tracing::debug!("Spice Runtime OpenTelemetry stopped");
 
     Ok(())
+}
+
+fn is_address_in_use_error(err: &tonic::transport::Error) -> bool {
+    let mut source: Option<&dyn std::error::Error> = Some(err);
+    while let Some(e) = source {
+        if let Some(io_err) = e.downcast_ref::<std::io::Error>() {
+            return io_err.kind() == std::io::ErrorKind::AddrInUse;
+        }
+        source = e.source();
+    }
+    false
 }

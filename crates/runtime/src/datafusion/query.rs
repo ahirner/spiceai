@@ -14,24 +14,27 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{cell::LazyCell, collections::HashSet, sync::Arc};
+use std::{cell::LazyCell, fmt::Display, sync::Arc};
 
+use ::cache::{
+    get_logical_plan_input_tables,
+    key::CacheKey,
+    result::{CacheStatus, query::QueryResult},
+};
 use arrow::{
     array::RecordBatch,
     datatypes::{Schema, SchemaRef},
 };
+use arrow_schema::{Field, SchemaBuilder};
 use arrow_tools::schema::verify_schema;
-use cache::{
-    get_logical_plan_input_tables, to_cached_record_batch_stream, QueryResult,
-    QueryResultsCacheStatus,
-};
+use cache::PlanOrCached;
 use datafusion::{
+    common::ParamValues,
     error::DataFusionError,
-    execution::{context::SQLOptions, SendableRecordBatchStream},
+    execution::{SendableRecordBatchStream, context::SQLOptions},
     logical_expr::LogicalPlan,
-    physical_plan::{memory::MemoryStream, stream::RecordBatchStreamAdapter},
+    physical_plan::stream::RecordBatchStreamAdapter,
     prelude::DataFrame,
-    sql::TableReference,
 };
 use error_code::ErrorCode;
 use snafu::{ResultExt, Snafu};
@@ -42,6 +45,7 @@ pub(crate) use tracker::QueryTracker;
 
 pub mod builder;
 pub use builder::QueryBuilder;
+mod cache;
 pub mod error_code;
 mod metrics;
 mod tracker;
@@ -49,9 +53,12 @@ mod tracker;
 use async_stream::stream;
 use futures::StreamExt;
 
-use crate::request::{AsyncMarker, CacheControl, RequestContext};
+use crate::{
+    datafusion::{DataFusion, query::cache::RequestCacheManager},
+    request::{AsyncMarker, RequestContext},
+};
 
-use super::{error::find_datafusion_root, DataFusion, SPICE_RUNTIME_SCHEMA};
+use super::{SPICE_RUNTIME_SCHEMA, error::find_datafusion_root};
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -61,7 +68,7 @@ pub enum Error {
     UnableToExecuteQuery { source: DataFusionError },
 
     #[snafu(display("Failed to access query results cache: {source}"))]
-    FailedToAccessCache { source: cache::Error },
+    FailedToAccessCache { source: ::cache::Error },
 
     #[snafu(display("Unable to convert cached result to a record batch stream: {source}"))]
     UnableToCreateMemoryStream { source: DataFusionError },
@@ -71,6 +78,9 @@ pub enum Error {
 
     #[snafu(display("Schema mismatch: {source}"))]
     SchemaMismatch { source: arrow_tools::schema::Error },
+
+    #[snafu(display("Failed to set parameters in logical plan: {source}"))]
+    BindingParameters { source: DataFusionError },
 }
 
 // There is no need to have a synchronized SQLOptions across all threads, each thread can have its own instance.
@@ -83,98 +93,43 @@ thread_local! {
     });
 }
 
+pub enum QueryMethod {
+    Plan(LogicalPlan),
+    Text {
+        sql: Arc<str>,
+        parameters: Option<ParamValues>,
+    },
+}
+
+impl Display for QueryMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text { sql, .. } => write!(f, "{sql}"),
+            Self::Plan(plan) => write!(f, "{}", plan.display()),
+        }
+    }
+}
+
 pub struct Query {
     df: Arc<crate::datafusion::DataFusion>,
-    sql: Arc<str>,
-    tracker: QueryTracker,
+    sql: QueryMethod,
+    tracker: Option<QueryTracker>,
 }
 
 macro_rules! handle_error {
     ($self:expr, $request_context:expr, $error_code:expr, $error:expr, $target_error:ident) => {{
         let snafu_error = Error::$target_error { source: $error };
-        $self.finish_with_error($request_context, snafu_error.to_string(), $error_code);
+        $self.map(|t| t.finish_with_error($request_context, snafu_error.to_string(), $error_code));
         return Err(snafu_error);
     }};
 }
 
-enum CacheResult {
-    Hit(QueryResult),
-    MissOrSkipped(QueryTracker, QueryResultsCacheStatus),
-    Error(Error),
-}
-
 impl Query {
-    async fn try_get_cached_result(
-        df: &DataFusion,
-        ctx: Arc<RequestContext>,
-        mut tracker: QueryTracker,
-        plan: &LogicalPlan,
-    ) -> CacheResult {
-        let Some(cache_provider) = df.cache_provider() else {
-            return CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheDisabled);
-        };
-
-        // If the user requested no caching, skip the cache lookup
-        if matches!(ctx.cache_control(), CacheControl::NoCache) {
-            return CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheBypass);
-        }
-
-        let cached_result = match cache_provider.get(plan).await {
-            Ok(Some(result)) => result,
-            Ok(None) => {
-                return CacheResult::MissOrSkipped(tracker, QueryResultsCacheStatus::CacheMiss)
-            }
-            Err(e) => return CacheResult::Error(Error::FailedToAccessCache { source: e }),
-        };
-
-        tracker = tracker
-            .datasets(cached_result.input_tables)
-            .results_cache_hit(true);
-
-        let record_batch_stream =
-            match MemoryStream::try_new(cached_result.records.to_vec(), cached_result.schema, None)
-            {
-                Ok(stream) => stream,
-                Err(e) => {
-                    return CacheResult::Error(Error::UnableToCreateMemoryStream { source: e })
-                }
-            };
-
-        CacheResult::Hit(QueryResult::new(
-            attach_query_tracker_to_stream(
-                Span::current(),
-                ctx,
-                tracker,
-                Box::pin(record_batch_stream),
-            ),
-            QueryResultsCacheStatus::CacheHit,
-        ))
-    }
-
-    fn should_cache_results(
-        df: &DataFusion,
-        plan: &LogicalPlan,
-        cache_status: QueryResultsCacheStatus,
-    ) -> (bool, QueryResultsCacheStatus) {
-        match df.cache_provider() {
-            Some(provider) if provider.cache_is_enabled_for_plan(plan) => (true, cache_status),
-            _ => (false, QueryResultsCacheStatus::CacheDisabled),
-        }
-    }
-
-    fn wrap_stream_with_cache(
-        df: &DataFusion,
-        stream: SendableRecordBatchStream,
-        plan_cache_key: u64,
-        datasets: Arc<HashSet<TableReference>>,
-    ) -> SendableRecordBatchStream {
-        if let Some(cache_provider) = df.cache_provider() {
-            to_cached_record_batch_stream(cache_provider, stream, plan_cache_key, datasets)
-        } else {
-            stream
-        }
-    }
-
+    /// Run a query and return the result.
+    ///
+    /// # Panics
+    ///
+    /// Panics when running under test if no cache key is computed for the query.
     #[allow(clippy::too_many_lines)]
     pub async fn run(self) -> Result<QueryResult> {
         let request_context = RequestContext::current(AsyncMarker::new().await);
@@ -194,39 +149,33 @@ impl Query {
                 .config_mut()
                 .set_extension(Arc::clone(&request_context));
 
-            let plan = match session.create_logical_plan(&ctx.sql).await {
-                Ok(plan) => plan,
-                Err(e) => {
-                    let e = find_datafusion_root(e);
-                    let error_code = ErrorCode::from(&e);
-                    handle_error!(
+            // Get the `LogicalPlan` or cached results
+            let (plan, mut tracker, cache_manager) = match &ctx.sql {
+                QueryMethod::Text { sql, parameters } => {
+                    match Self::get_plan_or_cached(
+                        &ctx.df,
+                        &session,
+                        Arc::clone(&request_context),
+                        sql,
+                        parameters.clone(),
                         tracker,
-                        &request_context,
-                        error_code,
-                        e,
-                        UnableToExecuteQuery
                     )
+                    .await?
+                    {
+                        PlanOrCached::Plan(plan, tracker, cache_manager) => {
+                            (plan, tracker, cache_manager)
+                        }
+                        PlanOrCached::Cached(query_result) => return Ok(query_result),
+                    }
+                }
+                QueryMethod::Plan(logical_plan) => {
+                    let cache_manager = RequestCacheManager::new(
+                        CacheStatus::CacheMiss,
+                        CacheKey::LogicalPlan(logical_plan).as_raw_key(Query::plan_hasher(&ctx.df)),
+                    );
+                    (logical_plan.clone(), None, cache_manager)
                 }
             };
-
-            // Try to get cached results first
-            let (mut tracker, cache_status) = match Self::try_get_cached_result(
-                &ctx.df,
-                Arc::clone(&request_context),
-                tracker,
-                &plan,
-            )
-            .await
-            {
-                CacheResult::Hit(result) => return Ok(result),
-                CacheResult::MissOrSkipped(tracker, status) => (tracker, status),
-                CacheResult::Error(e) => return Err(e),
-            };
-
-            let (plan_is_cache_enabled, cache_status) =
-                Self::should_cache_results(&ctx.df, &plan, cache_status);
-            let plan_cache_key = cache::key_for_logical_plan(&plan);
-            tracker = tracker.results_cache_hit(false);
 
             if let Err(e) =
                 RESTRICTED_SQL_OPTIONS.with(|sql_options| sql_options.verify_plan(&plan))
@@ -258,13 +207,20 @@ impl Query {
                 }
             }
             if is_accelerated {
-                tracker.is_accelerated = Some(true);
+                tracker = tracker.map(|mut t| {
+                    t.is_accelerated = Some(true);
+                    t
+                });
             }
 
-            tracker = tracker.datasets(Arc::new(input_tables));
+            let datasets = Arc::new(input_tables);
+            tracker = tracker.map(|t| t.datasets(Arc::clone(&datasets)));
 
             // Start the timer for the query execution
-            tracker.query_execution_duration_timer = Instant::now();
+            tracker = tracker.map(|mut t| {
+                t.query_execution_duration_timer = Instant::now();
+                t
+            });
 
             let df = DataFrame::new(session, plan);
 
@@ -295,14 +251,14 @@ impl Query {
                     e,
                     SchemaMismatch
                 )
-            };
+            }
 
-            let final_stream = if plan_is_cache_enabled {
+            let final_stream = if cache_manager.should_cache_results() {
                 Self::wrap_stream_with_cache(
                     &ctx.df,
                     res_stream,
-                    plan_cache_key,
-                    Arc::clone(&tracker.datasets),
+                    cache_manager.raw_cache_key,
+                    datasets,
                 )
             } else {
                 res_stream
@@ -315,7 +271,7 @@ impl Query {
                     tracker,
                     final_stream,
                 ),
-                cache_status,
+                cache_manager.cache_status,
             ))
         }
         .instrument(span.clone())
@@ -330,26 +286,44 @@ impl Query {
         }
     }
 
+    pub fn from_logical_plan(df: &Arc<DataFusion>, plan: &LogicalPlan) -> Self {
+        Self {
+            df: Arc::clone(df),
+            sql: QueryMethod::Plan(plan.clone()),
+            tracker: None,
+        }
+    }
+
+    #[must_use]
+    pub fn display_sql(&self) -> String {
+        format!("{}", self.sql)
+    }
+
     pub fn finish_with_error(
         self,
         request_context: &RequestContext,
         error_message: String,
         error_code: ErrorCode,
     ) {
-        self.tracker
-            .finish_with_error(request_context, error_message, error_code);
+        if let Some(t) = self.tracker {
+            t.finish_with_error(request_context, error_message, error_code);
+        }
     }
 
-    pub async fn get_schema(self) -> Result<Schema, DataFusionError> {
+    /// Return the schema for the data and (possibly) the parameters of a [`Query`].
+    pub async fn get_schema(self) -> Result<(Schema, Option<Schema>), DataFusionError> {
         let session = self.df.ctx.state();
         let request_context = RequestContext::current(AsyncMarker::new().await);
-        let plan = match session.create_logical_plan(&self.sql).await {
-            Ok(plan) => plan,
-            Err(e) => {
-                let e = find_datafusion_root(e);
-                self.handle_schema_error(&request_context, &e);
-                return Err(e);
-            }
+        let plan = match self.sql {
+            QueryMethod::Plan(ref plan) => plan.clone(),
+            QueryMethod::Text { ref sql, .. } => match session.create_logical_plan(sql).await {
+                Ok(plan) => plan,
+                Err(e) => {
+                    let e = find_datafusion_root(e);
+                    self.handle_schema_error(&request_context, &e);
+                    return Err(e);
+                }
+            },
         };
 
         // Verify the plan against the restricted options
@@ -358,7 +332,10 @@ impl Query {
             self.handle_schema_error(&request_context, &e);
             return Err(e);
         }
-        Ok(plan.schema().as_arrow().clone())
+        let dataset_schema = plan.schema().as_arrow().clone();
+        let parameter_schema = parameter_schema_for_plan(&plan)?;
+
+        Ok((dataset_schema, parameter_schema))
     }
 
     fn handle_schema_error(self, request_context: &RequestContext, e: &DataFusionError) {
@@ -369,6 +346,51 @@ impl Query {
             self.finish_with_error(request_context, e.to_string(), error_code);
         });
     }
+}
+
+fn parameter_schema_for_plan(plan: &LogicalPlan) -> Result<Option<Schema>, DataFusionError> {
+    let mut parameters: Vec<(String, arrow_schema::DataType)> = plan
+        .get_parameter_types()?
+        .into_iter()
+        .map(|(name, dt)| {
+            // If cannot determine datatype, we are assuming UInt64.
+            // This appears to occur for LIMIT parameters such as for:
+            // ```sql
+            // SELECT * FROM table LIMIT $1
+            // ```
+            // Other cases are not known
+            (name, dt.unwrap_or(arrow_schema::DataType::UInt64))
+        })
+        .collect();
+
+    // Sort parameters by their numeric value to ensure correct ordering
+    // For example, $1, $2, ..., $9, $10, $11 instead of $1, $10, $11, $2, ...
+    parameters.sort_by(|a, b| {
+        let parse_param_num =
+            |param_name: &str| -> Option<u32> { param_name.strip_prefix('$')?.parse().ok() };
+
+        let a_num = parse_param_num(&a.0);
+        let b_num = parse_param_num(&b.0);
+
+        match (a_num, b_num) {
+            (Some(a), Some(b)) => a.cmp(&b),
+            (Some(_), None) => std::cmp::Ordering::Less, // numeric params come before non-numeric
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => a.0.cmp(&b.0), // fallback to lexicographic for non-numeric params
+        }
+    });
+
+    let maybe_schema = if parameters.is_empty() {
+        None
+    } else {
+        let mut builder = SchemaBuilder::new();
+        parameters
+            .into_iter()
+            .for_each(|(name, typ)| builder.push(Field::new(name, typ, false)));
+        Some(builder.finish())
+    };
+
+    Ok(maybe_schema)
 }
 
 #[must_use]
@@ -382,9 +404,13 @@ impl Query {
 fn attach_query_tracker_to_stream(
     span: Span,
     request_context: Arc<RequestContext>,
-    tracker: QueryTracker,
+    tracker: Option<QueryTracker>,
     mut stream: SendableRecordBatchStream,
 ) -> SendableRecordBatchStream {
+    let Some(tracker) = tracker else {
+        return stream;
+    };
+
     let schema = stream.schema();
     let schema_copy = Arc::clone(&schema);
 
@@ -449,4 +475,293 @@ pub fn write_to_json_string(
     writer.finish()?;
 
     String::from_utf8(writer.into_inner()).boxed()
+}
+
+#[cfg(test)]
+mod tests {
+    use ::cache::{Caching, QueryResultsCacheProvider, result::CacheStatus};
+    use arrow::array::Int64Array;
+    use serde_json::json;
+    use spicepod::component::caching::SQLResultsCacheConfig;
+
+    use crate::{
+        dataaccelerator::AcceleratorEngineRegistry,
+        datafusion::{builder::DataFusionBuilder, param_utils::convert_json_to_param_values},
+        status::RuntimeStatus,
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn parameterized_query() {
+        let parameters = convert_json_to_param_values(json!([41])).expect("json to paramvalues");
+        let config = SQLResultsCacheConfig::default();
+        let cache_provider = Arc::new(
+            QueryResultsCacheProvider::try_new(&config, Box::new([])).expect("cache provider new"),
+        );
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+            )
+            .with_caching(Arc::new(Caching::new().with_results_cache(cache_provider)))
+            .build(),
+        );
+
+        let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", Arc::clone(&df))
+            .parameters(parameters.clone())
+            .build()
+            .run()
+            .await
+            .expect("Query::run");
+
+        // Need to consume the stream to cache the result
+        while let Some(Ok(batch)) = query.data.next().await {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value");
+            let id_value = column.value(0);
+            assert_eq!(id_value, 42);
+        }
+
+        assert_eq!(query.cache_status, CacheStatus::CacheMiss);
+
+        let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", Arc::clone(&df))
+            .parameters(parameters)
+            .build()
+            .run()
+            .await
+            .expect("Query::run");
+        assert_eq!(query.cache_status, CacheStatus::CacheHit);
+
+        // Need to consume the stream to cache the result
+        while let Some(Ok(batch)) = query.data.next().await {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value");
+            let id_value = column.value(0);
+            assert_eq!(id_value, 42);
+        }
+
+        // New parameters should not be cached
+        let parameters = convert_json_to_param_values(json!([1])).expect("json to paramvalues");
+        let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", df)
+            .parameters(parameters)
+            .build()
+            .run()
+            .await
+            .expect("Query::run");
+
+        // Need to consume the stream to cache the result
+        while let Some(Ok(batch)) = query.data.next().await {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("value");
+            let id_value = column.value(0);
+            assert_eq!(id_value, 2);
+        }
+
+        assert_eq!(query.cache_status, CacheStatus::CacheMiss);
+    }
+
+    #[tokio::test]
+    async fn test_parameter_schema_ordering_basic() {
+        use datafusion::execution::context::SessionContext;
+
+        let ctx = SessionContext::new();
+
+        // Test basic parameter ordering with small numbers
+        let sql = "SELECT $1, $2, $3";
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("create plan");
+        let schema = parameter_schema_for_plan(&plan).expect("parameter schema");
+
+        let schema = schema.expect("should have parameters");
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        assert_eq!(field_names, vec!["$1", "$2", "$3"]);
+    }
+
+    #[tokio::test]
+    async fn test_parameter_schema_ordering_with_double_digits() {
+        use datafusion::execution::context::SessionContext;
+
+        let ctx = SessionContext::new();
+
+        // Test parameter ordering with more than 10 parameters
+        let sql = "SELECT $1, $10, $11, $12, $2, $3, $4, $5, $6, $7, $8, $9";
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("create plan");
+        let schema = parameter_schema_for_plan(&plan).expect("parameter schema");
+
+        let schema = schema.expect("should have parameters");
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        // Should be sorted numerically, not lexicographically
+        assert_eq!(
+            field_names,
+            vec![
+                "$1", "$2", "$3", "$4", "$5", "$6", "$7", "$8", "$9", "$10", "$11", "$12"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parameter_schema_ordering_large_numbers() {
+        use datafusion::execution::context::SessionContext;
+
+        let ctx = SessionContext::new();
+
+        // Test with larger parameter numbers to ensure numeric sorting works correctly
+        let sql = "SELECT $1, $100, $11, $2, $20, $21, $3";
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("create plan");
+        let schema = parameter_schema_for_plan(&plan).expect("parameter schema");
+
+        let schema = schema.expect("should have parameters");
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        assert_eq!(
+            field_names,
+            vec!["$1", "$2", "$3", "$11", "$20", "$21", "$100"]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parameter_schema_ordering_mixed_types() {
+        use datafusion::execution::context::SessionContext;
+
+        let ctx = SessionContext::new();
+
+        // Test with different parameter types in different positions
+        let sql = "SELECT $1::text, $10::int, $2::float";
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("create plan");
+        let schema = parameter_schema_for_plan(&plan).expect("parameter schema");
+
+        let schema = schema.expect("should have parameters");
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        // Should still be ordered numerically regardless of types
+        assert_eq!(field_names, vec!["$1", "$2", "$10"]);
+    }
+
+    #[tokio::test]
+    async fn test_parameter_schema_empty() {
+        use datafusion::execution::context::SessionContext;
+
+        let ctx = SessionContext::new();
+
+        // Test with no parameters
+        let sql = "SELECT 1, 2, 3";
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("create plan");
+        let schema = parameter_schema_for_plan(&plan).expect("parameter schema");
+
+        assert!(schema.is_none(), "should have no parameter schema");
+    }
+
+    #[tokio::test]
+    async fn test_parameter_schema_ordering_with_limit() {
+        use datafusion::execution::context::SessionContext;
+
+        let ctx = SessionContext::new();
+
+        // Test parameter ordering when parameters are used in LIMIT clause
+        let sql = "SELECT $1, $2 LIMIT $3";
+        let plan = ctx
+            .state()
+            .create_logical_plan(sql)
+            .await
+            .expect("create plan");
+        let schema = parameter_schema_for_plan(&plan).expect("parameter schema");
+
+        let schema = schema.expect("should have parameters");
+        let field_names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+
+        assert_eq!(field_names, vec!["$1", "$2", "$3"]);
+
+        // Check that $3 exists (the type may vary based on DataFusion's inference)
+        let limit_field = schema.field_with_name("$3").expect("$3 field should exist");
+        // The actual type may be Int64 or UInt64 depending on DataFusion's type inference
+        assert!(
+            limit_field.data_type() == &arrow_schema::DataType::UInt64
+                || limit_field.data_type() == &arrow_schema::DataType::Int64,
+            "Expected UInt64 or Int64, got {:?}",
+            limit_field.data_type()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_parameter_schema_ordering_non_standard_names() {
+        use std::collections::HashMap;
+
+        // Test edge case with non-standard parameter names
+
+        let mut param_types = HashMap::new();
+        param_types.insert("$1".to_string(), Some(arrow_schema::DataType::Int64));
+        param_types.insert("$10".to_string(), Some(arrow_schema::DataType::Utf8));
+        param_types.insert(
+            "non_numeric_param".to_string(),
+            Some(arrow_schema::DataType::Boolean),
+        );
+        param_types.insert("$2".to_string(), Some(arrow_schema::DataType::Float64));
+        param_types.insert(
+            "another_param".to_string(),
+            Some(arrow_schema::DataType::Int32),
+        );
+
+        // Manually set parameter types for testing - we need to create a plan that would have these parameters
+        // For testing purposes, we'll just test the sorting logic directly
+        let mut parameters: Vec<(String, arrow_schema::DataType)> = param_types
+            .into_iter()
+            .map(|(name, dt)| (name, dt.unwrap_or(arrow_schema::DataType::UInt64)))
+            .collect();
+
+        // Apply the same sorting logic as in parameter_schema_for_plan
+        parameters.sort_by(|a, b| {
+            let parse_param_num =
+                |param_name: &str| -> Option<u32> { param_name.strip_prefix('$')?.parse().ok() };
+
+            let a_num = parse_param_num(&a.0);
+            let b_num = parse_param_num(&b.0);
+
+            match (a_num, b_num) {
+                (Some(a), Some(b)) => a.cmp(&b),
+                (Some(_), None) => std::cmp::Ordering::Less, // numeric params come before non-numeric
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.0.cmp(&b.0), // fallback to lexicographic for non-numeric params
+            }
+        });
+
+        let param_names: Vec<&str> = parameters.iter().map(|(name, _)| name.as_str()).collect();
+
+        // Numeric parameters should come first, sorted numerically
+        // Then non-numeric parameters sorted lexicographically
+        assert_eq!(
+            param_names,
+            vec!["$1", "$2", "$10", "another_param", "non_numeric_param"]
+        );
+    }
 }

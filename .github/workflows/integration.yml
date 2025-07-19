@@ -2,10 +2,15 @@
 name: integration tests
 
 on:
+  push:
+    branches:
+      - trunk
+      - release/*
   pull_request:
     branches:
       - trunk
       - release-*
+      - release/*
       - feature-*
     paths-ignore:
       - '**/*.md'
@@ -28,6 +33,12 @@ on:
       - 'bin/spice/**'
 
   workflow_dispatch:
+    inputs:
+      run_all_tests:
+        description: 'Run all tests'
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
@@ -40,7 +51,7 @@ env:
 jobs:
   build:
     name: Build Test Binary
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     steps:
       - uses: actions/checkout@v4
 
@@ -55,18 +66,51 @@ jobs:
       - name: Set up cc
         uses: ./.github/actions/setup-cc
 
+      - name: Check if sccache can be set up
+        run: |
+          if [ -z "${{ secrets.TEST_MINIO_ENDPOINT }}" ]; then
+            echo "SCCACHE_SETUP=false" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=" >> $GITHUB_ENV
+          else
+            echo "SCCACHE_SETUP=true" >> $GITHUB_ENV
+            echo "RUSTC_WRAPPER=sccache" >> $GITHUB_ENV
+          fi
+
+      - name: Set up sccache
+        if: ${{ env.SCCACHE_SETUP == 'true' }}
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          os: 'linux'
+
+      - name: Install Nextest
+        run: |
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
+
       # Build the test binary without running tests
       - name: Build integration test binary
+        env:
+          RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          CARGO_INCREMENTAL: 0
         run: |
-          TEST_BINARY_PATH=$(cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
-          cp $TEST_BINARY_PATH ./integration_test
+          FEATURES="postgres,mysql,delta_lake,duckdb,sqlite,spark,databricks,spark,dynamodb,oracle"
+          if [[ "${{ github.event.inputs.run_all_tests }}" == "true" ]]; then
+            FEATURES="${FEATURES},extended_tests"
+            echo "Including extended_tests"
+          else
+            echo "Excluding extended_tests"
+          fi
 
-      # Upload the test binary as an artifact
-      - name: Upload test binary
+          cargo nextest archive -p runtime --test integration --features ${FEATURES} --archive-file integration.tar.zst
+
+      # Upload the test archive as an artifact
+      - name: Upload test archive
         uses: actions/upload-artifact@v4
         with:
-          name: integration-test-binary
-          path: ./integration_test
+          name: integration-test-archive
+          path: ./integration.tar.zst
           retention-days: 1
 
   test:
@@ -82,17 +126,25 @@ jobs:
         with:
           os: 'linux'
 
-      # Download the test binary artifact
-      - name: Download test binary
+      - name: Install Oracle ODPI-C
+        run: |
+          curl -Lo basic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linuxx64.zip
+          mkdir linux
+          unzip basic.zip -d linux -x "META-INF/*"
+          IC_DIR=$PWD/$(ls -d linux/instantclient*)
+          ln -s /usr/lib/x86_64-linux-gnu/libaio.so.1t64 $IC_DIR/libaio.so.1
+          echo LD_LIBRARY_PATH=$IC_DIR:$LD_LIBRARY_PATH >> $GITHUB_ENV
+
+      # Download the test archive artifact
+      - name: Download test archive
         uses: actions/download-artifact@v4
         with:
-          name: integration-test-binary
+          name: integration-test-archive
           path: ./integration_test
 
-      - name: Mark test binary as executable
+      - name: Install Nextest
         run: |
-          ls -l ./integration_test
-          chmod +x ./integration_test/integration_test
+          curl -LsSf https://get.nexte.st/latest/linux | tar zxf - -C ${CARGO_HOME:-~/.cargo}/bin
 
       - name: Login to ACR
         uses: docker/login-action@v3
@@ -117,20 +169,50 @@ jobs:
       - name: Set up Spice.ai API Key
         run: |
           echo 'SPICEAI_API_KEY="${{ secrets.SPICE_SECRET_SPICEAI_KEY }}"' > .env
+      
+      - name: Set up Github Token
+        uses: actions/create-github-app-token@v2
+        id: github-app-token
+        with:
+          app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
+          private-key: ${{ secrets.ORG_MEMBERS_GITHUB_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            spiceai
 
       - name: Run integration test
         env:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
-          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
-          DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID }}
+          GITHUB_TOKEN: ${{ steps.github-app-token.outputs.token }}
+          # old dbc instance
+          TEST_DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+          TEST_DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          TEST_DATABRICKS_CLUSTER_ID: ${{ secrets.DATABRICKS_CLUSTER_ID }}
           AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
+          # new dbc instance
+          NEW_DATABRICKS_HOST: ${{ secrets.NEW_DATABRICKS_HOST }}
+          NEW_DATABRICKS_CLUSTER_ID: ${{ secrets.NEW_DATABRICKS_CLUSTER_ID }}
+          NEW_DATABRICKS_SP_CLIENT_ID: ${{ secrets.NEW_DATABRICKS_SP_CLIENT_ID }}
+          NEW_DATABRICKS_SP_CLIENT_SECRET: ${{ secrets.NEW_DATABRICKS_SP_CLIENT_SECRET }}
+          NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_ACCESS_KEY_ID }}
+          NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.NEW_AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           SPICEAI_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
+          AWS_ICEBERG_ACCESS_KEY_ID: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
+          AWS_ICEBERG_SECRET_ACCESS_KEY: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_ICEBERG_REGION: ${{ secrets.AWS_ICEBERG_REGION }}
+          AWS_ICEBERG_ACCOUNT_ID: ${{ secrets.AWS_ICEBERG_ACCOUNT_ID }}
+          AWS_GLUE_KEY: ${{ secrets.AWS_ICEBERG_ACCESS_KEY_ID }}
+          AWS_GLUE_SECRET: ${{ secrets.AWS_ICEBERG_SECRET_ACCESS_KEY }}
+          AWS_DYNAMODB_KEY: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
+          AWS_DYNAMODB_SECRET: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
+          ORACLE_CLOUD_CONNECTION_STRING: ${{ secrets.ORACLE_CLOUD_CONNECTION_STRING }}
+          ORACLE_CLOUD_USERNAME: ${{ secrets.ORACLE_CLOUD_USERNAME }}
+          ORACLE_CLOUD_PASSWORD: ${{ secrets.ORACLE_CLOUD_PASSWORD }}
+          ORACLE_CLOUD_WALLET_SSO_CERT: ${{ secrets.ORACLE_CLOUD_WALLET_SSO_CERT }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/integration_test --nocapture
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst
           else
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" ./integration_test/integration_test --nocapture --skip spiceai_integration_test
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_test/integration.tar.zst --skip spiceai_integration_test
           fi

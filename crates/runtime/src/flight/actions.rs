@@ -20,14 +20,14 @@ use prost::Message;
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{flightsql::prepared_statement_query, metrics, to_tonic_err, Service},
+    flight::{Service, flightsql::prepared_statement_query, metrics, to_tonic_err},
     timing::TimedStream,
 };
 
 use arrow_flight::{
+    Action, ActionType as FlightActionType,
     flight_service_server::FlightService,
     sql::{self, Any, ProstMessageExt},
-    Action, ActionType as FlightActionType,
 };
 
 enum ActionType {
@@ -88,7 +88,6 @@ pub(crate) async fn list() -> Response<<Service as FlightService>::ListActionsSt
 }
 
 pub(crate) async fn do_action(
-    flight_svc: &Service,
     request: Request<Action>,
 ) -> Result<Response<<Service as FlightService>::DoActionStream>, Status> {
     let action_type = ActionType::from_str(request.get_ref().r#type.as_str());
@@ -107,9 +106,7 @@ pub(crate) async fn do_action(
                         "Unable to unpack ActionCreatePreparedStatementRequest.",
                     )
                 })?;
-            let stmt =
-                prepared_statement_query::do_action_create_prepared_statement(flight_svc, cmd)
-                    .await?;
+            let stmt = prepared_statement_query::do_action_create_prepared_statement(cmd).await?;
             futures::stream::iter(vec![Ok(arrow_flight::Result {
                 body: stmt.as_any().encode_to_vec().into(),
             })])

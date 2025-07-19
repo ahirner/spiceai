@@ -16,9 +16,9 @@ limitations under the License.
 use std::sync::Arc;
 
 use axum::{
+    Extension,
     extract::Path,
     response::{IntoResponse, Json, Response},
-    Extension,
 };
 use axum_extra::TypedHeader;
 use datafusion::sql::TableReference;
@@ -28,15 +28,16 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
-    datafusion::DataFusion,
-    model::{handle_eval_run, sql_query_for, EvalScorerRegistry, LLMModelStore},
     Runtime,
+    datafusion::request_context_extension::get_current_datafusion,
+    model::{EvalScorerRegistry, LLMModelStore, handle_eval_run, sql_query_for},
+    request::{AsyncMarker, RequestContext},
 };
 
 #[cfg(feature = "openapi")]
 use crate::model::EvalRunResponse;
 
-use super::{sql_to_http_response, ArrowFormat};
+use super::{ResponseMimeType, sql_to_http_response};
 
 /// Input parameters to start an evaluation run for a given model.
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,7 +93,6 @@ pub(crate) struct RunEval {
 ))]
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
-    Extension(df): Extension<Arc<DataFusion>>,
     Extension(rt): Extension<Arc<Runtime>>,
     Extension(eval_scorer_registry): Extension<EvalScorerRegistry>,
     accept: Option<TypedHeader<Accept>>,
@@ -100,6 +100,9 @@ pub(crate) async fn post(
     Json(req): Json<RunEval>,
 ) -> Response {
     let model = req.model;
+
+    let context = RequestContext::current(AsyncMarker::new().await);
+    let df = get_current_datafusion(&context);
 
     let evals = rt.evals.read().await;
     let Some(eval) = evals.iter().find(|e| e.name == eval_name) else {
@@ -112,18 +115,15 @@ pub(crate) async fn post(
 
     if !llms.read().await.contains_key(&model) {
         return (StatusCode::NOT_FOUND, format!("model '{model}' not found")).into_response();
-    };
+    }
 
-    if !df
-        .has_table(&TableReference::parse_str(eval.dataset.as_str()))
-        .await
-    {
+    if !df.table_exists(TableReference::parse_str(eval.dataset.as_str())) {
         return (
             StatusCode::NOT_FOUND,
             format!("dataset '{}' not found", eval.dataset),
         )
             .into_response();
-    };
+    }
 
     match handle_eval_run(
         eval,
@@ -138,7 +138,8 @@ pub(crate) async fn post(
             sql_to_http_response(
                 Arc::clone(&df),
                 sql_query_for(&id).as_str(),
-                ArrowFormat::from_accept_header(accept.as_ref()),
+                None,
+                ResponseMimeType::from_accept_header(accept.as_ref()),
             )
             .await
         }

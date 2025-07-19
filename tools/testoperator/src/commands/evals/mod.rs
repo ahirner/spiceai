@@ -18,18 +18,81 @@ use crate::args::EvalsTestArgs;
 
 use super::get_app_and_start_request;
 use serde_json::json;
-use std::time::Duration;
+use spiceai::Client as SpiceClient;
+use std::time::{Duration, SystemTime};
 use test_framework::{
     anyhow,
-    arrow::{array::RecordBatch, util::pretty::pretty_format_batches},
-    flight_client::FlightClient,
+    arrow::{
+        array::{Float64Array, RecordBatch, StringArray},
+        util::pretty::pretty_format_batches,
+    },
     futures::TryStreamExt,
+    git,
+    opentelemetry::KeyValue,
+    opentelemetry_sdk::Resource,
     spiced::SpicedInstance,
+    telemetry::Telemetry,
 };
+
+/// Status of an evaluation run
+#[derive(Debug, Clone, PartialEq)]
+pub enum EvalStatus {
+    Finished,
+    Failed,
+}
+
+impl EvalStatus {
+    /// Convert a status string to `EvalStatus`
+    pub fn from_str(status: &str) -> Self {
+        match status.to_lowercase().as_str() {
+            "completed" => EvalStatus::Finished,
+            _ => EvalStatus::Failed,
+        }
+    }
+
+    /// Convert `EvalStatus` to a boolean value for metrics recording
+    pub fn to_u64(&self) -> u64 {
+        match self {
+            EvalStatus::Finished => 1,
+            EvalStatus::Failed => 0,
+        }
+    }
+}
+
+/// Metrics from an evaluation run
+#[derive(Debug, Clone)]
+pub struct EvalMetrics {
+    pub status: EvalStatus,
+    pub score: f64,
+}
+
+impl EvalMetrics {
+    pub fn from_record_batch(batch: &[RecordBatch]) -> anyhow::Result<Self> {
+        let record = batch
+            .iter()
+            .find(|b| b.num_rows() > 0)
+            .ok_or_else(|| anyhow::anyhow!("No evaluation metrics found"))?;
+
+        let status_str = record
+            .column_by_name("status")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| anyhow::anyhow!("Failed to extract status"))?
+            .value(0);
+        let status = EvalStatus::from_str(status_str);
+
+        let score = record
+            .column_by_name("score")
+            .and_then(|col| col.as_any().downcast_ref::<Float64Array>())
+            .ok_or_else(|| anyhow::anyhow!("Failed to extract score"))?
+            .value(0);
+
+        Ok(EvalMetrics { status, score })
+    }
+}
 
 #[allow(clippy::too_many_lines)]
 pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
-    let (app, start_request) = get_app_and_start_request(&args.common)?;
+    let (app, start_request) = get_app_and_start_request(&args.common).await?;
     let mut spiced_instance = SpicedInstance::start(start_request).await?;
 
     let eval = args
@@ -55,6 +118,8 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
     let url = format!("http://localhost:8090/v1/evals/{eval}");
     let body = json!({"model": model}).to_string();
 
+    let started_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+
     let response = http_client
         .post(&url)
         .header("Content-Type", "application/json")
@@ -62,46 +127,84 @@ pub(crate) async fn run(args: &EvalsTestArgs) -> anyhow::Result<()> {
         .send()
         .await?;
 
-    if !response.status().is_success() {
-        return Err(anyhow::anyhow!(
-            "Failed to execute evals: {}",
-            response.text().await?
-        ));
+    let finished_at = SystemTime::now().duration_since(std::time::UNIX_EPOCH)?;
+
+    let response_status = response.status();
+    let response_msq = response.text().await?;
+
+    if !response_status.is_success() {
+        return Err(anyhow::anyhow!("Failed to execute evals: {response_msq}"));
     }
 
-    println!("Execution completed, retrieving results...");
+    println!("Evals completed:\n{response_msq}");
 
-    let mut flight_client = spiced_instance.flight_client().await?;
+    println!("Retrieving results...");
 
-    let eval_result = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_MAIN_METRICS).await?;
+    let mut spice_client = spiced_instance.spice_client(None, false).await?;
+
+    let eval_result = execute_sql(&mut spice_client, QUERY_EVAL_BENCHMARK_MAIN_METRICS).await?;
     println!("Result:\n{}\n", pretty_format_batches(&eval_result)?);
 
-    let tasks_calls = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_TASKS).await?;
+    // Extract metrics from the evaluation result. If the evaluation run was not successful (EvalStatus::Failed),
+    // we will return an error at the end after printing statistics and cleaning up.
+    let metrics = EvalMetrics::from_record_batch(&eval_result)?;
+
+    let tasks_calls = execute_sql(&mut spice_client, QUERY_EVAL_BENCHMARK_TASKS).await?;
     println!(
         "Executed tasks:\n{}\n",
         pretty_format_batches(&tasks_calls)?
     );
 
-    let failed_tests = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_FAILED_TESTS).await?;
+    let failed_tests = execute_sql(&mut spice_client, QUERY_EVAL_BENCHMARK_FAILED_TESTS).await?;
     // json format is easier to read as table could be too wide
     println!("Failed tests:\n{}\n", arrow_to_json(&failed_tests)?);
 
-    let top_errors = execute_sql(&mut flight_client, QUERY_EVAL_BENCHMARK_TOP_ERRORS).await?;
+    let top_errors = execute_sql(&mut spice_client, QUERY_EVAL_BENCHMARK_TOP_ERRORS).await?;
     // json format is easier to read as table could be too wide
     println!("Top errors:\n{}\n", arrow_to_json(&top_errors)?);
 
+    // Record benchmark results
+    let benchmark_resource = Resource::new(vec![
+        KeyValue::new("service.name", "testoperator"),
+        KeyValue::new("type", "model_benchmark"),
+        KeyValue::new("spiced_version", spiced_instance.version().to_string()),
+        KeyValue::new("spiced_commit_sha", git::get_commit_sha()),
+        KeyValue::new("testoperator_commit_sha", git::get_commit_sha()),
+        KeyValue::new("branch_name", git::get_branch_name()),
+    ]);
+
+    let telemetry = Telemetry::new(&benchmark_resource, "SPICEAI_BENCHMARK_METRICS_KEY");
+
+    let attributes = vec![
+        KeyValue::new("model_name", model.to_string()),
+        KeyValue::new("benchmark_name", eval.to_string()),
+    ];
+    crate::metrics::STATUS.record(metrics.status.to_u64(), &attributes);
+    crate::metrics::SCORE.record(metrics.score, &attributes);
+    crate::metrics::TEST_DURATION.record(
+        u64::try_from((finished_at - started_at).as_millis())?,
+        &attributes,
+    );
+
+    telemetry.emit().await?;
+
     spiced_instance.stop()?;
 
-    println!("Benchmark completed");
+    // Report unsuccessful evaluation run as an error
+    if matches!(metrics.status, EvalStatus::Failed) {
+        return Err(anyhow::anyhow!("Evaluation run failed"));
+    }
+
+    println!("Benchmark completed successfully!");
 
     Ok(())
 }
 
 async fn execute_sql(
-    flight_client: &mut FlightClient,
+    spice_client: &mut SpiceClient,
     sql: &str,
 ) -> Result<Vec<RecordBatch>, anyhow::Error> {
-    let res = flight_client
+    let res = spice_client
         .query(sql)
         .await?
         .try_collect::<Vec<RecordBatch>>()
@@ -113,14 +216,14 @@ async fn execute_sql(
  * Fetches key metrics for the latest evaluation run, including duration, evaluation score, task call counts, and errors.
  *
  * Output:
- * - `run_id`: Evaluation run ID  
- * - `model`: Model name  
- * - `status`: Run status  
+ * - `run_id`: Evaluation run ID
+ * - `model`: Model name
+ * - `status`: Run status
  * - `tests`: Number of tests performed
- * - `duration_seconds`: Eval duration (seconds)  
+ * - `duration_seconds`: Eval duration (seconds)
  * - `score`: Rounded average score
- * - `task_calls`: Total task invocations  
- * - `task_errors`: Task task errors  
+ * - `task_calls`: Total task invocations
+ * - `task_errors`: Task task errors
  *
  * Example:
  * +----------------------------------+-------------+-----------+-------+------------------+--------+------------+-------------+
@@ -142,11 +245,11 @@ score AS (
     GROUP BY run_id
 ),
 tool_stats AS (
-    SELECT 
+    SELECT
         COUNT(*) AS task_calls,
         COUNT(CASE WHEN error_message IS NOT NULL THEN 1 END) AS task_errors
     FROM runtime.task_history
-    WHERE 
+    WHERE
         task != 'test_connectivity'
         AND start_time BETWEEN (SELECT created_at FROM latest_run)
         AND COALESCE(end_time, NOW())
@@ -162,10 +265,10 @@ LEFT JOIN tool_stats ts ON 1 = 1;
  * Retrieves statistis on executed tasks/tools during the latest evaluation run.
  *
  * Output:
- * - `task`: Task name  
- * - `calls`: Total number of task calls  
- * - `failures`: Total number of task failures  
- * - `duration_ms`: Aggregated task duration in milliseconds  
+ * - `task`: Task name
+ * - `calls`: Total number of task calls
+ * - `failures`: Total number of task failures
+ * - `duration_ms`: Aggregated task duration in milliseconds
  *
  * Example:
  * +-------------------------+-------+----------+--------------------+
@@ -179,20 +282,20 @@ LEFT JOIN tool_stats ts ON 1 = 1;
  */
 static QUERY_EVAL_BENCHMARK_TASKS: &str = "
 WITH latest_run AS (
-  SELECT id 
-  FROM spice.eval.runs 
-  ORDER BY created_at DESC 
+  SELECT id
+  FROM spice.eval.runs
+  ORDER BY created_at DESC
   LIMIT 1
 )
-SELECT 
-  task, 
+SELECT
+  task,
   COUNT(*) AS calls,
   COUNT(CASE WHEN error_message IS NOT NULL THEN 1 END) AS failures,
   SUM(CAST((end_time - start_time) AS Float) /  1000000) AS duration_ms
 FROM runtime.task_history
-WHERE 
+WHERE
   task != 'test_connectivity'
-  AND start_time BETWEEN (SELECT created_at FROM spice.eval.runs WHERE id = (SELECT id FROM latest_run)) AND 
+  AND start_time BETWEEN (SELECT created_at FROM spice.eval.runs WHERE id = (SELECT id FROM latest_run)) AND
   COALESCE(end_time, NOW())
 GROUP BY task
 ORDER BY duration_ms DESC;
@@ -202,10 +305,10 @@ ORDER BY duration_ms DESC;
  * Fetches the top task errors for the latest evaluation run aggregated by associated task name, error message, and input
  *
  * Output:
- * - `task`: Task name  
- * - `count`: Number of error occurrences  
- * - `message`: Error message  
- * - `input`: Input causing the error  
+ * - `task`: Task name
+ * - `count`: Number of error occurrences
+ * - `message`: Error message
+ * - `input`: Input causing the error
  *
  * Example:
  * +---------------+-------+---------------------------------------------------------------------------------------+-----------------------------------------------------------------------------------+
@@ -216,25 +319,25 @@ ORDER BY duration_ms DESC;
  */
 static QUERY_EVAL_BENCHMARK_TOP_ERRORS: &str = "
 WITH latest_run AS (
-  SELECT id 
-  FROM spice.eval.runs 
-  ORDER BY created_at DESC 
+  SELECT id
+  FROM spice.eval.runs
+  ORDER BY created_at DESC
   LIMIT 1
 )
-SELECT 
+SELECT
     task,
     COUNT(*) AS count,
     error_message as message,
     input
-FROM 
+FROM
     runtime.task_history
-WHERE 
+WHERE
     error_message IS NOT NULL
-    AND start_time BETWEEN (SELECT created_at FROM spice.eval.runs WHERE id = (SELECT id FROM latest_run)) AND 
+    AND start_time BETWEEN (SELECT created_at FROM spice.eval.runs WHERE id = (SELECT id FROM latest_run)) AND
   	COALESCE(end_time, NOW())
-GROUP BY 
+GROUP BY
     task, input, message
-ORDER BY 
+ORDER BY
     count DESC
 LIMIT 20;
 ";
@@ -243,11 +346,11 @@ LIMIT 20;
  * Fetches the failed tests for the latest evaluation run.
  *
  * Output:
- * - `run_id`: Evaluation run ID  
- * - `input`: Test input query  
- * - `output`: Model response  
- * - `expected`: Expected response  
- * - `score`: Test score  
+ * - `run_id`: Evaluation run ID
+ * - `input`: Test input query
+ * - `output`: Model response
+ * - `expected`: Expected response
+ * - `score`: Test score
  *
  * Example:
  * +----------------------------------+----------------------------------+----------------------------------+----------------------------------+-------+
@@ -260,7 +363,7 @@ static QUERY_EVAL_BENCHMARK_FAILED_TESTS: &str = "
 WITH latest_run AS (
     SELECT id FROM spice.eval.runs ORDER BY created_at DESC LIMIT 1
 )
-SELECT run_id, input, output, actual as expected, value as score
+SELECT run_id, input, expected, actual, value as score
 FROM eval.results
 WHERE run_id = (SELECT id FROM latest_run) and value < 1;
 ";

@@ -21,12 +21,12 @@ use arrow::{
     datatypes::{DataType, Field, Schema},
 };
 use arrow_flight::{
-    flight_service_server::FlightService, sql, FlightDescriptor, FlightEndpoint, FlightInfo, Ticket,
+    FlightDescriptor, FlightEndpoint, FlightInfo, Ticket, flight_service_server::FlightService, sql,
 };
 use tonic::{Request, Response, Status};
 
 use crate::{
-    flight::{metrics, record_batches_to_flight_stream, util::set_flightsql_protocol, Service},
+    flight::{Service, metrics, record_batches_to_flight_stream, util::set_flightsql_protocol},
     timing::TimedStream,
 };
 
@@ -58,7 +58,6 @@ pub(crate) async fn get_flight_info(
 ///   `key_sequence`: int32 not null
 #[allow(clippy::unnecessary_wraps)]
 pub(crate) async fn do_get(
-    _flight_svc: &Service,
     query: &sql::CommandGetPrimaryKeys,
 ) -> Result<Response<<Service as FlightService>::DoGetStream>, Status> {
     let start = metrics::track_flight_request("do_get", Some("get_primary_keys")).await;

@@ -19,8 +19,8 @@ The principles guiding this work are as follows:
 
 *Good*:
 
-* Derives `Snafu` and `Debug` functionality
-* Has a useful, end-user-friendly display message
+- Derives `Snafu` and `Debug` functionality
+- Has a useful, end-user-friendly display message
 
 ```rust
 #[derive(Snafu, Debug)]
@@ -44,8 +44,8 @@ pub enum Error {
 
 *Good*:
 
-* Resembles `assert!`
-* More concise
+- Resembles `assert!`
+- More concise
 
 ```rust
 ensure!(!self.schema_sample.is_empty(), NeedsAtLeastOneLine);
@@ -63,8 +63,8 @@ if self.schema_sample.is_empty() {
 
 *Good*:
 
-* Grouping related error conditions with their generating code
-* Minimizing unnecessary `match` statements on irrelevant errors
+- Grouping related error conditions with their generating code
+- Minimizing unnecessary `match` statements on irrelevant errors
 
 ```rust
 #[derive(Debug, Snafu)]
@@ -92,7 +92,7 @@ ensure!(foo.is_implemented(), NotImplemented {
 
 *Good*:
 
-* Reduces repetition
+- Reduces repetition
 
 ```rust
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -111,7 +111,7 @@ fn foo() -> Result<bool, Error> { true }
 
 *Good*:
 
-* Reduces boilerplate
+- Reduces boilerplate
 
 ```rust
 input_reader
@@ -177,6 +177,82 @@ close_writer.context(WritingError {
     message: String::from("Error while closing the table writer"),
 })?;
 ```
+
+### `Error` enum variants do not include the word `Error` in the variant name
+
+When Snafu generates macros for the enum variants, Snafu re-writes variants that end with `Error`. For example:
+
+```rust
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Error writing remaining lines {}", source))]
+    UnableToWriteGoodLinesError { source: IngestError },
+}
+
+// Snafu drops the `Error` part of the name
+some_result.context(UnableToWriteGoodLinesSnafu)?;
+```
+
+This behavior can sometimes make it difficult to determine the originating error variant. Additionally, when using variants directly we already have the context they are an `Error` - so there is no need to duplicate `Error` in the variant name.
+
+*Good*:
+
+```rust
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Error writing remaining lines {}", source))]
+    UnableToWriteGoodLines { source: IngestError },
+}
+```
+
+*Bad*:
+
+```rust
+#[derive(Debug, Snafu)]
+pub enum Error {
+    #[snafu(display("Error writing remaining lines {}", source))]
+    UnableToWriteGoodLinesError { source: IngestError },
+}
+```
+
+### Avoid using `Clone` or `Copy` on Newtypes
+
+*Good:*
+
+Accessing the newtype value via a borrow:
+
+```rust
+struct MyStruct(u64);
+
+impl MyStruct {
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+```
+
+*Bad:*
+
+Accessing the newtype value directly through a `Copy`:
+
+```rust
+#[derive(Clone, Copy)]
+struct MyStruct(u64);
+
+fn consumes_value(v: MyStruct) -> {
+    v.0;
+}
+
+let a = MyStruct(0);
+consumes_value(a);
+consumes_value(a);
+```
+
+**Why?**
+
+Rust can make some compiler optimisations that result in more stack operations with implicit copies than register operations would use for borrows that result in a copy. Related reading: [When Zero Cost Abstractions Aren't Zero Cost](https://blog.polybdenum.com/2021/08/09/when-zero-cost-abstractions-aren-t-zero-cost.html).
+
+### Notes
 
 **Code linting**: [Clippy](https://doc.rust-lang.org/stable/clippy/index.html) is used for code linting to enhance idiomatic Rust usage. All warnings are treated as errors, with several non-standard lints enabled. Disabling lints using `#[allow(...)]` is acceptable when the lint is not applicable in certain contexts.
 

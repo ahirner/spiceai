@@ -20,15 +20,15 @@ use tokio::sync::RwLock;
 use arrow_schema::ArrowError;
 use async_openai::{error::OpenAIError, types::CreateChatCompletionRequest};
 
-use dataset::{get_eval_data, DatasetInput, DatasetOutput};
+use dataset::{DatasetInput, DatasetOutput, get_eval_data};
 use llms::chat::Chat;
-use result::{write_result_to_table, ResultBuilder, EVAL_RESULTS_TABLE_REFERENCE};
+use result::{EVAL_RESULTS_TABLE_REFERENCE, ResultBuilder, write_result_to_table};
 use runs::{
-    add_metrics_to_eval_run, start_tracing_eval_run, update_eval_run_status, EvalRunId,
-    EvalRunStatus,
+    EvalRunId, EvalRunStatus, add_metrics_to_eval_run, start_tracing_eval_run,
+    update_eval_run_status,
 };
 use scorer::score_results;
-use snafu::{ensure, ResultExt, Snafu};
+use snafu::{ResultExt, Snafu, ensure};
 use spicepod::component::eval::Eval;
 use tracing_futures::Instrument;
 
@@ -43,7 +43,9 @@ pub(crate) mod scorer;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to query evaluation dataset '{dataset_name}'.\n{source}\nEnsure the dataset is available and has the correct schema."))]
+    #[snafu(display(
+        "Failed to query evaluation dataset '{dataset_name}'.\n{source}\nEnsure the dataset is available and has the correct schema."
+    ))]
     FailedToQueryDataset {
         dataset_name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -58,7 +60,9 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to prepare data for evaluation '{eval_name}'\n{source}\nVerify the dataset and model configuration, and try again."))]
+    #[snafu(display(
+        "Failed to prepare data for evaluation '{eval_name}'\n{source}\nVerify the dataset and model configuration, and try again."
+    ))]
     FailedToPrepareData {
         eval_name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -88,13 +92,17 @@ pub enum Error {
         model_name: String,
     },
 
-    #[snafu(display("Failed to load the scorer '{scorer_name}' needed for evaluation '{eval_name}'.\nVerify the scorer '{scorer_name}' is defined in the spicepod and has been sucessfully loaded."))]
+    #[snafu(display(
+        "Failed to load the scorer '{scorer_name}' needed for evaluation '{eval_name}'.\nVerify the scorer '{scorer_name}' is defined in the spicepod and has been sucessfully loaded."
+    ))]
     EvalScorerUnavailable {
         eval_name: String,
         scorer_name: String,
     },
 
-    #[snafu(display("Failed to create score outputs.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to create score outputs.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToCreateScoreOutputs { source: ArrowError },
 
     #[snafu(display("Failed to write evaluation results to {} for '{eval_run_id}'.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues", EVAL_RESULTS_TABLE_REFERENCE.clone()))]
@@ -103,19 +111,25 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to start an evaluation run for {eval_name}.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to start an evaluation run for {eval_name}.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToStartEvalRun {
         eval_name: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to update evaluation run table '{eval_run_id}'.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to update evaluation run table '{eval_run_id}'.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToUpdateEvalRunTable {
         eval_run_id: EvalRunId,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to start the evaluation run '{eval_run_id}'.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to start the evaluation run '{eval_run_id}'.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToOffloadEvalRun {
         eval_run_id: EvalRunId,
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -130,17 +144,28 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to parse the input column from the evaluation dataset.\n{reason}\nCheck that the values in the input column are of valid evaluation format."))]
+    #[snafu(display(
+        "Failed to parse the input column from the evaluation dataset.\n{reason}\nCheck that the values in the input column are of valid evaluation format."
+    ))]
     InvalidInputFormat { reason: String },
 
-    #[snafu(display("Failed to parse the input column from the evaluation dataset.\n{reason}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to parse the input column from the evaluation dataset.\n{reason}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     InvalidInputFormatReport { reason: String },
 
-    #[snafu(display("Failed to parse the output column from the evaluation dataset.\n{reason}\nCheck that the values in the output column are of valid evaluation format."))]
+    #[snafu(display(
+        "Failed to parse the output column from the evaluation dataset.\n{reason}\nCheck that the values in the output column are of valid evaluation format."
+    ))]
     InvalidOutputFormat { reason: String },
 
-    #[snafu(display("Failed to parse the output column from the evaluation dataset.\n{reason}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to parse the output column from the evaluation dataset.\n{reason}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     InvalidOutputFormatReport { reason: String },
+
+    #[snafu(display("An error occured whilst scoring the results of the eval run. {source}"))]
+    FailedToScoreEvalRun { source: scorer::Error },
 }
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -218,7 +243,14 @@ async fn run_eval(
         })?;
 
     let actual: Vec<DatasetOutput> = if let Some(first_ideal) = ideal.first() {
-        run_model(eval.name.clone(), &**model, &input, first_ideal).await?
+        run_model(
+            eval.name.as_str(),
+            model_name.as_str(),
+            &**model,
+            &input,
+            first_ideal,
+        )
+        .await?
     } else {
         // Not an error, no data in dataset
         vec![]
@@ -234,7 +266,25 @@ async fn run_eval(
 
     // Score the results
     let scorers_to_use = get_scorers_for_eval(eval, Arc::clone(&scorer_registry)).await?;
-    let scores = score_results(&input, &actual, &ideal, &scorers_to_use).await;
+
+    let span = tracing::span!(
+        target: "task_history",
+        tracing::Level::INFO,
+        "eval_scoring",
+        scorers = %serde_json::to_string(&scorers_to_use.keys().collect::<Vec<_>>()).unwrap_or_default(),
+    );
+
+    let scores = match score_results(&input, &actual, &ideal, &scorers_to_use)
+        .instrument(span.clone())
+        .await
+    {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!(target: "task_history", parent: &span, "{e}");
+            return Err(Error::FailedToScoreEvalRun { source: e });
+        }
+    };
+
     write_results(id, Arc::clone(&df), &input, &actual, &ideal, &scores).await?;
 
     // Compute metrics
@@ -296,38 +346,69 @@ async fn write_results(
 
 /// Return format of [`DatasetOutput`] determined by `output_format`. `output_format` can be empty, is only used for its enum type.
 async fn run_model(
-    eval_name: String,
+    eval_name: &str,
+    model_name: &str,
     model: &dyn Chat,
     inputs: &[DatasetInput],
     output_format: &DatasetOutput,
 ) -> Result<Vec<DatasetOutput>> {
     let mut outputs = Vec::with_capacity(inputs.len());
     for input in inputs {
-        let req = TryInto::<CreateChatCompletionRequest>::try_into(input).context(
-            FailedToRunModelSnafu {
-                eval_name: eval_name.clone(),
-            },
-        )?;
-
-        let choices = model
-            .chat_request(req)
+        let span = tracing::span!(
+            target: "task_history",
+            tracing::Level::INFO,
+            "eval_step",
+            input = %serde_json::to_string(&input).unwrap_or_default(),
+        );
+        match run_eval_step(eval_name, model_name, model, input, output_format)
+            .instrument(span.clone())
             .await
-            .context(FailedToRunModelSnafu {
-                eval_name: eval_name.clone(),
-            })?
-            .choices;
-
-        let output = match output_format {
-            DatasetOutput::AssistantResponse(_) => DatasetOutput::AssistantResponse(
-                choices
-                    .into_iter()
-                    .next()
-                    .and_then(|mut c| c.message.content.take())
-                    .unwrap_or_default(),
-            ),
-            DatasetOutput::Choices(_) => DatasetOutput::Choices(choices),
-        };
-        outputs.push(output);
+        {
+            Ok(output) => {
+                if let Ok(captured_output) = serde_json::to_string(&output) {
+                    tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
+                } else {
+                    tracing::warn!("Failed to serialize output for logging");
+                }
+                outputs.push(output);
+            }
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                return Err(e);
+            }
+        }
     }
     Ok(outputs)
+}
+
+async fn run_eval_step(
+    eval_name: &str,
+    model_name: &str,
+    model: &dyn Chat,
+    input: &DatasetInput,
+    output_format: &DatasetOutput,
+) -> Result<DatasetOutput> {
+    let mut req =
+        TryInto::<CreateChatCompletionRequest>::try_into(input).context(FailedToRunModelSnafu {
+            eval_name: eval_name.to_string(),
+        })?;
+    req.model.clone_from(&model_name.to_string());
+    let resp = model
+        .chat_request(req)
+        .await
+        .context(FailedToRunModelSnafu {
+            eval_name: eval_name.to_string(),
+        })?;
+
+    let output = match output_format {
+        DatasetOutput::AssistantResponse(_) => DatasetOutput::AssistantResponse(
+            resp.choices
+                .into_iter()
+                .next()
+                .and_then(|mut c| c.message.content.take())
+                .unwrap_or_default(),
+        ),
+        DatasetOutput::Choices(_) => DatasetOutput::Choices(resp.choices),
+    };
+    Ok(output)
 }

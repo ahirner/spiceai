@@ -16,14 +16,14 @@ limitations under the License.
 
 use crate::component::dataset::Dataset;
 use async_trait::async_trait;
-use data_components::{
-    graphql::{self, client::GraphQLClient, provider::GraphQLTableProviderBuilder},
-    token_provider::{StaticTokenProvider, TokenProvider},
+use data_components::graphql::{
+    self, client::GraphQLClient, provider::GraphQLTableProviderBuilder,
 };
 use datafusion::datasource::TableProvider;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
+use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
 use snafu::ResultExt;
 use std::{any::Any, future::Future, pin::Pin, sync::Arc};
+use token_provider::{StaticTokenProvider, TokenProvider};
 use url::Url;
 
 use super::{
@@ -31,11 +31,12 @@ use super::{
     InvalidConfigurationSnafu, ParameterSpec, Parameters,
 };
 
+#[derive(Debug)]
 pub struct GraphQL {
     params: Parameters,
 }
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Debug, Copy, Clone)]
 pub struct GraphQLFactory {}
 
 impl GraphQLFactory {
@@ -110,8 +111,8 @@ pub(crate) fn default_spice_client(content_type: &'static str) -> reqwest::Resul
 
 impl GraphQL {
     fn get_client(&self, dataset: &Dataset) -> super::DataConnectorResult<GraphQLClient> {
-        let token = self.params.get("auth_token").expose().ok().map(|token| {
-            Arc::new(StaticTokenProvider::new(token.into())) as Arc<dyn TokenProvider>
+        let token = self.params.get("auth_token").ok().map(|token| {
+            Arc::new(StaticTokenProvider::new(token.clone())) as Arc<dyn TokenProvider>
         });
 
         let user = self

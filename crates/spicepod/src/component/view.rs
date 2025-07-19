@@ -21,7 +21,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::{Nameable, WithDependsOn};
+use super::{Nameable, WithDependsOn, dataset::ReadyState, is_default};
+use crate::{acceleration::Acceleration, semantic::Column};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -34,6 +35,9 @@ pub struct View {
     #[serde(default)]
     pub metadata: HashMap<String, Value>,
 
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub columns: Vec<Column>,
+
     /// Inline SQL that describes a view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sql: Option<String>,
@@ -41,6 +45,12 @@ pub struct View {
     /// Reference to a SQL file that describes a view.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sql_ref: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceleration: Option<Acceleration>,
+
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub ready_state: ReadyState,
 
     #[serde(skip_serializing_if = "Vec::is_empty")]
     #[serde(rename = "dependsOn", default)]
@@ -60,8 +70,11 @@ impl View {
             name,
             description: None,
             metadata: HashMap::default(),
+            columns: vec![],
             sql: None,
             sql_ref: None,
+            acceleration: None,
+            ready_state: ReadyState::default(),
             depends_on: Vec::default(),
         }
     }
@@ -73,8 +86,11 @@ impl WithDependsOn<View> for View {
             name: self.name.clone(),
             description: self.description.clone(),
             metadata: self.metadata.clone(),
+            columns: vec![],
             sql: self.sql.clone(),
             sql_ref: self.sql_ref.clone(),
+            acceleration: self.acceleration.clone(),
+            ready_state: self.ready_state,
             depends_on: depends_on.to_vec(),
         }
     }

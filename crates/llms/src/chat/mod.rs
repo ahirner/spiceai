@@ -19,13 +19,14 @@ use async_stream::stream;
 use async_trait::async_trait;
 use futures::{Stream, StreamExt, TryStreamExt};
 use nsql::SqlGeneration;
-use rand::distributions::Alphanumeric;
-use rand::{thread_rng, Rng};
-use secrecy::Secret;
+use rand::distr::Alphanumeric;
+use rand::{Rng, rng};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::{path::Path, pin::Pin};
 use tracing_futures::Instrument;
 
@@ -71,57 +72,99 @@ pub enum LlmRuntime {
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to check the status of the model.\nAn error occurred: {source}\nVerify the model configuration."))]
+    #[snafu(display(
+        "Failed to check the status of the model.\nAn error occurred: {source}\nVerify the model configuration."
+    ))]
     HealthCheckError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to run the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to run the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToRunModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to find the Local model at '{expected_path}'.\nVerify the model exists, and try again."))]
+    #[snafu(display(
+        "Failed to find the Local model at '{expected_path}'.\nVerify the model exists, and try again."
+    ))]
     LocalModelNotFound { expected_path: String },
 
-    #[snafu(display("Failed to find the Local model config at '{expected_path}'.\nVerify the model config exists, and try again."))]
+    #[snafu(display(
+        "Failed to find the Local model config at '{expected_path}'.\nVerify the model config exists, and try again."
+    ))]
     LocalModelConfigNotFound { expected_path: String },
 
-    #[snafu(display("Failed to find the Local tokenizer at '{expected_path}'.\nVerify the tokenizer exists, and try again."))]
+    #[snafu(display(
+        "Failed to find the Local tokenizer at '{expected_path}'.\nVerify the tokenizer exists, and try again."
+    ))]
     LocalTokenizerNotFound { expected_path: String },
 
-    #[snafu(display("Failed to load the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "Failed to load the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToLoadModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Unsupported value for `model_type` parameter.\n{source}\n Verify the `model_type` parameter, and try again"))]
+    #[snafu(display(
+        "Unsupported value for `model_type` parameter.\n{source}\n Verify the `model_type` parameter, and try again"
+    ))]
     UnsupportedModelType {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("The specified model identifier '{model}' is not valid for the source '{model_source}'.\nVerify the model exists, and try again."))]
+    #[snafu(display(
+        "The specified model identifier '{model}' is not valid for the source '{model_source}'.\nVerify the model exists, and try again."
+    ))]
     ModelNotFound { model: String, model_source: String },
 
-    #[snafu(display("Failed to load model tokenizer.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"))]
+    #[snafu(display(
+        "A model identifier must be provided for source '{model_source}' via `from: {model_source}:<model_id>`"
+    ))]
+    ModelNotProvided { model_source: String },
+
+    #[snafu(display(
+        "Failed to load model tokenizer.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+    ))]
     FailedToLoadTokenizer {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("An unsupported model source was specified in the 'from' parameter: '{from}'.\nSpecify a valid source, like 'openai', and try again.\nFor details, visit: https://spiceai.org/docs/components/models"))]
+    #[snafu(display(
+        "An unsupported model source was specified in the 'from' parameter: '{from}'.\nSpecify a valid source, like 'openai', and try again.\nFor details, visit: https://spiceai.org/docs/components/models"
+    ))]
     UnknownModelSource { from: String },
 
-    #[snafu(display("The specified model, '{from}', does not support executing the task '{task}'.\nSelect a different model or task, and try again."))]
+    #[snafu(display(
+        "The specified model, '{from}', does not support executing the task '{task}'.\nSelect a different model or task, and try again."
+    ))]
     UnsupportedTaskForModel { from: String, task: String },
 
     #[snafu(display("Invalid value for parameter {param}. {message}"))]
-    InvalidParamError { param: String, message: String },
+    InvalidParamValueError { param: String, message: String },
 
-    #[snafu(display("Failed to find weights for the model.\nExpected tensors with a file extension of: {extensions}.\nVerify the model is correctly configured, and try again."))]
+    #[snafu(display("Expected `param.{param_key}`, but it was not provided"))]
+    MissingParamError { param_key: &'static str },
+
+    #[snafu(display(
+        "Failed to find weights for the model.\nExpected tensors with a file extension of: {extensions}.\nVerify the model is correctly configured, and try again."
+    ))]
     ModelMissingWeights { extensions: String },
 
-    #[snafu(display("Failed to load a file specified for the model.\nCould not find the file: {file_url}.\nVerify the `files` parameters for the model, and try again."))]
+    #[snafu(display(
+        "Failed to load a file specified for the model.\nCould not find the file: {file_url}.\nVerify the `files` parameters for the model, and try again."
+    ))]
     ModelFileMissing { file_url: String },
+
+    #[snafu(display(
+        "Invalid parameters for model '{model}':\n{source}\nVerify the model parameters, and try again."
+    ))]
+    ModelParameterFailed {
+        model: String,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -280,7 +323,7 @@ pub fn message_to_mistral(
         ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessageContent,
     };
     use either::Either;
-    use serde_json::{json, Value};
+    use serde_json::{Value, json};
 
     match message {
         ChatCompletionRequestMessage::User(ChatCompletionRequestUserMessage {
@@ -439,7 +482,7 @@ pub fn message_to_mistral(
                     // Use Some(""), not None as it is more compatible with many open source `chat_template`s.
                     map.insert("content".to_string(), Either::Left(String::new()));
                 }
-            };
+            }
             if let Some(name) = name {
                 map.insert("name".to_string(), Either::Left(name.clone()));
             }
@@ -487,12 +530,14 @@ pub trait Chat: Sync + Send {
 
         async move {
             let req = CreateChatCompletionRequestArgs::default()
-                .messages(vec![ChatCompletionRequestSystemMessageArgs::default()
-                    .content(prompt)
-                    .build()
-                    .boxed()
-                    .context(FailedToLoadTokenizerSnafu)?
-                    .into()])
+                .messages(vec![
+                    ChatCompletionRequestSystemMessageArgs::default()
+                        .content(prompt)
+                        .build()
+                        .boxed()
+                        .context(FailedToLoadTokenizerSnafu)?
+                        .into(),
+                ])
                 .build()
                 .boxed()
                 .context(FailedToLoadModelSnafu)?;
@@ -571,7 +616,7 @@ pub trait Chat: Sync + Send {
             })
         })?;
 
-        let strm_id: String = thread_rng()
+        let strm_id: String = rng()
             .sample_iter(&Alphanumeric)
             .take(10)
             .map(char::from)
@@ -657,7 +702,7 @@ pub trait Chat: Sync + Send {
             id: format!(
                 "{}-{}",
                 model_id.clone(),
-                thread_rng()
+                rng()
                     .sample_iter(&Alphanumeric)
                     .take(10)
                     .map(char::from)
@@ -682,26 +727,27 @@ pub trait Chat: Sync + Send {
 /// `from_gguf` is a path to a GGUF file within the huggingface model repo. If provided, the model will be loaded from this GGUF. This is useful for loading quantized models.
 /// `hf_token_literal` is a literal string of the Huggingface API token. If not provided, the token will be read from the HF token cache (i.e. `~/.cache/huggingface/token` or set via `HF_TOKEN_PATH`).
 #[cfg(feature = "mistralrs")]
-pub fn create_hf_model(
-    model_id: &str,
+pub async fn create_hf_model(
+model_id: &str,
     model_type: Option<&str>,
     from_gguf: Option<PathBuf>,
-    hf_token_literal: Option<&Secret<String>>,
-) -> Result<Box<dyn Chat>> {
+    hf_token_literal: Option<&SecretString>,
+) -> Result<Arc<dyn Chat>> {
     mistral::MistralLlama::from_hf(model_id, model_type, hf_token_literal, from_gguf)
-        .map(|x| Box::new(x) as Box<dyn Chat>)
+        .await
+        .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }
 
 #[cfg(feature = "mistralrs")]
 #[allow(unused_variables)]
-pub fn create_local_model(
+pub async fn create_local_model(
     model_weights: &[String],
     config: Option<&str>,
     tokenizer: Option<&str>,
     tokenizer_config: Option<&str>,
     generation_config: Option<&str>,
     chat_template_literal: Option<&str>,
-) -> Result<Box<dyn Chat>> {
+) -> Result<Arc<dyn Chat>> {
     mistral::MistralLlama::from(
         model_weights
             .iter()
@@ -716,5 +762,6 @@ pub fn create_local_model(
         generation_config.map(Path::new),
         chat_template_literal,
     )
-    .map(|x| Box::new(x) as Box<dyn Chat>)
+    .await
+    .map(|x| Arc::new(x) as Arc<dyn Chat>)
 }

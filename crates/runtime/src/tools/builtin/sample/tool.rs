@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use crate::{
-    tools::{utils::parameters, SpiceModelTool},
-    Runtime,
+    datafusion::DataFusion,
+    tools::{SpiceModelTool, utils::parameters},
 };
 use arrow::util::pretty::pretty_format_batches;
 use arrow_tools::record_batch::{truncate_numeric_column_length, truncate_string_columns};
@@ -27,14 +27,16 @@ use tracing::Span;
 use tracing_futures::Instrument;
 
 use super::{
-    distinct::DistinctColumnsParams, RandomSampleParams, SampleFrom, SampleTableMethod,
-    TopSamplesParams,
+    RandomSampleParams, SampleFrom, SampleTableMethod, TopSamplesParams,
+    distinct::DistinctColumnsParams,
 };
 
 /// A tool to sample data from a table in a variety of ways. How data is sampled is determined by
 /// the [`ExploreTableMethod`] and the corresponding [`SampleFrom`].
 pub struct SampleDataTool {
     method: SampleTableMethod,
+
+    df: Arc<DataFusion>,
 
     // Overrides
     name: Option<String>,
@@ -43,8 +45,9 @@ pub struct SampleDataTool {
 
 impl SampleDataTool {
     #[must_use]
-    pub fn new(method: SampleTableMethod) -> Self {
+    pub fn new(df: Arc<DataFusion>, method: SampleTableMethod) -> Self {
         Self {
+            df,
             method,
             name: None,
             description: None,
@@ -83,16 +86,12 @@ impl SpiceModelTool for SampleDataTool {
         }
     }
 
-    async fn call(
-        &self,
-        arg: &str,
-        rt: Arc<Runtime>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let params = self.method.parse_args(arg).boxed()?;
         let span: Span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::sample_data", tool = self.name().to_string(), input = format!("{params}"), sample_method = self.method.name());
 
         async {
-            let mut batch = params.sample(rt.datafusion()).await?;
+            let mut batch = params.sample(Arc::clone(&self.df)).await?;
 
             // truncate large text fields
             batch = truncate_string_columns(&batch, 512)?;

@@ -25,21 +25,22 @@ use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{project_schema, Constraint, Constraints},
+    common::{Constraint, Constraints, project_schema},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, TableProviderFilterPushDown},
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
-        ExecutionPlan, Partitioning, PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
+        execution_plan::{Boundedness, EmissionType},
+        stream::RecordBatchStreamAdapter,
     },
 };
 
 use futures::Stream;
 use futures::StreamExt;
-use object_store::{path::Path, ObjectMeta, ObjectStore};
+use object_store::{ObjectMeta, ObjectStore, path::Path};
 
 use super::ObjectStoreContext;
 use url::Url;
@@ -99,12 +100,8 @@ impl ObjectStoreMetadataTable {
                 .map(|meta| meta.last_modified.timestamp_millis())
                 .collect::<Vec<_>>(),
         );
-        let size_array = UInt64Array::from(
-            meta_list
-                .iter()
-                .map(|meta| meta.size as u64)
-                .collect::<Vec<_>>(),
-        );
+        let size_array =
+            UInt64Array::from(meta_list.iter().map(|meta| meta.size).collect::<Vec<_>>());
         let e_tag_array = StringArray::from(
             meta_list
                 .iter()
@@ -265,7 +262,8 @@ impl ObjectStoreMetadataExec {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Bounded,
+                EmissionType::Incremental,
+                Boundedness::Bounded,
             ),
             ctx,
         }

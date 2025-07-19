@@ -15,19 +15,21 @@ limitations under the License.
 */
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
+use crate::component::dataset::builder::DatasetBuilder;
 use crate::{
+    App, Runtime,
     component::{catalog::Catalog, dataset::Dataset},
     dataconnector::{
+        DataConnector, DataConnectorFactory,
+        parameters::{ConnectorParams, ConnectorParamsBuilder},
         spiceai::{SpiceAI, SpiceAIDatasetPath, SpiceAIFactory},
-        ConnectorParams, ConnectorParamsBuilder, DataConnector, DataConnectorFactory,
     },
     parameters::ExposedParamLookup,
-    Runtime,
 };
 use async_trait::async_trait;
 use data_components::{
-    iceberg::catalog::RestCatalog, spice_cloud::provider::SpiceCloudPlatformCatalogProvider, Read,
-    RefreshableCatalogProvider,
+    Read, RefreshableCatalogProvider, iceberg::catalog::RestCatalog,
+    spice_cloud::provider::SpiceCloudPlatformCatalogProvider,
 };
 use iceberg::NamespaceIdent;
 use iceberg_catalog_rest::RestCatalogConfig;
@@ -57,7 +59,7 @@ impl SpiceCloudPlatformCatalog {
 
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
-        runtime: &Runtime,
+        runtime: Arc<Runtime>,
         catalog: &Catalog,
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let (org, app, catalog_name) = Self::parse_and_validate_catalog_id(catalog)?;
@@ -120,7 +122,7 @@ impl SpiceCloudPlatformCatalog {
         let mut props = HashMap::new();
         if let ExposedParamLookup::Present(api_key) = self.params.get("api_key").expose() {
             props.insert("token".to_string(), api_key.to_string());
-        };
+        }
 
         let catalog_config = RestCatalogConfig::builder()
             .uri(endpoint.to_string())
@@ -132,14 +134,27 @@ impl SpiceCloudPlatformCatalog {
 
     async fn create_read_provider(
         &self,
-        runtime: &Runtime,
+        runtime: Arc<Runtime>,
         catalog: &Catalog,
         org: &str,
         app: &str,
         catalog_name: &str,
     ) -> super::Result<Arc<dyn Read>> {
+        let app_ref = runtime.app();
+        let app_lock = app_ref.read().await;
+        let runtime_app = match app_lock.as_ref() {
+            Some(app) => Arc::clone(app),
+            None => {
+                return Err(super::Error::FailedToGetAppFromRuntime {});
+            }
+        };
+
         let connector_factory = self
-            .create_data_connector(runtime, catalog, self.create_template_dataset())
+            .create_data_connector(
+                Arc::clone(&runtime),
+                catalog,
+                self.create_template_dataset(runtime, runtime_app),
+            )
             .await?;
 
         let Some(data_connector) = connector_factory.as_any().downcast_ref::<SpiceAI>() else {
@@ -158,8 +173,17 @@ impl SpiceCloudPlatformCatalog {
         Ok(Arc::new(flight_factory))
     }
 
-    fn create_template_dataset(&self) -> Dataset {
-        let Ok(template_dataset) = Dataset::try_new("spice.ai".into(), "template") else {
+    fn create_template_dataset(&self, runtime: Arc<Runtime>, app: Arc<App>) -> Dataset {
+        let Ok(template_dataset_builder) = DatasetBuilder::try_new("spice.ai".into(), "template")
+        else {
+            unreachable!("'template' is a valid dataset name");
+        };
+
+        let Ok(template_dataset) = template_dataset_builder
+            .with_app(app)
+            .with_runtime(runtime)
+            .build()
+        else {
             unreachable!("'template' is a valid dataset name");
         };
 
@@ -179,7 +203,7 @@ impl SpiceCloudPlatformCatalog {
 
     async fn create_data_connector(
         &self,
-        runtime: &Runtime,
+        runtime: Arc<Runtime>,
         catalog: &Catalog,
         template_dataset: Dataset,
     ) -> super::Result<Arc<dyn DataConnector>> {
@@ -233,7 +257,7 @@ impl CatalogConnector for SpiceCloudPlatformCatalog {
 
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
-        runtime: &Runtime,
+        runtime: Arc<Runtime>,
         catalog: &Catalog,
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         self.refreshable_catalog_provider(runtime, catalog).await

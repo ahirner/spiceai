@@ -19,9 +19,8 @@ use text_splitter::{Characters, ChunkCapacity, ChunkConfig, ChunkConfigError, Ch
 use tokenizers::Tokenizer;
 
 use tiktoken_rs::{
-    get_bpe_from_tokenizer,
-    tokenizer::{get_tokenizer, Tokenizer as OpenAITokenizer},
-    CoreBPE,
+    CoreBPE, get_bpe_from_tokenizer,
+    tokenizer::{Tokenizer as OpenAITokenizer, get_tokenizer},
 };
 
 #[derive(Debug, Clone)]
@@ -60,18 +59,19 @@ pub struct RecursiveSplittingChunker<Sizer: ChunkSizer> {
 
 impl<Sizer: ChunkSizer> RecursiveSplittingChunker<Sizer> {
     pub fn try_new(cfg: &ChunkingConfig, sizer: Sizer) -> Result<Self, ChunkConfigError> {
-        let cfg_with_overlap: ChunkConfig<Sizer> =
-            ChunkConfig::new(ChunkCapacity::new(cfg.target_chunk_size))
-                .with_trim(cfg.trim_whitespace)
-                .with_sizer(sizer)
-                .with_overlap(cfg.overlap_size)
-                .inspect_err(|_| {
-                    tracing::warn!(
+        let cfg_with_overlap: ChunkConfig<Sizer> = ChunkConfig::new(ChunkCapacity::new(
+            cfg.target_chunk_size,
+        ))
+        .with_trim(cfg.trim_whitespace)
+        .with_sizer(sizer)
+        .with_overlap(cfg.overlap_size)
+        .inspect_err(|_| {
+            tracing::warn!(
                 "Cannot have overlap ({overlap}) >= target_chunk_size ({target_chunk_size})",
                 overlap = cfg.overlap_size,
                 target_chunk_size = cfg.target_chunk_size
             );
-                })?;
+        })?;
 
         let splitter = match cfg.file_format {
             Some("md" | ".md" | "mdx" | ".mdx") => {
@@ -104,7 +104,7 @@ impl From<Arc<dyn ChunkSizer + Send + Sync>> for ArcSizer {
 }
 
 /// Basic wrapper around a [`Arc<Tokenizer>`], so as to be able to `impl ChunkSizer for TokenizerWrapper`.
-pub(crate) struct TokenizerWrapper(Arc<Tokenizer>);
+pub struct TokenizerWrapper(Arc<Tokenizer>);
 
 impl ChunkSizer for TokenizerWrapper {
     fn size(&self, chunk: &str) -> usize {
@@ -157,7 +157,7 @@ mod tests {
     use crate::{
         embeddings::Embed,
         openai::{
-            embed::{OpenaiEmbed, DEFAULT_EMBEDDING_MODEL},
+            embed::{DEFAULT_EMBEDDING_MODEL, OpenaiEmbed},
             new_openai_client,
         },
     };

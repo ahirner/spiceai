@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{collections::HashMap, fmt::Display, sync::Arc};
 
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use snafu::prelude::*;
 use tokio::sync::RwLock;
 
@@ -58,8 +58,8 @@ impl Parameters {
 
         if !prefix_removed && spec.r#type.is_prefixed() {
             tracing::warn!(
-            "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {component_name}."
-        );
+                "Ignoring parameter {key}: must be prefixed with `{full_prefix}` for {component_name}."
+            );
             return None;
         }
 
@@ -192,7 +192,9 @@ impl Parameters {
         if let Some(spec) = self.all_params.iter().find(|p| p.name == name) {
             spec
         } else {
-            panic!("Parameter `{name}` not found in parameters list. Add it to the parameters() list on the DataConnectorFactory or DataAccelerator.");
+            panic!(
+                "Parameter `{name}` not found in parameters list. Add it to the parameters() list on the DataConnectorFactory or DataAccelerator."
+            );
         }
     }
 
@@ -220,13 +222,44 @@ impl Parameters {
     pub fn iter(&self) -> std::slice::Iter<'_, (String, SecretString)> {
         self.params.iter()
     }
+
+    #[must_use]
+    pub fn get_runtime_params(&self) -> HashMap<String, SecretString> {
+        self.params
+            .iter()
+            .filter(|p| !self.describe(&p.0).r#type.is_prefixed())
+            .cloned()
+            .collect()
+    }
+
+    #[must_use]
+    pub fn get_component_params(&self) -> HashMap<String, SecretString> {
+        self.params
+            .iter()
+            .filter(|p| self.describe(&p.0).r#type.is_prefixed())
+            .cloned()
+            .collect()
+    }
 }
 
 #[derive(Clone)]
 pub struct Parameters {
     params: Vec<(String, SecretString)>,
-    prefix: &'static str,
+    pub(crate) prefix: &'static str,
     all_params: &'static [ParameterSpec],
+}
+
+impl std::fmt::Debug for Parameters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Parameters")
+            .field(
+                "params",
+                &self.params.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+            )
+            .field("prefix", &self.prefix)
+            .field("all_params", &self.all_params)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<'a> IntoIterator for &'a Parameters {
@@ -264,7 +297,9 @@ impl<'a> ParamLookup<'a> {
     #[must_use]
     pub fn expose(self) -> ExposedParamLookup<'a> {
         match self {
-            ParamLookup::Present(s) => ExposedParamLookup::Present(s.expose_secret()),
+            ParamLookup::Present(s) => {
+                ExposedParamLookup::Present(secrecy::ExposeSecret::expose_secret(s))
+            }
             ParamLookup::Absent(s) => ExposedParamLookup::Absent(s),
         }
     }
@@ -306,7 +341,7 @@ impl<'a> ExposedParamLookup<'a> {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct ParameterSpec {
     pub name: &'static str,
     pub required: bool,
@@ -427,6 +462,7 @@ impl Display for ParameterType {
 }
 
 impl ParameterType {
+    #[must_use]
     pub const fn is_prefixed(self) -> bool {
         matches!(self, Self::Component)
     }

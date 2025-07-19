@@ -14,22 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{rate_limit::RateLimiter, token_provider::TokenProvider};
+use crate::rate_limit::RateLimiter;
+use token_provider::TokenProvider;
 
 use super::{ArrowInternalSnafu, Error, ErrorChecker, ReqwestInternalSnafu, Result};
 use arrow::{
     array::RecordBatch,
     datatypes::SchemaRef,
-    json::{reader::infer_json_schema_from_iterator, ReaderBuilder},
+    json::{ReaderBuilder, reader::infer_json_schema_from_iterator},
 };
 use graphql_parser::query::{
-    parse_query, Definition, Document, Field, InlineFragment, OperationDefinition, Query,
-    Selection, SelectionSet, Text,
+    Definition, Document, Field, InlineFragment, OperationDefinition, Query, Selection,
+    SelectionSet, Text, parse_query,
 };
 use regex::Regex;
 use reqwest::{RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use snafu::ResultExt;
 use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc};
 
@@ -309,7 +310,7 @@ impl PaginationParameters {
     ///      node {
     ///        id
     ///        name
-    ///        email   
+    ///        email
     ///      }
     ///      pageInfo {
     ///        hasNextPage
@@ -326,7 +327,7 @@ impl PaginationParameters {
     ///      node {
     ///        id
     ///        name
-    ///        email   
+    ///        email
     ///      }
     ///      edges {
     ///        friends {
@@ -376,7 +377,7 @@ impl PaginationParameters {
         tracing::trace!("For PaginationParameters, searching json_pointer path: {current_path}");
         for selection in selections {
             match selection {
-                graphql_parser::query::Selection::FragmentSpread(_) => continue,
+                graphql_parser::query::Selection::FragmentSpread(_) => {}
                 graphql_parser::query::Selection::InlineFragment(InlineFragment {
                     selection_set,
                     ..
@@ -447,7 +448,9 @@ impl PaginationParameters {
 
                         // Check [`PaginationArgument`] and `pageInfo` fields are consistent.
                         if let Err(e) = pagination_argument.validate_page_info(field) {
-                            tracing::warn!("GraphQL query has pagination specified ({pagination_argument}), but invalid pagination fields: {e}");
+                            tracing::warn!(
+                                "GraphQL query has pagination specified ({pagination_argument}), but invalid pagination fields: {e}"
+                            );
                             return (None, None);
                         }
 
@@ -549,7 +552,7 @@ fn unnest_json_object(unnest_parameters: &UnnestParameters, object: &Value) -> R
 
             new_object.retain(|_, value| {
                 match value {
-                    Value::Object(ref mut inner_obj) => {
+                    Value::Object(inner_obj) => {
                         inner_obj.retain(|inner_key, inner_value| {
                             additions.push((inner_key.clone(), inner_value.clone())); // add the inner key to the additions list
                             false
@@ -655,6 +658,12 @@ impl TryFrom<Arc<str>> for GraphQLQuery {
 
 impl GraphQLQuery {
     #[must_use]
+    pub fn with_json_pointer(mut self, json_pointer: Arc<str>) -> Self {
+        self.json_pointer = Some(json_pointer);
+        self
+    }
+
+    #[must_use]
     pub fn to_string(&self, limit: Option<usize>, cursor: Option<String>) -> String {
         let query = self.ast.to_string();
 
@@ -694,7 +703,6 @@ impl GraphQLQuery {
 
 pub(crate) struct GraphQLQueryResult {
     pub(crate) records: Vec<RecordBatch>,
-    record_count: usize,
     limit_reached: bool,
     pub(crate) schema: SchemaRef,
     cursor: Option<String>,
@@ -760,7 +768,7 @@ impl GraphQLClient {
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
         let mut request = self.client.post(self.endpoint.clone()).body(body);
-        request = request_with_auth(request, self.auth.as_ref()).await;
+        request = request_with_auth(request, self.auth.as_ref());
 
         let response = request.send().await.context(ReqwestInternalSnafu)?;
         let response_headers = response.headers().clone();
@@ -824,13 +832,10 @@ impl GraphQLClient {
             res.extend(batch);
         }
 
-        let record_count = res.len();
-
-        let limit_reached = query.limit_reached(limit, record_count);
+        let limit_reached = query.limit_reached(limit, res.len());
 
         Ok(GraphQLQueryResult {
             records: res,
-            record_count,
             limit_reached,
             schema: Arc::clone(&schema),
             cursor: next_cursor,
@@ -875,8 +880,8 @@ impl GraphQLClient {
 
             while let Some(next_cursor_val) = result.cursor {
                 if let Some(p) = query.pagination_parameters.as_ref() {
-                    if limit.is_some() {
-                        limit = Some(p.reduce_limit(result.record_count));
+                    if let Some(value) = limit {
+                        limit = Some(p.reduce_limit(value));
                     }
                 }
 
@@ -927,14 +932,11 @@ fn get_json_schema(
     Ok(Arc::new(schema))
 }
 
-async fn request_with_auth(request_builder: RequestBuilder, auth: Option<&Auth>) -> RequestBuilder {
+fn request_with_auth(request_builder: RequestBuilder, auth: Option<&Auth>) -> RequestBuilder {
     match auth {
         Some(Auth::Basic(user, pass)) => request_builder.basic_auth(user, pass.clone()),
         Some(Auth::Bearer(token_provider)) => {
-            if let Ok(token) = token_provider.get_token().await {
-                return request_builder.bearer_auth(&token);
-            }
-            request_builder
+            request_builder.bearer_auth(token_provider.get_token())
         }
         _ => request_builder,
     }
@@ -955,13 +957,17 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
         .to_string();
 
         return match status {
-            StatusCode::UNAUTHORIZED => {
-                Err(Error::InvalidCredentialsOrPermissions { message: format!("The API failed with status code {status}.\nVerify the provided credentials are correct.") })
-            },
-            StatusCode::FORBIDDEN => {
-                Err(Error::InvalidCredentialsOrPermissions { message: format!("The API failed with status code {status}.\nVerify the provided credentials have the necessary permissions.") })
-            },
-            _ => Err(Error::InvalidReqwestStatus { status, message })
+            StatusCode::UNAUTHORIZED => Err(Error::InvalidCredentialsOrPermissions {
+                message: format!(
+                    "The API failed with status code {status}.\nVerify the provided credentials are correct."
+                ),
+            }),
+            StatusCode::FORBIDDEN => Err(Error::InvalidCredentialsOrPermissions {
+                message: format!(
+                    "The API failed with status code {status}.\nVerify the provided credentials have the necessary permissions."
+                ),
+            }),
+            _ => Err(Error::InvalidReqwestStatus { status, message }),
         };
     }
     Ok(())
@@ -993,7 +999,18 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
 
         if let Some(error_type) = error_type {
             if error_type.to_lowercase() == "forbidden" {
-                return Err(Error::InvalidCredentialsOrPermissions { message: format!("The API returned a 'FORBIDDEN' error.\nVerify the credentials have the necessary permissions.\n{message}") });
+                return Err(Error::InvalidCredentialsOrPermissions {
+                    message: format!(
+                        "The API returned a 'FORBIDDEN' error.\nVerify the credentials have the necessary permissions.\n{message}"
+                    ),
+                });
+            }
+            if error_type.to_lowercase() == "not_found" {
+                return Err(Error::ResourceNotFound {
+                    message: format!(
+                        "The API returned a 'NOT_FOUND' error.\nVerify the requsted resource exists and is accessible.\n{message}"
+                    ),
+                });
             }
         }
 
@@ -1043,7 +1060,7 @@ mod tests {
 
     use crate::graphql::client::GraphQLQuery;
 
-    use super::{handle_http_error, DuplicateBehavior, PaginationParameters};
+    use super::{DuplicateBehavior, PaginationParameters, handle_http_error};
 
     struct TestPaginationParseCase {
         name: &'static str,
@@ -1526,8 +1543,7 @@ mod tests {
 
         assert!(result.is_err());
 
-        #[allow(clippy::unwrap_used)]
-        let err = result.unwrap_err();
+        let err = result.expect_err("Failed to unnest JSON object");
         assert_eq!(
             err.to_string(),
             "Invalid object access. Column 'a' already exists in the object."
