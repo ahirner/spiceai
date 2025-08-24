@@ -27,10 +27,7 @@ use crate::component::dataset::{Dataset, Mode, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::AcceleratorEngineRegistry;
 use crate::dataaccelerator::spice_sys::dataset_checkpoint::DatasetCheckpoint;
-use crate::dataaccelerator::{
-    self,
-    behaviors::{Behavior, Behaviors},
-};
+use crate::dataaccelerator::{self};
 use crate::dataconnector::deferred::DeferredConnector;
 use crate::dataconnector::localpod::LOCALPOD_DATACONNECTOR;
 use crate::dataconnector::sink::SinkConnector;
@@ -183,14 +180,14 @@ pub enum Error {
         source: DataFusionError,
     },
 
-    #[snafu(display("Failed to refresh the dataset {dataset_name}.\n{source}"))]
+    #[snafu(display("Failed to refresh the dataset {dataset_name}. {source}"))]
     UnableToTriggerRefresh {
         dataset_name: String,
         source: crate::accelerated_table::Error,
     },
 
     #[snafu(display(
-        "Changing the schema of an accelerated table via the Refresh SQL is not allowed.\nRetry the request, changing the SELECT statement from 'SELECT {selected_columns}' to 'SELECT {refresh_columns}'"
+        "Changing the schema of an accelerated table via the Refresh SQL is not allowed. Retry the request, changing the SELECT statement from 'SELECT {selected_columns}' to 'SELECT {refresh_columns}'"
     ))]
     RefreshSqlSchemaChangeDisallowed {
         dataset_name: Arc<str>,
@@ -241,7 +238,7 @@ pub enum Error {
     InvalidTimeColumnTimeFormat { source: refresh::Error },
 
     #[snafu(display(
-        "Acceleration mode `append` requires `time_column` parameter for source {from}.\nConfigure `time_column` parameter and try again.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#time_column"
+        "Acceleration mode `append` requires `time_column` parameter for source {from}. Configure `time_column` parameter and try again. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#time_column"
     ))]
     AppendRequiresTimeColumn { from: String },
 
@@ -249,7 +246,7 @@ pub enum Error {
     UnableToRetrieveTableFromFederation { table_name: String },
 
     #[snafu(display(
-        "Failed to create an accelerated table for the dataset {dataset_name}.\n{source}"
+        "Failed to create an accelerated table for the dataset {dataset_name}. {source}"
     ))]
     UnableToBuildAcceleratedTable {
         dataset_name: String,
@@ -257,7 +254,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create an accelerated table for {component_name}.\nError setting the underlying table provider: {source}"
+        "Failed to create an accelerated table for {component_name}. Error setting the underlying table provider: {source}"
     ))]
     UnableToSetUnderlyingTableProvider {
         component_name: String,
@@ -281,7 +278,7 @@ pub enum Table {
     Accelerated {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
-        accelerated_table: Option<AcceleratedTable>,
+        accelerated_table: Option<Arc<AcceleratedTable>>,
         secrets: Arc<TokioRwLock<Secrets>>,
     },
     Federated {
@@ -392,6 +389,7 @@ impl DataFusion {
     /// Register a table with its [`SchemaProvider`] if it exists and marks it as writable.
     ///
     /// This method is generally used for tables that are created by the Spice runtime.
+    #[allow(clippy::result_large_err)]
     pub fn register_table_as_writable_and_with_schema(
         &self,
         table_name: TableReference,
@@ -459,7 +457,7 @@ impl DataFusion {
                     self.ctx
                         .register_table(
                             dataset_table_ref.clone(),
-                            Arc::new(accelerated_table).table_provider(),
+                            accelerated_table.table_provider(),
                         )
                         .map_err(find_datafusion_root)
                         .context(UnableToRegisterTableToDataFusionSnafu)?;
@@ -896,7 +894,7 @@ impl DataFusion {
             FederatedTable::Deferred(_) => None,
         };
 
-        let (accelerated_table_provider, accelerated_table_behaviors) = self
+        let accelerated_table_provider = self
             .accelerator_engine_registry
             .create_accelerator_table(
                 dataset.name.clone(),
@@ -909,12 +907,6 @@ impl DataFusion {
             )
             .await
             .context(UnableToCreateDataAcceleratorSnafu)?;
-
-        handle_accelerated_table_behavior(
-            accelerated_table_behaviors,
-            &source_table_provider,
-            &dataset.name.to_string(),
-        )?;
 
         // If we already have an existing dataset checkpoint table that has been checkpointed,
         // it means there is data from a previous acceleration and we don't need
@@ -1322,6 +1314,7 @@ impl DataFusion {
         Ok(())
     }
 
+    #[allow(clippy::result_large_err)]
     pub(crate) fn register_view(
         self: &Arc<Self>,
         view: Arc<View>,
@@ -1352,6 +1345,11 @@ impl DataFusion {
         let df_ref = Arc::clone(self);
         let dependent_table_names = view::get_dependent_table_names(&statements[0]);
         let status = self.runtime_status();
+
+        tracing::debug!(
+            "Creating view {} with dependent tables {dependent_table_names:?}",
+            view.name
+        );
 
         let register_task: JoinHandle<Option<Arc<Notify>>> = spawn(async move {
             // Tables are currently lazily created (i.e. not created until first data is received) so that we know the table schema.
@@ -1401,11 +1399,14 @@ impl DataFusion {
                 return None;
             }
 
+            // If view depends on other tables, wait until they are ready
+            wait_until_dependent_tables_are_ready(table, &dependent_table_names, &status).await;
+
             let view_table = match create_view_table(&ctx, &statements[0], view.sql.as_ref()).await
             {
                 Ok(view_table) => view_table,
                 Err(e) => {
-                    tracing::error!("Failed to create view: {e}");
+                    tracing::error!("Failed to create view {table}: {e}");
                     status.update_view(table, status::ComponentStatus::Error);
                     return None;
                 }
@@ -1414,14 +1415,14 @@ impl DataFusion {
             if let Some(acceleration) = &view.acceleration {
                 if acceleration.enabled {
                     match df_ref
-                        .create_accelerated_view(&view, view_table, &dependent_table_names, secrets)
+                        .create_accelerated_view(&view, view_table, secrets)
                         .await
                     {
                         Ok(is_ready) => {
                             return is_ready;
                         }
                         Err(e) => {
-                            tracing::error!("Failed to create view: {e}");
+                            tracing::error!("Failed to create view {table}: {e}");
                             status.update_view(table, status::ComponentStatus::Error);
                             return None;
                         }
@@ -1431,7 +1432,7 @@ impl DataFusion {
 
             // non-accelerated view
             if let Err(e) = ctx.register_table(table.clone(), Arc::new(view_table)) {
-                tracing::error!("Failed to create view: {e}");
+                tracing::error!("Failed to create view {table}: {e}");
                 status.update_view(table, status::ComponentStatus::Error);
                 return None;
             }
@@ -1448,14 +1449,9 @@ impl DataFusion {
         self: &Arc<Self>,
         view: &View,
         view_table: ViewTable,
-        dependent_tables: &[TableReference],
         secrets: Arc<TokioRwLock<Secrets>>,
     ) -> Result<Option<Arc<Notify>>> {
         let table = &view.name;
-
-        tracing::debug!(
-            "Creating accelerated view {table} with dependent tables {dependent_tables:?}"
-        );
 
         let acceleration =
             view.acceleration
@@ -1464,17 +1460,11 @@ impl DataFusion {
                     name: table.to_string(),
                 })?;
 
-        let runtime_status = self.runtime_status();
-
-        // If accelerated view depends on other tables, wait until they are ready; this is required to complete
-        // initial data load and avoid errors indicating that the load can't be completed because tables are still loading or connecting
-        wait_until_dependent_tables_are_ready(table, dependent_tables, &runtime_status).await;
-
         let schema = view_table.schema();
         let federated_table =
             FederatedTable::new_unchecked(Arc::new(view_table) as Arc<dyn TableProvider>);
 
-        let (accelerated_table_provider, accelerated_table_behaviors) = self
+        let accelerated_table_provider = self
             .accelerator_engine_registry()
             .create_accelerator_table(
                 table.clone(),
@@ -1489,12 +1479,6 @@ impl DataFusion {
             .map_err(|e| Error::UnableToCreateView {
                 reason: format!("Failed to create view acceleration: {e}"),
             })?;
-
-        handle_accelerated_table_behavior(
-            accelerated_table_behaviors,
-            &federated_table,
-            &view.name.to_string(),
-        )?;
 
         // Detect if data for view was already loaded so we don't need to wait for the first refresh to complete to mark it as ready.
         let mut initial_load_complete = false;
@@ -1517,7 +1501,7 @@ impl DataFusion {
         }
 
         let mut builder = AcceleratedTable::builder(
-            Arc::clone(&runtime_status),
+            self.runtime_status(),
             table.clone(),
             federated_table.into(),
             "view".to_string(),
@@ -1618,6 +1602,7 @@ impl DataFusion {
             .collect_vec()
     }
 
+    #[allow(clippy::result_large_err)]
     pub fn get_public_table_names(&self) -> Result<Vec<String>> {
         Ok(self
             .ctx
@@ -1732,29 +1717,6 @@ fn resolve_table_reference(table: TableReference) -> ResolvedTableReference {
     table.resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
 }
 
-pub fn handle_accelerated_table_behavior(
-    accelerated_table_behaviors: Behaviors,
-    federated_table: &FederatedTable,
-    component_name: &str,
-) -> Result<()> {
-    for behavior in accelerated_table_behaviors {
-        match behavior {
-            Behavior::WantsUnderlyingTableProvider(wants_underlying_table_provider) => {
-                if let Some(underlying_provider) = federated_table.try_table_provider_sync() {
-                    wants_underlying_table_provider
-                        .set(underlying_provider)
-                        .map_err(find_datafusion_root)
-                        .context(UnableToSetUnderlyingTableProviderSnafu {
-                            component_name: component_name.to_string(),
-                        })?;
-                }
-            }
-        }
-    }
-
-    Ok(())
-}
-
 #[must_use]
 pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
     catalog == SPICE_DEFAULT_CATALOG
@@ -1775,6 +1737,11 @@ async fn wait_until_dependent_tables_are_ready(
     dependent_tables: &[TableReference],
     runtime_status: &Arc<status::RuntimeStatus>,
 ) {
+    tracing::debug!(
+        "Waiting for dependent tables {dependent_tables:?} to be ready for {table}",
+        table = table
+    );
+
     // Exponential retry with max duration of 10 seconds between retries
     let retry_strategy = FibonacciBackoffBuilder::new()
         .max_retries(None)

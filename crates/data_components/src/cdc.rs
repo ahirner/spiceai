@@ -16,10 +16,12 @@ limitations under the License.
 
 use std::{fmt::Display, sync::Arc};
 
+use arrow::error::ArrowError;
 use arrow::{
-    array::{Array, ListArray, RecordBatch, StringArray, StructArray},
+    array::{Array, ArrayRef, ListArray, RecordBatch, StringArray, StructArray},
     datatypes::{DataType, Field, Schema, SchemaRef},
 };
+use arrow_buffer::OffsetBuffer;
 use futures::stream::BoxStream;
 use snafu::prelude::*;
 
@@ -37,6 +39,8 @@ pub enum CommitError {
 pub enum ChangeBatchError {
     #[snafu(display("Schema didn't match expected change batch format {detail} schema={schema}"))]
     SchemaMismatch { detail: String, schema: SchemaRef },
+    #[snafu(display("Encountered an Arrow error while updating change batch data: {source}"))]
+    Arrow { source: ArrowError },
 }
 
 #[derive(Debug)]
@@ -44,6 +48,7 @@ pub enum StreamError {
     Kafka(String),
     SerdeJsonError(String),
     Flight(String),
+    Arrow(String),
 }
 
 impl std::error::Error for StreamError {}
@@ -54,6 +59,7 @@ impl std::fmt::Display for StreamError {
             StreamError::Kafka(e) => write!(f, "Kafka error: {e}"),
             StreamError::SerdeJsonError(e) => write!(f, "Serde JSON error: {e}"),
             StreamError::Flight(e) => write!(f, "Arrow Flight error: {e}"),
+            StreamError::Arrow(e) => write!(f, "Arrow error: {e}"),
         }
     }
 }
@@ -80,6 +86,22 @@ impl ChangeEnvelope {
     pub fn commit(self) -> Result<(), CommitError> {
         self.change_committer.commit()
     }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Box<dyn CommitChange + Send>, ChangeBatch) {
+        (self.change_committer, self.change_batch)
+    }
+
+    #[must_use]
+    pub fn from_parts(
+        change_committer: Box<dyn CommitChange + Send>,
+        change_batch: ChangeBatch,
+    ) -> Self {
+        Self {
+            change_committer,
+            change_batch,
+        }
+    }
 }
 
 /// The Arrow schema that represents a `ChangeEvent`
@@ -100,7 +122,7 @@ pub fn changes_schema(table_schema: &Schema) -> Schema {
     ])
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ChangeBatch {
     pub record: RecordBatch,
     op_idx: usize,
@@ -118,7 +140,6 @@ pub enum ChangeOperation {
 }
 
 impl From<&str> for ChangeOperation {
-    #[must_use]
     fn from(op: &str) -> Self {
         match op {
             "c" => Self::Create,
@@ -221,6 +242,24 @@ impl ChangeBatch {
         data_col.slice(row, 1).into()
     }
 
+    #[must_use]
+    pub fn data_batch(&self) -> RecordBatch {
+        let data_col = self.record.column(self.data_idx);
+        let Some(data_array) = data_col.as_any().downcast_ref::<StructArray>() else {
+            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
+        };
+        let DataType::Struct(fields) = data_array.data_type() else {
+            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
+        };
+        let Ok(record_batch) = RecordBatch::try_new(
+            Arc::new(Schema::new(fields.clone())),
+            data_array.columns().to_vec(),
+        ) else {
+            unreachable!("The schema is validated to have a 'data' field which is a StructArray");
+        };
+        record_batch
+    }
+
     fn validate_schema(schema: SchemaRef) -> Result<(), ChangeBatchError> {
         let Some(data_col) = schema.fields().iter().find(|field| field.name() == "data") else {
             return SchemaMismatchSnafu {
@@ -251,5 +290,141 @@ impl ChangeBatch {
         }
 
         Ok(())
+    }
+}
+
+/// Wraps an arbitrary data `RecordBatch` as a `ChangeBatch` with "create" operations.
+pub fn wrap_data_as_change_batch(
+    table_schema: &SchemaRef,
+    data: &RecordBatch,
+) -> Result<ChangeBatch, ChangeBatchError> {
+    let num_rows = data.num_rows();
+    let schema = changes_schema(table_schema);
+
+    // 1) op column ("create" operations)
+    let op_array = Arc::new(arrow::array::StringArray::from(vec![
+        "c".to_string();
+        num_rows
+    ]));
+
+    // 2) Dummy primary_keys: List<Utf8> with EMPTY LIST per row
+    // Offsets must be length = num_rows + 1. All zeros => [] for every row.
+    let offsets = vec![0i32; num_rows + 1];
+    let values = Arc::new(StringArray::from(Vec::<&str>::new())) as ArrayRef;
+    let primary_keys_array: ArrayRef = Arc::new(ListArray::new(
+        Arc::new(Field::new("item", DataType::Utf8, false)),
+        OffsetBuffer::new(offsets.into()),
+        values,
+        None, // no validity bitmap (all non-null lists)
+    ));
+
+    // 3) data: Struct matching the input batch's schema/columns
+    let data_array = Arc::new(StructArray::new(
+        data.schema().fields().clone(),
+        data.columns().to_vec(),
+        None,
+    ));
+
+    let columns = vec![op_array, primary_keys_array, data_array];
+    let record_batch = RecordBatch::try_new(schema.into(), columns).context(ArrowSnafu)?;
+
+    ChangeBatch::try_new(record_batch)
+}
+
+pub fn replace_change_batch_data(
+    new_data: &RecordBatch,
+    change: &ChangeBatch,
+) -> Result<ChangeBatch, ChangeBatchError> {
+    let schema = changes_schema(&new_data.schema());
+
+    let cols = change
+        .record
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| {
+            if f.name() == "data" {
+                Arc::new(StructArray::new(
+                    new_data.schema().fields().clone(),
+                    new_data.columns().to_vec(),
+                    None,
+                )) as Arc<dyn Array>
+            } else {
+                match change.record.column_by_name(f.name()) {
+                    Some(column) => Arc::clone(column),
+                    None => unreachable!("Column {} must exist", f.name()),
+                }
+            }
+        })
+        .collect();
+
+    RecordBatch::try_new(schema.into(), cols)
+        .map_err(|source| ChangeBatchError::Arrow { source })
+        .and_then(ChangeBatch::try_new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow_array::{Int32Array, StringArray};
+    use std::sync::Arc;
+
+    #[test]
+    fn test_wrap_batch_as_change_batch() {
+        // Create a test schema
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("name", DataType::Utf8, true),
+        ]));
+
+        // Create test data
+        let id_array = Arc::new(Int32Array::from(vec![1, 2, 3]));
+        let name_array = Arc::new(StringArray::from(vec!["Alice", "Bob", "Charlie"]));
+        let data_batch = RecordBatch::try_new(Arc::clone(&schema), vec![id_array, name_array])
+            .expect("to create data batch");
+
+        let change_batch =
+            wrap_data_as_change_batch(&schema, &data_batch).expect("to create change batch");
+
+        let record = &change_batch.record;
+
+        // Verify the schema has the expected fields
+        assert_eq!(record.schema().fields().len(), 3);
+        // Verify the number of rows
+        assert_eq!(record.num_rows(), 3);
+
+        // Verify the op column
+        let op_column = record
+            .column_by_name("op")
+            .expect("op column exists")
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("op column is StringArray");
+        for i in 0..3 {
+            assert_eq!(op_column.value(i), "c");
+        }
+
+        // Verify the primary_keys column (should be empty lists)
+        let pk_column = record
+            .column_by_name("primary_keys")
+            .expect("primary_keys column exists")
+            .as_any()
+            .downcast_ref::<ListArray>()
+            .expect("primary_keys column is ListArray");
+        assert_eq!(pk_column.len(), 3);
+        for i in 0..3 {
+            assert_eq!(pk_column.value_length(i), 0);
+        }
+
+        // Verify the data column
+        let data_column = record
+            .column_by_name("data")
+            .expect("data column exists")
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .expect("data column is StructArray");
+        assert_eq!(data_column.len(), 3);
+        assert_eq!(data_column.num_columns(), 2);
     }
 }

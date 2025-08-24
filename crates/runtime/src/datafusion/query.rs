@@ -94,7 +94,7 @@ thread_local! {
 }
 
 pub enum QueryMethod {
-    Plan(LogicalPlan),
+    Plan(Box<LogicalPlan>),
     Text {
         sql: Arc<str>,
         parameters: Option<ParamValues>,
@@ -222,7 +222,7 @@ impl Query {
                 t
             });
 
-            let df = DataFrame::new(session, plan);
+            let df = DataFrame::new(session, *plan);
 
             let df_schema: SchemaRef = Arc::clone(df.schema().inner());
 
@@ -289,7 +289,7 @@ impl Query {
     pub fn from_logical_plan(df: &Arc<DataFusion>, plan: &LogicalPlan) -> Self {
         Self {
             df: Arc::clone(df),
-            sql: QueryMethod::Plan(plan.clone()),
+            sql: QueryMethod::Plan(Box::new(plan.clone())),
             tracker: None,
         }
     }
@@ -317,7 +317,7 @@ impl Query {
         let plan = match self.sql {
             QueryMethod::Plan(ref plan) => plan.clone(),
             QueryMethod::Text { ref sql, .. } => match session.create_logical_plan(sql).await {
-                Ok(plan) => plan,
+                Ok(plan) => Box::new(plan),
                 Err(e) => {
                     let e = find_datafusion_root(e);
                     self.handle_schema_error(&request_context, &e);
@@ -509,7 +509,7 @@ mod tests {
         );
 
         let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", Arc::clone(&df))
-            .parameters(parameters.clone())
+            .parameters(Some(parameters.clone()))
             .build()
             .run()
             .await
@@ -529,7 +529,7 @@ mod tests {
         assert_eq!(query.cache_status, CacheStatus::CacheMiss);
 
         let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", Arc::clone(&df))
-            .parameters(parameters)
+            .parameters(Some(parameters))
             .build()
             .run()
             .await
@@ -550,7 +550,7 @@ mod tests {
         // New parameters should not be cached
         let parameters = convert_json_to_param_values(json!([1])).expect("json to paramvalues");
         let mut query = QueryBuilder::new("SELECT $1 + 1 AS the_answer", df)
-            .parameters(parameters)
+            .parameters(Some(parameters))
             .build()
             .run()
             .await

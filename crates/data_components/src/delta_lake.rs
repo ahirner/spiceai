@@ -16,6 +16,7 @@ limitations under the License.
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_trait::async_trait;
+use aws_sdk_credential_bridge;
 use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
@@ -63,12 +64,12 @@ mod pruning;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to connect to the Delta Lake Table.\nVerify the Delta Lake Table configuration is valid, and try again.\nReceived the following error while connecting: {source}"
+        "Failed to connect to the Delta Lake Table. Verify the Delta Lake Table configuration is valid, and try again. Received the following error while connecting: {source}"
     ))]
     DeltaTableError { source: delta_kernel::Error },
 
     #[snafu(display(
-        "Delta Lake Table checkpoint files are missing or incorrect.\nRecreate the checkpoint for the Delta Lake Table and try again.\n{source}"
+        "Delta Lake Table checkpoint files are missing or incorrect. Recreate the checkpoint for the Delta Lake Table and try again. {source}"
     ))]
     DeltaCheckpointError { source: delta_kernel::Error },
 }
@@ -133,14 +134,44 @@ impl DeltaTable {
             }
         }
 
-        let engine = Arc::new(
-            DefaultEngine::try_new(
-                table.location(),
-                storage_options,
+        let mut load_credentials_from_environment = true;
+        if let (Some(_), Some(_)) = (
+            storage_options.get("aws_access_key_id"),
+            storage_options.get("aws_secret_access_key"),
+        ) {
+            load_credentials_from_environment = false;
+        }
+
+        let table_object_store = match (
+            load_credentials_from_environment,
+            aws_sdk_credential_bridge::get_sdk_config(),
+        ) {
+            (true, Some(sdk_config)) => {
+                let region = storage_options.get("aws_region").map(ToString::to_string);
+                aws_sdk_credential_bridge::from_s3_url_and_config(
+                    table.location(),
+                    region,
+                    sdk_config,
+                )
+                .ok()
+            }
+            _ => None,
+        };
+
+        let engine = match table_object_store {
+            Some(object_store) => Arc::new(DefaultEngine::new(
+                object_store.into(),
                 Arc::new(TokioBackgroundExecutor::new()),
-            )
-            .map_err(handle_delta_error)?,
-        );
+            )),
+            None => Arc::new(
+                DefaultEngine::try_new(
+                    table.location(),
+                    storage_options,
+                    Arc::new(TokioBackgroundExecutor::new()),
+                )
+                .map_err(handle_delta_error)?,
+            ),
+        };
 
         let snapshot = table
             .snapshot(engine.as_ref(), None)

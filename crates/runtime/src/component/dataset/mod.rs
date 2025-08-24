@@ -44,7 +44,7 @@ pub mod replication;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Column for index '{index}' was not found in the schema.\nValid columns: {valid_columns}.\nVerify configuration and try again.\nFor details, visit https://spiceai.org/docs/features/data-acceleration/indexes"
+        "Column for index '{index}' was not found in the schema. Valid columns: {valid_columns}. Verify configuration and try again. For details, visit https://spiceai.org/docs/features/data-acceleration/indexes"
     ))]
     IndexColumnNotFound {
         index: String,
@@ -52,7 +52,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Primary key column '{invalid_column}' was not found in the schema.\nValid columns: {valid_columns}.\nVerify configuration and try again.\nFor details, visit https://spiceai.org/docs/features/data-acceleration/constraints"
+        "Primary key column '{invalid_column}' was not found in the schema. Valid columns: {valid_columns}. Verify configuration and try again. For details, visit https://spiceai.org/docs/features/data-acceleration/constraints"
     ))]
     PrimaryKeyColumnNotFound {
         invalid_column: String,
@@ -90,7 +90,7 @@ pub enum Error {
     UnableToParseTableReferenceFromPath { path: String, source: ParserError },
 
     #[snafu(display(
-        "Failed to build dataset '{dataset}': required component '{missing_component}' is missing.\nAn unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
+        "Failed to build dataset '{dataset}': required component '{missing_component}' is missing. An unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToBuildDataset {
         dataset: String,
@@ -98,9 +98,14 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Both a 'refresh_cron' and 'refresh_check_interval' were specified.\nOnly one of these options can be specified for a given dataset.\nFor details, visit: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+        "Both a 'refresh_cron' and 'refresh_check_interval' were specified. Only one of these options can be specified for a given dataset. For details, visit: https://spiceai.org/docs/features/data-acceleration/data-refresh"
     ))]
     MultipleRefreshExpressionSpecified,
+
+    #[snafu(display(
+        "Chunking is not supported for vector engines. Disable chunking for the column '{column}', or disable the vector engine, and try again."
+    ))]
+    ChunkingNotSupportedForVectorEngine { column: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -215,6 +220,34 @@ impl Display for ReadyState {
     }
 }
 
+/// Controls whether the federated table periodically has its availability checked.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum CheckAvailability {
+    /// The dataset is checked for availability if it isn't accelerated.
+    #[default]
+    Auto,
+    /// The dataset is not checked for availability.
+    Disabled,
+}
+
+impl From<spicepod_dataset::CheckAvailability> for CheckAvailability {
+    fn from(monitor: spicepod_dataset::CheckAvailability) -> Self {
+        match monitor {
+            spicepod_dataset::CheckAvailability::Auto => CheckAvailability::Auto,
+            spicepod_dataset::CheckAvailability::Disabled => CheckAvailability::Disabled,
+        }
+    }
+}
+
+impl Display for CheckAvailability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CheckAvailability::Auto => write!(f, "auto"),
+            CheckAvailability::Disabled => write!(f, "disabled"),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Dataset {
     pub from: String,
@@ -238,6 +271,7 @@ pub struct Dataset {
     pub metrics: Metrics,
     pub runtime: Arc<Runtime>,
     pub vectors: Option<VectorStore>,
+    pub check_availability: CheckAvailability,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -263,6 +297,7 @@ impl std::fmt::Debug for Dataset {
             .field("ready_state", &self.ready_state)
             .field("metrics", &self.metrics)
             .field("vectors", &self.vectors)
+            .field("check_availability", &self.check_availability)
             .finish_non_exhaustive()
     }
 }
@@ -288,6 +323,7 @@ impl PartialEq for Dataset {
             && self.columns == other.columns
             && self.metrics == other.metrics
             && self.vectors == other.vectors
+            && self.check_availability == other.check_availability
     }
 }
 
@@ -319,6 +355,7 @@ impl Dataset {
         self.schema.clone()
     }
 
+    #[allow(clippy::result_large_err)]
     pub(crate) fn parse_table_reference(
         name: &str,
     ) -> std::result::Result<TableReference, crate::Error> {

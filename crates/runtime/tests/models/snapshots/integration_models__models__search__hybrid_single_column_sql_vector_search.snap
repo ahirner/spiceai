@@ -1,0 +1,26 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: resp?
+---
+[
+  {
+    "id": 1002,
+    "question": "What is the next term in the sequence 3, 12, 48, 192, 768?",
+    "trunc(vector_search().score,Int64(3))": 0.652
+  },
+  {
+    "id": 6,
+    "question": "<refined question>",
+    "trunc(vector_search().score,Int64(3))": 0.651
+  },
+  {
+    "id": 151,
+    "question": "Evaluate \\(2^{1/2}\\).",
+    "trunc(vector_search().score,Int64(3))": 0.643
+  },
+  {
+    "id": 989,
+    "question": "What is the mode of the following data: 70 (10 times), 55 (5 times)?",
+    "trunc(vector_search().score,Int64(3))": 0.637
+  }
+]

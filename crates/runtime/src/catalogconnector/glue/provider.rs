@@ -43,12 +43,12 @@ use std::{any::Any, fmt};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Cannot connect to AWS Glue to retrieve databases.\nVerify your AWS credentials and region are configured correctly.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}"
+        "Cannot connect to AWS Glue to retrieve databases. Verify your AWS credentials and region are configured correctly. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue  {source}"
     ))]
     GetDatabases { source: SdkError<GetDatabasesError> },
 
     #[snafu(display(
-        "Cannot retrieve tables from Glue database '{database}'.\nVerify the database exists and you have permissions to access it.\n{source}"
+        "Cannot retrieve tables from Glue database '{database}'. Verify the database exists and you have permissions to access it. {source}"
     ))]
     GetTables {
         database: String,
@@ -56,7 +56,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Cannot create dataset for table `{dataset}`.\nVerify the table configuration and format are supported.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}"
+        "Cannot create dataset for table `{dataset}`. Verify the table configuration and format are supported. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue {source}"
     ))]
     CreatingDataset {
         dataset: String,
@@ -64,7 +64,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Cannot load AWS configuration for Glue catalog.\nVerify your AWS credentials and region settings.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}"
+        "Cannot load AWS configuration for Glue catalog. Verify your AWS credentials and region settings. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue {source}"
     ))]
     ConfigurationLoadingFailed {
         #[snafu(source)]
@@ -72,7 +72,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Invalid AWS configuration for Glue catalog.\nVerify your region, credentials, and other AWS parameters are correct.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue \n{source}",
+        "Invalid AWS configuration for Glue catalog. Verify your region, credentials, and other AWS parameters are correct. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue {source}",
     ))]
     ParameterValidation {
         #[snafu(source)]
@@ -90,6 +90,7 @@ pub struct GlueCatalogProvider {
     runtime: Arc<Runtime>,
     app: Arc<App>,
     parameters: ConnectorParams,
+    catalog_id: Option<String>,
     databases: RwLock<HashMap<DatabaseName, Arc<dyn SchemaProvider>>>,
 }
 
@@ -139,24 +140,25 @@ impl GlueCatalogProvider {
             runtime,
             app,
             databases,
+            catalog_id: catalog.catalog_id.clone(),
             parameters,
         })
     }
 
     async fn create_schema_provider(&self, database: String) -> Result<Arc<dyn SchemaProvider>> {
-        let mut paginator = self
-            .client
-            .get_tables()
-            .database_name(&database)
-            .into_paginator()
-            .send();
+        let mut tables_builder = self.client.get_tables().database_name(&database);
+
+        if let Some(catalog_id) = &self.catalog_id {
+            tables_builder = tables_builder.catalog_id(catalog_id);
+        }
+
+        let mut paginator = tables_builder.into_paginator().send();
 
         let mut tables = HashMap::new();
 
         while let Some(maybe_get_tables_output) = paginator.next().await {
-            let get_tables_output = maybe_get_tables_output.map_err(|source| Error::GetTables {
+            let get_tables_output = maybe_get_tables_output.context(GetTablesSnafu {
                 database: database.clone(),
-                source,
             })?;
             let some_tables = get_tables_output
                 .table_list
@@ -169,27 +171,29 @@ impl GlueCatalogProvider {
                 .collect::<Vec<_>>();
 
             for table in some_tables {
-                let connector = GlueDataConnector::new(self.parameters.parameters.clone());
+                let connector = GlueDataConnector::new_with_catalog_id(
+                    self.parameters.parameters.clone(),
+                    self.catalog_id.clone(),
+                );
                 let from = format!("{database}.{}", table.name());
                 let runtime = Arc::clone(&self.runtime);
                 let dataset = DatasetBuilder::try_new(from, table.name())
-                    .map_err(|e| Error::CreatingDataset {
+                    .boxed()
+                    .context(CreatingDatasetSnafu {
                         dataset: table.name().to_string(),
-                        source: e.into(),
                     })?
                     .with_app(Arc::clone(&self.app))
                     .with_runtime(runtime)
                     .build()
-                    .map_err(|e| Error::CreatingDataset {
+                    .boxed()
+                    .context(CreatingDatasetSnafu {
                         dataset: table.name().to_string(),
-                        source: e.into(),
                     })?;
-                let table_provider = connector.read_provider(&dataset).await.map_err(|e| {
-                    Error::CreatingDataset {
+                let table_provider = connector.read_provider(&dataset).await.boxed().context(
+                    CreatingDatasetSnafu {
                         dataset: table.name().to_string(),
-                        source: e.into(),
-                    }
-                })?;
+                    },
+                )?;
                 tables.insert(table.name, table_provider);
             }
         }
@@ -240,7 +244,13 @@ impl CatalogProvider for GlueCatalogProvider {
 #[async_trait]
 impl RefreshableCatalogProvider for GlueCatalogProvider {
     async fn refresh(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut paginator = self.client.get_databases().into_paginator().send();
+        let mut databases_builder = self.client.get_databases();
+
+        if let Some(catalog_id) = &self.catalog_id {
+            databases_builder = databases_builder.catalog_id(catalog_id);
+        }
+
+        let mut paginator = databases_builder.into_paginator().send();
 
         let mut databases = HashMap::new();
 

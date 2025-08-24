@@ -6,7 +6,7 @@ on:
     branches:
       - trunk
       - release/*
-  pull_request:
+  pull_request_target:
     branches:
       - trunk
       - release-*
@@ -42,7 +42,7 @@ on:
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
-  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
 env:
@@ -53,7 +53,9 @@ jobs:
     name: Build Test Binary
     runs-on: spiceai-dev-runners
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -119,7 +121,9 @@ jobs:
     permissions: read-all
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -137,7 +141,7 @@ jobs:
 
       # Download the test archive artifact
       - name: Download test archive
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: integration-test-archive
           path: ./integration_test
@@ -148,17 +152,10 @@ jobs:
 
       - name: Login to ACR
         uses: docker/login-action@v3
-        # This will fail for forks, so we only run it for the main repo
-        if: github.repository == 'spiceai/spiceai'
         with:
           registry: spiceaitestimages.azurecr.io
           username: spiceai-repo-pull
           password: ${{ secrets.AZCR_PASSWORD }}
-
-      # Change the CONTAINER_REGISTRY to public.ecr.aws/docker/library/ if this is a fork
-      - name: Use public ECR for forks
-        if: github.repository != 'spiceai/spiceai'
-        run: echo "CONTAINER_REGISTRY=public.ecr.aws/docker/library/" >> $GITHUB_ENV
 
       - name: Pull the Postgres/MySQL images
         run: |
@@ -176,14 +173,15 @@ jobs:
         with:
           app-id: ${{ vars.ORG_MEMBERS_GITHUB_APP_ID }}
           private-key: ${{ secrets.ORG_MEMBERS_GITHUB_PRIVATE_KEY }}
-          owner: ${{ github.repository_owner }}
+          owner: spiceai
           repositories: |
             spiceai
 
       - name: Run integration test
         env:
           SPICE_SECRET_SPICEAI_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_KEY }}
-          GITHUB_TOKEN: ${{ steps.github-app-token.outputs.token }}
+          GITHUB_ORG_TOKEN: ${{ steps.github-app-token.outputs.token }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # old dbc instance
           TEST_DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
           TEST_DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}

@@ -130,7 +130,6 @@ pub enum Engine {
     PartitionedDuckDB,
     Sqlite,
     PostgreSQL,
-    Void,
 }
 
 impl Display for Engine {
@@ -140,7 +139,6 @@ impl Display for Engine {
             Engine::DuckDB | Engine::PartitionedDuckDB => write!(f, "duckdb"),
             Engine::Sqlite => write!(f, "sqlite"),
             Engine::PostgreSQL => write!(f, "postgres"),
-            Engine::Void => write!(f, "void"),
         }
     }
 }
@@ -154,7 +152,6 @@ impl TryFrom<&str> for Engine {
             "duckdb" => Ok(Engine::DuckDB),
             "sqlite" => Ok(Engine::Sqlite),
             "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
-            "void" => Ok(Engine::Void),
             _ => crate::AcceleratorEngineNotAvailableSnafu {
                 name: engine.to_string(),
             }
@@ -470,6 +467,7 @@ impl Default for Acceleration {
 }
 
 /// Returns true if the `query_federation` parameter is set to "disabled".
+#[allow(clippy::result_large_err)]
 fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<bool, crate::Error> {
     if let Some(params) = params {
         if let Some(value) = params.data.remove("query_federation") {

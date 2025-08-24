@@ -6,7 +6,7 @@ on:
     branches:
       - trunk
       - release/*
-  pull_request:
+  pull_request_target:
     branches:
       - trunk
       - release-*
@@ -42,7 +42,7 @@ on:
 
 concurrency:
   # Allow only one workflow per any non-trunk branch.
-  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
 jobs:
@@ -50,7 +50,9 @@ jobs:
     name: Build Test Binary
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -90,10 +92,12 @@ jobs:
     permissions: read-all
     runs-on: 'spiceai-macos'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Download test binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: ai-integration-test-binary
           path: ./integration_test
@@ -130,13 +134,16 @@ jobs:
   test-hf:
     name: Test Huggingface Models
     needs: build
+    if: ${{ github.event.inputs.run_all_tests == 'true' }}
     permissions: read-all
     runs-on: [self-hosted, macOS]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Download test binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: ai-integration-test-binary
           path: ./integration_test
@@ -172,10 +179,12 @@ jobs:
     permissions: read-all
     runs-on: [self-hosted, macOS]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Download test binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: ai-integration-test-binary
           path: ./integration_test
@@ -196,10 +205,12 @@ jobs:
     permissions: read-all
     runs-on: [self-hosted, macOS]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Download test binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: ai-integration-test-binary
           path: ./integration_test
@@ -222,10 +233,12 @@ jobs:
     permissions: read-all
     runs-on: [self-hosted, macOS]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Download test binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: ai-integration-test-binary
           path: ./integration_test
@@ -255,10 +268,12 @@ jobs:
     permissions: read-all
     runs-on: [self-hosted, macOS]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - name: Download test binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           name: ai-integration-test-binary
           path: ./integration_test

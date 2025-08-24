@@ -20,25 +20,24 @@ use arrow::datatypes::SchemaRef;
 use arrow_schema::{DataType, Field};
 use async_trait::async_trait;
 
-use data_components::s3_vectors::{S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME};
-
 use datafusion::{
     catalog::Session,
     common::{Column, Constraints, DFSchema, DFSchemaRef, JoinConstraint, JoinType},
     datasource::{DefaultTableSource, TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::{
-        Cast, Expr, Join, Limit, LogicalPlan, Operator, Projection, TableProviderFilterPushDown,
-        TableScan, expr::Alias,
+        Expr, Filter, Join, Limit, LogicalPlan, Projection, TableProviderFilterPushDown, TableScan,
     },
     physical_plan::ExecutionPlan,
     scalar::ScalarValue,
     sql::TableReference,
 };
 
-use crate::embeddings::index::query_table::fold_binary;
-use crate::embeddings::udtf::append_fields;
-use crate::{embedding_col, embeddings::index::VectorIndex};
+use crate::{
+    embedding_col,
+    embeddings::index::{VectorIndex, vector_index_table_is_sufficient},
+};
+use search::generation::util::append_fields;
 
 /// A [`TableProvider`] that adds an embedding column to an underlying [`TableProvider`].
 #[derive(Debug, Clone)]
@@ -93,82 +92,6 @@ impl VectorScanTableProvider {
         )
     }
 
-    /// Construct [`TableScan`] for associated vector search index table for `projection` & `filters` relative to [`VectorScanTableProvider`].
-    ///
-    /// Ok(None), if no columns from table scan are required and no filters are needed.
-    fn vector_table_scan(
-        &self,
-        projection: Option<&Vec<usize>>,
-        _filters: &[Expr],
-    ) -> DataFusionResult<Option<LogicalPlan>> {
-        // Filter pushdown not supported for S3 vector listVectors. If vector is not needed in projection, do not need this table.
-        let need_vector_column = self.need_vector_column(projection);
-        if !need_vector_column {
-            return Ok(None);
-        }
-
-        let list_scan = self.index.list_table_provider();
-        let list_scan_schema = list_scan.schema();
-        let proj = [
-            index_of_column(&list_scan_schema, S3_VECTOR_EMBEDDING_NAME),
-            index_of_column(&list_scan_schema, S3_VECTOR_PRIMARY_KEY_NAME),
-        ]
-        .iter()
-        .filter_map(|p| *p)
-        .collect();
-
-        let scan = TableScan::try_new(
-            TableReference::parse_str("vector_index"),
-            Arc::new(DefaultTableSource::new(list_scan)),
-            Some(proj),
-            vec![],
-            None,
-        )?;
-
-        // Add expected column aliases.
-        let primary_key = self
-            .index
-            .primary_fields()
-            .first()
-            .map_or(S3_VECTOR_PRIMARY_KEY_NAME.to_string(), |f| f.name().clone());
-
-        let primary_key_datatype = self
-            .index
-            .primary_fields()
-            .iter()
-            .find_map(|f| {
-                if *f.name() == primary_key {
-                    Some(f.data_type().clone())
-                } else {
-                    None
-                }
-            })
-            .unwrap_or(DataType::Utf8);
-
-        let aliased = LogicalPlan::Projection(Projection::try_new(
-            vec![
-                Expr::Alias(Alias::new(
-                    Expr::Column(Column::new_unqualified(S3_VECTOR_EMBEDDING_NAME)),
-                    Some(TableReference::parse_str("vector_index")),
-                    embedding_col!(self.index.embedded_column()),
-                )),
-                Expr::Alias(Alias::new(
-                    Expr::Cast(Cast::new(
-                        Box::new(Expr::Column(Column::new_unqualified(
-                            S3_VECTOR_PRIMARY_KEY_NAME,
-                        ))),
-                        primary_key_datatype,
-                    )),
-                    Some(TableReference::parse_str("vector_index")),
-                    primary_key,
-                )),
-            ],
-            Arc::new(LogicalPlan::TableScan(scan)),
-        )?);
-
-        Ok(Some(aliased))
-    }
-
     /// For a projection relative to [`VectorScanTableProvider`], check if the embedding column is being requested.
     fn need_vector_column(&self, projection: Option<&Vec<usize>>) -> bool {
         let Some(proj) = projection else {
@@ -185,18 +108,6 @@ impl VectorScanTableProvider {
         proj.contains(&idx)
     }
 
-    /// Construct the required join on expressions as per the primary key.
-    fn join_on_expr(&self) -> DataFusionResult<Vec<(Expr, Expr)>> {
-        let primary_key_columns = self.index.primary_fields();
-        let Some(pk) = primary_key_columns.first() else {
-            return Err(DataFusionError::Execution("Vector search index was successfully created without a primary key available during physical planning.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues".to_string()));
-        };
-        Ok(vec![(
-            Expr::Column(Column::new_unqualified(pk.name().clone())),
-            Expr::Column(Column::new_unqualified(pk.name().clone())),
-        )])
-    }
-
     fn qualified_schema(&self, projection: Option<&Vec<usize>>) -> DFSchemaRef {
         let base = self.table_provider.schema();
         let mut qualified_fields: Vec<_> = base
@@ -208,7 +119,7 @@ impl VectorScanTableProvider {
             Some(TableReference::parse_str("vector_index")),
             Arc::new(Field::new(
                 embedding_col!(self.index.embedded_column()),
-                DataType::new_list(DataType::Float32, false),
+                DataType::new_list(DataType::Float32, true),
                 true,
             )),
         ));
@@ -247,7 +158,7 @@ impl TableProvider for VectorScanTableProvider {
             &self.table_provider.schema(),
             vec![Arc::new(Field::new(
                 embedding_col!(self.index.embedded_column()),
-                DataType::new_list(DataType::Float32, false),
+                DataType::new_list(DataType::Float32, true),
                 true,
             ))],
         )
@@ -261,6 +172,7 @@ impl TableProvider for VectorScanTableProvider {
         self.table_provider.table_type()
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn scan(
         &self,
         state: &dyn Session,
@@ -268,32 +180,136 @@ impl TableProvider for VectorScanTableProvider {
         filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        // If vector table isn't needed (in either filters or projection)
-        let Some(vector_table_scan) = self.vector_table_scan(projection, filters)? else {
+        // Filter pushdown not supported for S3 vector listVectors. If vector is not needed in projection, do not need to join on this table.
+        if !self.need_vector_column(projection) {
             return self
                 .table_provider
                 .scan(state, projection, filters, limit)
                 .await;
+        }
+
+        let mut proj = self
+            .index
+            .primary_fields()
+            .iter()
+            .map(|f| {
+                Expr::Column(Column::new(
+                    Some(TableReference::parse_str("vector_index")),
+                    f.name().clone(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        proj.push(Expr::Column(Column::new(
+            Some(TableReference::parse_str("vector_index")),
+            embedding_col!(self.index.embedded_column()),
+        )));
+
+        let vector_table_scan = LogicalPlan::Projection(Projection::try_new(
+            proj,
+            Arc::new(LogicalPlan::TableScan(TableScan::try_new(
+                TableReference::parse_str("vector_index"),
+                Arc::new(DefaultTableSource::new(self.index.list_table_provider()?)),
+                None,
+                vec![],
+                None,
+            )?)),
+        )?);
+
+        let primary_key_fields = self.index.primary_fields();
+        if primary_key_fields.is_empty() {
+            return Err(DataFusionError::Execution("The vector search index was created successfuly without a primary key.\nEnsure a primary key is available in the dataset source, or specified in the column configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#columnsembeddingsrow_id".to_string()));
+        }
+
+        let output_plan = if vector_index_table_is_sufficient(
+            self.schema(),
+            &vector_table_scan,
+            projection,
+            filters,
+        )? {
+            // Let DataFusion handle pushing filters.
+            if let Some(filter) = filters.iter().cloned().reduce(Expr::and) {
+                LogicalPlan::Filter(Filter::try_new(filter, vector_table_scan.into())?)
+            } else {
+                vector_table_scan
+            }
+        } else {
+            let underlying_table_scan =
+                LogicalPlan::TableScan(self.underlying_table_scan(projection, filters)?);
+
+            let join_schema = vector_table_scan
+                .schema()
+                .join(underlying_table_scan.schema())?;
+
+            // If the filter affects any primary key column, we must apply after we have removed the duplicate primary key columns.
+            let primary_key_column_names: std::collections::HashSet<String> = primary_key_fields
+                .iter()
+                .map(|f| f.name().clone())
+                .collect();
+            let (post_join_filters, pre_join_filters): (Vec<Expr>, Vec<Expr>) =
+                filters.iter().cloned().partition(|f| {
+                    f.column_refs()
+                        .iter()
+                        .any(|col| primary_key_column_names.contains(col.name()))
+                });
+
+            let join_conditions: Vec<(Expr, Expr)> = primary_key_fields
+                .iter()
+                .map(|pk_field| {
+                    (
+                        Expr::Column(Column::new_unqualified(pk_field.name())),
+                        Expr::Column(Column::new_unqualified(pk_field.name())),
+                    )
+                })
+                .collect();
+
+            // Right Join so that all rows in the underlying table are returned.
+            // Rows may not have associated vectors periodically due to indexing delays.
+            let join = LogicalPlan::Join(Join {
+                left: Arc::new(vector_table_scan),
+                right: Arc::new(underlying_table_scan),
+                join_type: JoinType::Right,
+                join_constraint: JoinConstraint::On,
+                on: join_conditions,
+                filter: pre_join_filters.into_iter().reduce(Expr::and),
+                schema: join_schema.into(),
+                null_equals_null: false,
+            });
+
+            // DataFusion will not deduplicate the `Join::on` keys. For simplicity with non-join
+            // case, we will remove duplicate primary key columns from the right table.
+            let deduped_schema = DFSchema::new_with_metadata(
+                join.schema()
+                    .iter()
+                    .filter(|(tbl, f)| {
+                        !(primary_key_column_names.contains(f.name())
+                            && tbl.is_some_and(|t| *t == TableReference::parse_str("vector_index")))
+                    })
+                    .map(|(tbl, f)| (tbl.cloned(), Arc::clone(f)))
+                    .collect(),
+                HashMap::default(),
+            )?;
+
+            let proj = LogicalPlan::Projection(Projection::new_from_schema(
+                join.into(),
+                deduped_schema.into(),
+            ));
+
+            if let Some(filter) = post_join_filters.into_iter().reduce(Expr::and) {
+                LogicalPlan::Filter(Filter::try_new(filter, proj.into())?)
+            } else {
+                proj
+            }
         };
 
-        let underlying_table_scan = self.underlying_table_scan(projection, filters)?;
-
-        // Right Join so that all rows in the underlying table are returned.
-        // Rows may not have associated vectors periodically due to indexing delays.
-        let join = LogicalPlan::Join(Join {
-            left: Arc::new(vector_table_scan),
-            right: Arc::new(LogicalPlan::TableScan(underlying_table_scan)),
-            join_type: JoinType::Right,
-            join_constraint: JoinConstraint::On,
-            on: self.join_on_expr()?,
-            filter: fold_binary(filters, Operator::And),
-            schema: self.qualified_schema(projection),
-            null_equals_null: false,
-        });
-
         let output_proj = LogicalPlan::Projection(Projection::new_from_schema(
-            Arc::new(join),
-            self.qualified_schema(projection),
+            Arc::new(output_plan),
+            Arc::new(DFSchema::from_unqualified_fields(
+                self.qualified_schema(projection)
+                    .as_arrow()
+                    .fields()
+                    .clone(),
+                HashMap::default(),
+            )?),
         ));
 
         let limit = LogicalPlan::Limit(Limit {
@@ -305,5 +321,276 @@ impl TableProvider for VectorScanTableProvider {
         });
 
         state.create_physical_plan(&limit).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use std::{collections::HashMap, sync::Arc};
+
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::{
+        catalog::{MemTable, TableProvider},
+        sql::TableReference,
+    };
+
+    use crate::embeddings::index::VectorScanTableProvider;
+    use crate::embeddings::index::tests::{
+        PretendVectorIndex, one_row_default_record_batch_for_schema, test_explain,
+    };
+
+    #[tokio::test]
+    pub async fn test_vector_scan_basic() -> Result<(), String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("another_column", DataType::Utf8, false),
+        ]));
+
+        let p = VectorScanTableProvider {
+            table_provider: Arc::new(
+                MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                )
+                .expect("could not make MemTable"),
+            ),
+            index: Arc::new(PretendVectorIndex::new(
+                "body".to_string(),
+                vec![Field::new("pk", DataType::Int64, false)],
+                Schema::new(vec![
+                    Field::new("pk", DataType::Int64, false),
+                    Field::new(
+                        "body_embedding",
+                        DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                        false,
+                    ),
+                ]),
+            )),
+        };
+
+        let provider: Arc<dyn TableProvider> = Arc::new(p);
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_basic",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, another_column, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_join_for_projection",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, body_embedding from my_vectored_table WHERE another_column != 'something' ORDER BY pk desc LIMIT 5",
+            "scan_table_join_for_filter",
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    // [`VectorScanTableProvider`] cannot use metadata column to get data from vector index.
+    #[tokio::test]
+    pub async fn test_vector_scan_index_metadata() -> Result<(), String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("another_column", DataType::Utf8, false),
+            Field::new("a_number", DataType::Int64, false),
+            Field::new("not_where", DataType::Utf8, false),
+        ]));
+        let p = VectorScanTableProvider {
+            table_provider: Arc::new(
+                MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                )
+                .expect("could not make MemTable"),
+            ),
+            index: Arc::new(PretendVectorIndex::new(
+                "body".to_string(),
+                vec![Field::new("pk", DataType::Int64, false)],
+                Schema::new(vec![
+                    Field::new("pk", DataType::Int64, false),
+                    Field::new(
+                        "body_embedding",
+                        DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                        false,
+                    ),
+                    Field::new("a_number", DataType::Int64, false).with_metadata(HashMap::from([
+                        ("filterable".to_string(), "true".to_string()),
+                    ])),
+                    Field::new("not_where", DataType::Utf8, false).with_metadata(HashMap::from([
+                        ("filterable".to_string(), "false".to_string()),
+                    ])),
+                ]),
+            )),
+        };
+        let provider: Arc<dyn TableProvider> = Arc::new(p);
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_basic_metadata",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, another_column, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_join_for_projection_metadata",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, another_column, not_where, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_join_for_projection_use_metadata",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, body_embedding from my_vectored_table WHERE another_column != 'something' AND a_number > 0 ORDER BY pk desc LIMIT 5",
+            "scan_table_join_for_filter_use_metadata",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, not_where, body_embedding from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_no_join_for_metadata_projection",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, body_embedding from my_vectored_table WHERE a_number > 0 ORDER BY pk desc LIMIT 5",
+            "scan_table_no_join_for_metadata_filter",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk, a_number from my_vectored_table ORDER BY pk desc LIMIT 5",
+            "scan_table_no_embedding_no_join",
+        )
+        .await?;
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    pub async fn test_vector_scan_index_multicolumn_pk() -> Result<(), String> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("pk1", DataType::Int64, false),
+            Field::new("pk2", DataType::Boolean, false),
+            Field::new("pk3", DataType::Utf8, false),
+            Field::new("body", DataType::Utf8, false),
+            Field::new("another_column", DataType::Utf8, false),
+            Field::new("a_number", DataType::Int64, false),
+            Field::new("not_where", DataType::Utf8, false),
+        ]));
+        let p = VectorScanTableProvider {
+            table_provider: Arc::new(
+                MemTable::try_new(
+                    Arc::clone(&schema),
+                    vec![vec![one_row_default_record_batch_for_schema(&schema)]],
+                )
+                .expect("could not make MemTable"),
+            ),
+            index: Arc::new(PretendVectorIndex::new(
+                "body".to_string(),
+                vec![
+                    Field::new("pk1", DataType::Int64, false),
+                    Field::new("pk2", DataType::Boolean, false),
+                    Field::new("pk3", DataType::Utf8, false),
+                ],
+                Schema::new(vec![
+                    Field::new("pk1", DataType::Int64, false),
+                    Field::new("pk2", DataType::Boolean, false),
+                    Field::new("pk3", DataType::Utf8, false),
+                    Field::new(
+                        "body_embedding",
+                        DataType::new_fixed_size_list(DataType::Float32, 10, false),
+                        false,
+                    ),
+                    Field::new("a_number", DataType::Int64, false).with_metadata(HashMap::from([
+                        ("filterable".to_string(), "true".to_string()),
+                    ])),
+                    Field::new("not_where", DataType::Utf8, false).with_metadata(HashMap::from([
+                        ("filterable".to_string(), "false".to_string()),
+                    ])),
+                ]),
+            )),
+        };
+        let provider: Arc<dyn TableProvider> = Arc::new(p);
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, body_embedding from my_vectored_table LIMIT 5",
+            "scan_table_basic_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, another_column, body_embedding from my_vectored_table LIMIT 5",
+            "scan_table_join_for_projection_metadata_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, another_column, not_where, body_embedding from my_vectored_table LIMIT 5",
+            "scan_table_join_for_projection_use_metadata_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, body_embedding from my_vectored_table WHERE another_column != 'something' AND a_number > 0 LIMIT 5",
+            "scan_table_join_for_filter_use_metadata_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, not_where, body_embedding from my_vectored_table LIMIT 5",
+            "scan_table_no_join_for_metadata_projection_multiple_pk",
+        )
+        .await?;
+
+        test_explain(
+            Arc::clone(&provider),
+            TableReference::parse_str("my_vectored_table"),
+            "SELECT pk1, pk2, pk3, body_embedding from my_vectored_table WHERE a_number > 0 LIMIT 5",
+            "scan_table_no_join_for_metadata_filter_multiple_pk",
+        )
+        .await?;
+
+        Ok(())
     }
 }

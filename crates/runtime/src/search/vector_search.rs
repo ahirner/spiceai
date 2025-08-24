@@ -18,10 +18,10 @@ use std::collections::HashSet;
 use std::{collections::HashMap, sync::Arc};
 
 use super::request::SearchRequest;
-use super::util::user_tables_with_embeddings;
+use super::util::user_tables_that_can_search;
 use super::{Error, Result};
 use crate::embeddings::table::EmbeddingTable;
-use crate::request::CacheControl;
+use crate::request::{AsyncMarker, CacheControl, CacheKeyType, RequestContext};
 use crate::search::{
     SearchPipelineSnafu,
     candidate::vector::VectorGeneration,
@@ -40,10 +40,7 @@ use cache::result::search::{CachedAggregationResult, CachedSearchResult};
 use cache::{CacheProvider, Sizeable};
 use datafusion::catalog::TableProvider;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::{
-    TableReference,
-    sqlparser::ast::{Expr, Ident},
-};
+use datafusion::sql::{TableReference, sqlparser::ast::Expr};
 use futures::StreamExt;
 use itertools::Itertools;
 use llms::embeddings::Embed;
@@ -91,7 +88,7 @@ impl VectorSearch {
         let indexed = find_concrete_table_provider::<IndexedTableProvider>(tbl)?;
         #[cfg(feature = "s3_vectors")]
         {
-            use crate::embeddings::index::S3Vector;
+            use crate::embeddings::index::s3::S3Vector;
             if let Some(s3_vector) = indexed.get_index::<S3Vector>() {
                 return s3_vector.embedding_model().await;
             }
@@ -169,12 +166,22 @@ impl VectorSearch {
         &self,
         req: &SearchRequest,
         cache_provider: Option<Arc<dyn CacheProvider<CachedSearchResult> + Send + Sync>>,
-        cache_control: CacheControl,
+        request_context: Arc<RequestContext>,
     ) -> Result<(VectorSearchResult, CacheStatus)> {
         Ok(if let Some(cache_provider) = cache_provider {
             tracing::trace!("Search cache is enabled");
             let search_key = SearchKey::from(req.clone());
-            let cache_key = CacheKey::Search(&search_key);
+            let cache_control = request_context.cache_control();
+
+            let cache_key = match request_context.client_supplied_cache_key() {
+                Some(cache_key)
+                    if cache_control == CacheControl::Cache(CacheKeyType::ClientSupplied) =>
+                {
+                    CacheKey::ClientSupplied(cache_key)
+                }
+                _ => CacheKey::Search(&search_key),
+            };
+
             let raw_cache_key = cache_key.as_raw_key(cache_provider.hasher());
 
             match (
@@ -224,6 +231,9 @@ impl VectorSearch {
     }
 
     pub async fn search(&self, req: &SearchRequest) -> Result<VectorSearchResult> {
+        let request_context = RequestContext::current(AsyncMarker::new().await);
+        telemetry::track_vector_search(&request_context.to_dimensions());
+
         let SearchRequest {
             text: query,
             datasets: data_source_opt,
@@ -235,11 +245,11 @@ impl VectorSearch {
 
         let tables = match data_source_opt {
             Some(ts) => ts.iter().map(TableReference::from).collect(),
-            None => user_tables_with_embeddings(&self.df).await?,
+            None => user_tables_that_can_search(&self.df).await?,
         };
 
         if tables.is_empty() {
-            return Err(Error::NoTablesWithEmbeddingsFound {});
+            return Err(Error::NoTablesWithSearchFound {});
         }
 
         let span = match Span::current() {
@@ -262,7 +272,7 @@ impl VectorSearch {
                 let primary_keys = table_primary_keys.get(&tbl).map_or(&[] as &[String], |v| v.as_slice());
 
                 async move {
-
+                    let request_context = RequestContext::current(AsyncMarker::new().await);
                     let embedding_columns = embedding_columns_from_table(&self.df, &tbl).await.unwrap_or_default();
                     let mut generators: Vec<Arc<dyn CandidateGeneration>> = Vec::with_capacity(embedding_columns.len());
                     for (i, col) in embedding_columns.iter().enumerate() {
@@ -276,13 +286,14 @@ impl VectorSearch {
 
                     // If the dataset is configured with full text search capabilities, add as generator.
                     if let Some(mut fts) = full_text_search_candidates(&self.df, &tbl).await.transpose()? {
+                        telemetry::track_text_search(&request_context.to_dimensions());
                         generators.append(&mut fts);
                     }
 
                     let agg_result = SearchPipeline::new(generators, ReciprocalRankFusion).run(
                         query.clone(),
                         where_cond.as_ref().map(|e| vec![e.clone()]).unwrap_or_default(),
-                        additional_columns.iter().map(|s| Expr::Identifier(Ident::with_quote('"', s))).collect(),
+                        additional_columns.iter().map(|i| Expr::Identifier(i.clone())).collect(),
                         primary_keys.to_vec(),
                         keywords,
                         *limit

@@ -1,0 +1,39 @@
+---
+source: crates/runtime/tests/models/search.rs
+expression: normalize_search_response(resp)
+---
+{
+  "duration_ms": "duration_ms_val",
+  "results": [
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "<refined question>"
+      },
+      "primary_key": {
+        "id": 6
+      },
+      "score": 0.65
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "What are consequential late effects?"
+      },
+      "primary_key": {
+        "id": 810
+      },
+      "score": 0.62
+    },
+    {
+      "dataset": "qs",
+      "matches": {
+        "question": "In the prescription label \"Sig: gtt ii OS TID,\" what does \"OS\" mean?"
+      },
+      "primary_key": {
+        "id": 537
+      },
+      "score": 0.62
+    }
+  ]
+}

@@ -60,10 +60,14 @@ pub enum Error {
     #[snafu(display("{message}"))]
     RateLimited { message: String },
 
-    #[snafu(display("Query response transformation failed.\n{source}"))]
+    #[snafu(display("Query response transformation failed. {source}"))]
     ResultTransformError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    #[snafu(display(
+        "Internal error: {message}. Report a bug at https://github.com/spiceai/spiceai/issues."
+    ))]
+    InternalError { message: String },
 
     #[snafu(display(
         "GraphQL Query Error:

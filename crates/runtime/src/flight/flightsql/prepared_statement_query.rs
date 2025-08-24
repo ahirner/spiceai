@@ -242,7 +242,7 @@ pub enum Error {
     #[snafu(display("Multiple statements found in query. Only one statement is supported."))]
     MultipleStatements,
 
-    #[snafu(display("Invalid query: {query}\n{source}"))]
+    #[snafu(display("Invalid query: {query} {source}"))]
     InvalidQuery { query: String, source: ParserError },
 }
 
@@ -284,7 +284,7 @@ impl ConvertJdbcPlaceholdersVisitor {
     }
 
     fn visit_statement(&mut self, statement: &mut Statement) {
-        statement.visit(self);
+        let _ = statement.visit(self);
     }
 }
 

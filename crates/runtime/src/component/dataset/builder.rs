@@ -17,16 +17,19 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    Dataset, Error, Mode, ReadyState, Result, TimeFormat, UnsupportedTypeAction, acceleration,
-    replication, validate_identifier,
+    CheckAvailability, Dataset, Error, Mode, ReadyState, Result, TimeFormat, UnsupportedTypeAction,
+    acceleration, replication, validate_identifier,
 };
-use crate::{Runtime, component::dataset::acceleration::Engine};
+use crate::Runtime;
 use app::App;
 use datafusion::sql::TableReference;
 use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::{
-    component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
+    component::{
+        dataset::{self as spicepod_dataset},
+        embeddings::ColumnEmbeddingConfig,
+    },
     metric::Metrics,
     param::Params,
     semantic::Column,
@@ -54,6 +57,7 @@ pub struct DatasetBuilder {
     pub metrics: Metrics,
     pub runtime: Option<Arc<Runtime>>,
     pub vectors: Option<VectorStore>,
+    pub check_availability: CheckAvailability,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
@@ -72,7 +76,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             _ => ReadyState::from(dataset.ready_state),
         };
 
-        let mut acceleration = dataset
+        let acceleration = dataset
             .acceleration
             .map(acceleration::Acceleration::try_from)
             .transpose()?;
@@ -83,17 +87,25 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
 
         // If the dataset is enabled for a vector engine, use this instead of JIT.
         if let Some(vector_engine) = &dataset.vectors {
-            // We have a vector engine configured with no explicit acceleration, add the void acceleration to force indexing.
-            tracing::debug!(
-                "Dataset {} configured for vector engine and no explicit acceleration, adding void acceleration for indexing.",
-                dataset.name
-            );
+            // We have a vector engine configured with no explicit acceleration - no indexing will happen.
             if vector_engine.enabled && acceleration.is_none() {
-                acceleration = Some(acceleration::Acceleration {
-                    enabled: true,
-                    engine: Engine::Void,
-                    ..Default::default()
-                });
+                tracing::debug!(
+                    "Dataset {} configured for vector engine and no acceleration is defined - indexing will not occur.",
+                    dataset.name
+                );
+            }
+
+            // Chunking with vector engines is not supported (yet).
+            for column in &dataset.columns {
+                for embedding in &column.embeddings {
+                    if embedding.chunking.is_some() {
+                        return Err(crate::Error::InvalidSpicepodDataset {
+                            source: Error::ChunkingNotSupportedForVectorEngine {
+                                column: column.name.clone(),
+                            },
+                        });
+                    }
+                }
             }
         }
 
@@ -130,11 +142,13 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             metrics: dataset.metrics.unwrap_or_default(),
             runtime: None,
             vectors: dataset.vectors,
+            check_availability: CheckAvailability::from(dataset.check_availability),
         })
     }
 }
 
 impl DatasetBuilder {
+    #[allow(clippy::result_large_err)]
     pub fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
         Ok(DatasetBuilder {
             from,
@@ -157,9 +171,11 @@ impl DatasetBuilder {
             metrics: Metrics::default(),
             runtime: None,
             vectors: None,
+            check_availability: CheckAvailability::default(),
         })
     }
 
+    #[allow(clippy::result_large_err)]
     pub(crate) fn parse_table_reference(
         name: &str,
     ) -> std::result::Result<TableReference, crate::Error> {
@@ -243,6 +259,7 @@ impl DatasetBuilder {
             metrics: self.metrics,
             runtime,
             vectors: self.vectors,
+            check_availability: self.check_availability,
         };
 
         Ok(dataset)

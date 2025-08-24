@@ -10,7 +10,7 @@ version.workspace = true
 
 [dependencies]
 ahash.workspace = true
-anyhow = "1.0.95"
+anyhow = "1.0.99"
 app = { path = "../app" }
 arrow = { workspace = true, features = ["prettyprint"] }
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
@@ -32,7 +32,7 @@ octocrab = "0.44.1"
 opentelemetry.workspace = true
 opentelemetry_sdk.workspace = true
 otel-arrow = { path = "../../crates/otel-arrow" }
-rand = "0.9.1"
+rand.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 rustls.workspace = true
@@ -41,7 +41,7 @@ serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true
 spicepod = { path = "../spicepod" }
-sysinfo = "0.33.1"
+sysinfo = "0.35.2"
 telemetry = { path = "../../crates/telemetry" }
 tempfile.workspace = true
 tokio.workspace = true
@@ -55,7 +55,7 @@ spiceai = { workspace = true }
 nix = { version = "0.30", features = ["signal"] }
 
 [dev-dependencies]
-rstest = "0.25.0"
+rstest = "0.26.1"
 
 [features]
 anonymous_telemetry = []

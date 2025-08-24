@@ -42,12 +42,12 @@ jobs:
       matrix:
         branch:
           - 'trunk'
-          - 'release/1.4'
+          - 'release/1.5'
     concurrency:
       group: testoperator-dispatch-scheduled
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           ref: ${{ matrix.branch }}
 
@@ -110,7 +110,7 @@ jobs:
       group: testoperator-dispatch-${{ github.event.ref }}
       cancel-in-progress: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio

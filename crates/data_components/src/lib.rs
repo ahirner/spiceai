@@ -40,8 +40,10 @@ pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
 pub mod iceberg;
-#[cfg(feature = "debezium")]
+#[cfg(any(feature = "debezium", feature = "kafka"))]
 pub mod kafka;
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
 #[cfg(feature = "mssql")]
 pub mod mssql;
 #[cfg(feature = "mysql")]

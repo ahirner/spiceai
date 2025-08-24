@@ -17,11 +17,22 @@ use crate::accelerated_table::AcceleratedTable;
 use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
 use crate::component::metrics::MetricsProvider;
+use crate::dataconnector::DataConnector;
 use crate::dataconnector::DataConnectorError;
+use crate::dataconnector::DataConnectorResult;
+use crate::embeddings::execution_plan::compute_additional_embedding_columns;
+use crate::embeddings::execution_plan::construct_record_batch;
+use crate::federated_table::FederatedTable;
+use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use async_trait::async_trait;
+use data_components::cdc::ChangeEnvelope;
+use data_components::cdc::ChangesStream;
+use data_components::cdc::StreamError;
+use data_components::cdc::replace_change_batch_data;
 use datafusion::datasource::TableProvider;
+use futures::StreamExt;
 use itertools::Itertools;
 use llms::chunking::ChunkingConfig;
 use runtime_datafusion_index::IndexedTableProvider;
@@ -31,10 +42,6 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-
-use crate::dataconnector::DataConnector;
-use crate::dataconnector::DataConnectorResult;
-use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
 
 use super::table::EmbeddingTable;
 
@@ -103,6 +110,7 @@ impl EmbeddingConnector {
                     model: e.model.clone(),
                     chunking: e.chunking.clone(),
                     primary_keys: e.row_ids.clone(),
+                    vector_size: e.vector_size,
                 })
             })
             .collect_vec();
@@ -113,13 +121,14 @@ impl EmbeddingConnector {
             return Ok(inner_table_provider);
         }
 
-        let embed_columns: HashMap<String, String, _> = embeddings
+        let embed_columns: HashMap<String, ColumnEmbeddingConfig, _> = embeddings
             .iter()
-            .map(|e| (e.column.clone(), e.model.clone()))
+            .map(|e| (e.column.clone(), e.clone()))
             .collect::<HashMap<_, _>>();
 
         // Early check if embedding models are available.
-        for (column, model) in &embed_columns {
+        for (column, config) in &embed_columns {
+            let model = &config.model;
             if !self.embedding_models.read().await.contains_key(model) {
                 return Err(DataConnectorError::InvalidConfigurationNoSource {
                     dataconnector: "EmbeddingConnector".to_string(),
@@ -191,7 +200,7 @@ impl EmbeddingConnector {
                 for (column, config) in embedding_columns {
                     use runtime_datafusion_index::Index;
 
-                    use crate::embeddings::index::VectorIndex;
+                    use crate::embeddings::index::{VectorIndex, VectorScanTableProvider};
 
                     let vector_index = super::index::s3::try_from_dataset(
                         &dataset.name,
@@ -212,8 +221,12 @@ impl EmbeddingConnector {
                         }
                     })?;
 
-                    provider.underlying = (Arc::new(vector_index.clone()) as Arc<dyn VectorIndex>)
-                        .augment_table(provider.underlying);
+                    // augment the previous underlying table provider with the vector index
+                    // this will result in recursive augmentation of the underlying table for N embedding columns
+                    provider.underlying = Arc::new(VectorScanTableProvider::new(
+                        provider.underlying,
+                        Arc::new(vector_index.clone()) as Arc<dyn VectorIndex>,
+                    )) as Arc<dyn TableProvider>;
                     provider = provider.add_index(Arc::new(vector_index.clone()) as Arc<dyn Index>);
                 }
                 tracing::info!(
@@ -234,6 +247,46 @@ impl EmbeddingConnector {
                 message: format!("Unknown vector engine '.vectors.engine: {unknown_engine}'"),
             }),
         }
+    }
+
+    async fn embed_change_envelope(
+        maybe_envelope: Result<ChangeEnvelope, StreamError>,
+        embedding_table: Arc<EmbeddingTable>,
+    ) -> Result<ChangeEnvelope, StreamError> {
+        let envelope = maybe_envelope.map_err(|e| {
+            tracing::debug!("Error in underlying base stream: {e:?}");
+            e
+        })?;
+
+        let (change_committer, batch) = envelope.into_parts();
+        let data_batch = batch.data_batch();
+
+        let embeddings = compute_additional_embedding_columns(
+            &data_batch,
+            &embedding_table.embedded_columns,
+            Arc::clone(&embedding_table.embedding_models),
+        )
+        .await
+        .map_err(|e| {
+            tracing::debug!("Error when getting embedding columns: {e:?}");
+            StreamError::Arrow(e.to_string())
+        })?;
+
+        for (column_name, embeddings) in &embeddings {
+            tracing::trace!(
+                "Embedding column computed: {column_name}, embeddings: {:?}",
+                embeddings.len()
+            );
+        }
+
+        let embedded_batch =
+            construct_record_batch(&data_batch, &embedding_table.schema(), &embeddings)
+                .map_err(|e| StreamError::Arrow(e.to_string()))?;
+
+        let new_change_batch = replace_change_batch_data(&embedded_batch, &batch)
+            .map_err(|e| StreamError::Arrow(e.to_string()))?;
+
+        Ok(ChangeEnvelope::new(change_committer, new_change_batch))
     }
 }
 
@@ -285,5 +338,55 @@ impl DataConnector for EmbeddingConnector {
         self.inner_connector
             .on_accelerated_table_registration(dataset, accelerated_table)
             .await
+    }
+
+    fn supports_changes_stream(&self) -> bool {
+        self.inner_connector.supports_changes_stream()
+    }
+
+    fn changes_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+        let table_provider = federated_table.try_table_provider_sync()?;
+        let embedding_table = Arc::new(
+            table_provider
+                .as_any()
+                .downcast_ref::<EmbeddingTable>()?
+                .clone(),
+        );
+        let underlying_table = Arc::clone(&embedding_table.base_table);
+        let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
+
+        let stream = self
+            .inner_connector
+            .changes_stream(underlying_federated_table)?
+            .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table)))
+            .boxed();
+
+        Some(stream)
+    }
+
+    fn supports_append_stream(&self) -> bool {
+        self.inner_connector.supports_append_stream()
+    }
+
+    fn append_stream(&self, federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+        let table_provider = federated_table.try_table_provider_sync()?;
+        let embedding_table = Arc::new(
+            table_provider
+                .as_any()
+                .downcast_ref::<EmbeddingTable>()?
+                .clone(),
+        );
+        let underlying_table = Arc::clone(&embedding_table.base_table);
+        let underlying_federated_table = Arc::new(FederatedTable::Immediate(underlying_table));
+
+        let _ = underlying_federated_table.schema();
+
+        let stream = self
+            .inner_connector
+            .append_stream(underlying_federated_table)?
+            .then(move |item| Self::embed_change_envelope(item, Arc::clone(&embedding_table)))
+            .boxed();
+
+        Some(stream)
     }
 }

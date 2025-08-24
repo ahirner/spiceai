@@ -42,17 +42,17 @@ use super::{ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Invalid value for 'debezium_transport': {transport}.\nSupported values: 'kafka'\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"
+        "Invalid value for 'debezium_transport': {transport}. Supported values: 'kafka' For details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"
     ))]
     InvalidTransport { transport: String },
 
     #[snafu(display(
-        "Invalid value for 'debezium_message_format': {format}.\nSupported values: 'json'\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"
+        "Invalid value for 'debezium_message_format': {format}. Supported values: 'json' For details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"
     ))]
     InvalidMessageFormat { format: String },
 
     #[snafu(display(
-        "Missing required parameter: 'debezium_kafka_bootstrap_servers'. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"
+        "Missing required parameter: 'debezium_kafka_bootstrap_servers'. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium#parameters"
     ))]
     MissingKafkaBootstrapServers,
 
@@ -239,18 +239,18 @@ impl DataConnector for Debezium {
             dataset.is_accelerated(),
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
-                message: "The Debezium data connector only works with accelerated datasets.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                message: "The Debezium data connector requires an accelerated dataset. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );
         let Some(ref acceleration) = dataset.acceleration else {
-            unreachable!("we just checked above that the dataset is accelerated");
+            unreachable!("Dataset acceleration already verified. This should never be None here.");
         };
         ensure!(
             acceleration.engine != Engine::Arrow,
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
-                message: "The Debezium data connector only works with non-Arrow acceleration engines.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                message: "The Debezium data connector does not support the Arrow acceleration engine. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );
@@ -258,7 +258,7 @@ impl DataConnector for Debezium {
             self.resolve_refresh_mode(acceleration.refresh_mode) == RefreshMode::Changes,
             super::InvalidConfigurationNoSourceSnafu {
                 dataconnector: "debezium",
-                message: "The Debezium data connector only works with 'changes' refresh mode.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
+                message: "The Debezium connector is only compatible with refresh mode 'changes'. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
                 connector_component: ConnectorComponent::from(dataset),
             }
         );
@@ -267,7 +267,7 @@ impl DataConnector for Debezium {
 
         if !dataset.is_file_accelerated() {
             tracing::warn!(
-                "Dataset {dataset_name} is not file accelerated. This is not recommended as it requires replaying all changes from the beginning on restarts.",
+                "Dataset {dataset_name} is not file accelerated, which forces full change replay on restarts. It is recommended only to use file acceleration with the Debezium connector. For details, visit: https://spiceai.org/docs/components/data-connectors/debezium",
             );
         }
 
@@ -278,7 +278,7 @@ impl DataConnector for Debezium {
             Some(metadata) => {
                 let kafka_consumer = KafkaConsumer::create_with_existing_group_id(
                     &metadata.consumer_group_id,
-                    self.kafka_config.clone(),
+                    &self.kafka_config,
                 )
                 .boxed()
                 .context(super::UnableToGetReadProviderSnafu {
@@ -316,7 +316,7 @@ impl DataConnector for Debezium {
 
                 (kafka_consumer, metadata, Arc::new(schema))
             }
-            None => get_metadata_from_kafka(dataset, topic, self.kafka_config.clone()).await?,
+            None => get_metadata_from_kafka(dataset, topic, &self.kafka_config).await?,
         };
 
         let refresh_sql = dataset.refresh_sql();
@@ -386,7 +386,7 @@ async fn set_metadata_to_accelerator(
 async fn get_metadata_from_kafka(
     dataset: &Dataset,
     topic: &str,
-    kafka_config: KafkaConfig,
+    kafka_config: &KafkaConfig,
 ) -> super::DataConnectorResult<(KafkaConsumer, DebeziumKafkaMetadata, SchemaRef)> {
     let dataset_name = dataset.name.to_string();
     let kafka_consumer = KafkaConsumer::create_with_generated_group_id(&dataset_name, kafka_config)
@@ -424,7 +424,16 @@ async fn get_metadata_from_kafka(
         }
     };
 
-    let primary_keys = msg.key().get_primary_key();
+    let Some(key) = msg.key() else {
+        return Err(super::DataConnectorError::UnableToGetReadProvider {
+            dataconnector: "debezium".to_string(),
+            source: "CDC message key is missing. Verify Debezium CDC configuration and try again."
+                .into(),
+            connector_component: ConnectorComponent::from(dataset),
+        });
+    };
+
+    let primary_keys = key.get_primary_key();
 
     let Some(schema_fields) = msg.value().get_schema_fields() else {
         return Err(super::DataConnectorError::UnableToGetReadProvider {

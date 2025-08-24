@@ -28,21 +28,20 @@ use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
 
 use crate::datafusion::builder::get_df_default_config;
-use crate::object_store_registry::default_runtime_env;
-
+use runtime_object_store::registry::default_runtime_env;
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "The provided Retention SQL could not be parsed.\n{source}\nCheck the SQL for syntax errors."
+        "The provided Retention SQL could not be parsed. {source} Check the SQL for syntax errors."
     ))]
     UnableToParseSql {
         source: sqlparser::parser::ParserError,
     },
 
     #[snafu(display(
-        "Expected a single SQL statement for the retention SQL, found {num_statements}.\nRewrite the SQL to only contain a single DELETE FROM statement."
+        "Expected a single SQL statement for the retention SQL, found {num_statements}. Rewrite the SQL to only contain a single DELETE FROM statement."
     ))]
     ExpectedSingleSqlStatement { num_statements: usize },
 
@@ -50,17 +49,17 @@ pub enum Error {
     InvalidSqlStatement { expected_table: TableReference },
 
     #[snafu(display(
-        "DELETE statement must have a WHERE clause for retention SQL.\nRewrite the SQL to include a WHERE clause, i.e. DELETE FROM {expected_table} WHERE column = 'value'"
+        "DELETE statement must have a WHERE clause for retention SQL. Rewrite the SQL to include a WHERE clause, i.e. DELETE FROM {expected_table} WHERE column = 'value'"
     ))]
     MissingWhereClause { expected_table: TableReference },
 
     #[snafu(display(
-        "Only DELETE statements are allowed in retention SQL.\nRewrite the SQL to use DELETE FROM {expected_table} WHERE <condition>"
+        "Only DELETE statements are allowed in retention SQL. Rewrite the SQL to use DELETE FROM {expected_table} WHERE <condition>"
     ))]
     OnlyDeleteStatements { expected_table: TableReference },
 
     #[snafu(display(
-        "The table '{table_name}' in the retention SQL does not match the expected table '{expected_table}'.\nRewrite the SQL to use the correct table name."
+        "The table '{table_name}' in the retention SQL does not match the expected table '{expected_table}'. Rewrite the SQL to use the correct table name."
     ))]
     TableMismatch {
         table_name: String,
@@ -76,10 +75,11 @@ pub enum Error {
     #[snafu(display("Failed to parse SQL expression '{expression}': {source}"))]
     ExpressionParsing {
         expression: String,
-        source: DataFusionError,
+        source: Box<DataFusionError>,
     },
 }
 
+#[allow(clippy::result_large_err)]
 pub fn parse_retention_sql(
     expected_table: &TableReference,
     retention_sql: &str,
@@ -126,6 +126,7 @@ pub fn parse_retention_sql(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_table_name(
     from: &sqlparser::ast::FromTable,
     expected_table: &TableReference,
@@ -173,6 +174,7 @@ fn validate_table_name(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 fn to_df_logical_expr(sql_expr: &SQLExpr, schema: Arc<Schema>) -> Result<Expr> {
     let df_schema = DFSchema::try_from(schema).context(SchemaConversionSnafu)?;
 
@@ -184,6 +186,7 @@ fn to_df_logical_expr(sql_expr: &SQLExpr, schema: Arc<Schema>) -> Result<Expr> {
     let expr_string = format!("{sql_expr}");
     ctx.state()
         .create_logical_expr(&expr_string, &df_schema)
+        .map_err(Box::new)
         .context(ExpressionParsingSnafu {
             expression: expr_string,
         })

@@ -176,6 +176,7 @@ impl Service {
         query.get_schema().await.map_err(handle_datafusion_error)
     }
 
+    #[allow(clippy::result_large_err)]
     fn serialize_schema(schema: &Schema) -> Result<Bytes, Status> {
         let message: IpcMessage = SchemaAsIpc::new(schema, &IpcWriteOptions::default())
             .try_into()
@@ -190,16 +191,12 @@ impl Service {
         sql: &str,
         parameters: Option<ParamValues>,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
-        let query = QueryBuilder::new(sql, Arc::clone(&datafusion));
-
-        let query = match parameters {
-            Some(parameters) => query.parameters(parameters),
-            None => query,
-        };
-
-        let query = query.build();
-
-        let query_result = query.run().await.map_err(handle_query_error)?;
+        let query_result = QueryBuilder::new(sql, Arc::clone(&datafusion))
+            .parameters(parameters)
+            .build()
+            .run()
+            .await
+            .map_err(handle_query_error)?;
 
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
 
@@ -272,7 +269,8 @@ where
 
 fn handle_query_error(e: query::Error) -> Status {
     match e {
-        query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(source),
+        query::Error::BindingParameters { source }
+        | query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(source),
         _ => to_tonic_err(e),
     }
 }
@@ -333,8 +331,10 @@ fn handle_datafusion_error(e: DataFusionError) -> Status {
                 Status::internal("Several DataFusion errors occurred, but no details available")
             }
         }
+        DataFusionError::NotImplemented(message) => {
+            Status::invalid_argument(format!("Unsupported Query. {message}"))
+        }
         DataFusionError::Internal(_)
-        | DataFusionError::NotImplemented(_)
         | DataFusionError::ArrowError(..)
         | DataFusionError::IoError(_)
         | DataFusionError::ObjectStore(_)
@@ -393,7 +393,8 @@ pub async fn start(
         channel_map: Arc::new(RwLock::new(HashMap::new())),
         basic_auth: endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
     };
-    let svc = FlightServiceServer::new(service);
+    let svc = FlightServiceServer::new(service)
+        .max_decoding_message_size(flight_client::MAX_DECODING_MESSAGE_SIZE);
 
     tracing::info!("Spice Runtime Flight listening on {bind_address}");
     runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);

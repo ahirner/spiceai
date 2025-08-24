@@ -47,6 +47,7 @@ mod databricks_spark_catalog;
 mod databricks_spark_catalog_m2m;
 #[cfg(all(feature = "spark", feature = "databricks"))]
 mod databricks_spark_m2m;
+mod dataset_availability;
 #[cfg(feature = "delta_lake")]
 mod delta_lake;
 mod docker;
@@ -63,6 +64,8 @@ mod graphql;
 mod iceberg;
 mod iceberg_api;
 mod metadata;
+#[cfg(feature = "mongodb")]
+mod mongo;
 #[cfg(feature = "mssql")]
 mod mssql;
 #[cfg(feature = "mysql")]

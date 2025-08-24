@@ -30,7 +30,7 @@ use tokio::sync::Mutex;
 use tracing_futures::Instrument;
 
 use crate::{
-    component::dataset::Dataset,
+    component::dataset::{CheckAvailability, Dataset},
     datafusion::{DataFusion, error::find_datafusion_root},
     metrics,
 };
@@ -43,7 +43,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to read the table.\n{source}"))]
+    #[snafu(display("Failed to read the table. {source}"))]
     UnableToGetTable { source: DataFusionError },
 
     #[snafu(display("{source}"))]
@@ -51,11 +51,11 @@ pub enum Error {
         source: crate::datafusion::query::Error,
     },
 
-    #[snafu(display("Failed to get recently access datasets.\n{source}"))]
+    #[snafu(display("Failed to get recently access datasets. {source}"))]
     UnableToGetRecentlyAccessedDatasets { source: DataFusionError },
 
     #[snafu(display(
-        "Spice received an unexpected data type from a `task_history` query: {data_type}\nThis is likely a bug in Spice, which can be reported here: https://github.com/spiceai/spiceai/issues"
+        "Spice received an unexpected data type from a `task_history` query: {data_type} This is likely a bug in Spice, which can be reported here: https://github.com/spiceai/spiceai/issues"
     ))]
     UnexpectedDataType {
         data_type: arrow::datatypes::DataType,
@@ -63,7 +63,7 @@ pub enum Error {
 }
 
 #[derive(Clone)]
-struct DatasetAvailabilityInfo {
+pub struct DatasetAvailabilityInfo {
     name: String,
     table_provider: Arc<dyn TableProvider>,
     last_available_time: SystemTime,
@@ -95,7 +95,7 @@ enum AvailabilityVerificationResult {
 
 pub struct DatasetsHealthMonitor {
     df: Arc<DataFusion>,
-    monitored_datasets: Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>>,
+    pub monitored_datasets: Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>>,
     is_task_history_enabled: bool,
 }
 
@@ -117,6 +117,14 @@ impl DatasetsHealthMonitor {
 
     pub async fn register_dataset(&self, dataset: &Dataset) -> Result<()> {
         if dataset.is_accelerated() {
+            return Ok(());
+        }
+
+        if matches!(dataset.check_availability, CheckAvailability::Disabled) {
+            tracing::debug!(
+                "Skipping dataset {} for availability monitoring (disabled in config)",
+                dataset.name
+            );
             return Ok(());
         }
 
@@ -231,7 +239,7 @@ AND labels.error_code IS NULL"
                 // Only datasets without recent activity/availability
                 let datasets_to_check = datasets_for_availability_check(&monitored_datasets).await;
 
-                // check `task_history` first to exlude anything that had a successful query in the last 10 minutes
+                // check `task_history` first to exclude anything that had a successful query in the last 10 minutes
                 let recently_accessed_datasets = if is_task_history_enabled {
                     match Self::get_recently_accessed_datasets(Arc::clone(&df)).await {
                         Ok(datasets) => datasets,
@@ -320,7 +328,7 @@ async fn update_dataset_availability_info(
             report_dataset_unavailable_time(dataset_name, None);
         }
         AvailabilityVerificationResult::Unavailable(last_available_time, err) => {
-            tracing::warn!("Failed to verify the dataset {dataset_name} was available.\n{err}\n");
+            tracing::warn!("Failed to verify the dataset {dataset_name} was available. {err}");
             report_dataset_unavailable_time(dataset_name, Some(last_available_time));
         }
     }
