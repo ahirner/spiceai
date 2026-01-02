@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::LazyLock;
 
-use test_framework::opentelemetry::metrics::Gauge;
+use test_framework::opentelemetry::metrics::{Gauge, Histogram};
 use test_framework::telemetry::METER;
 
 pub static ITERATIONS: LazyLock<Gauge<u64>> = LazyLock::new(|| {
@@ -40,6 +40,30 @@ pub static ROW_COUNT: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .u64_gauge("row_count")
         .with_description("Number of rows returned from the query.")
         .with_unit("rows")
+        .build()
+});
+
+pub static ACCELERATION_SIZE_BYTES: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("acceleration_size_bytes")
+        .with_description("Size of acceleration data on disk.")
+        .with_unit("bytes")
+        .build()
+});
+
+pub static READY_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("ready_duration_ms")
+        .with_description("Duration until the spicepod is ready.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static HEALTH_LATENCY: LazyLock<Histogram<f64>> = LazyLock::new(|| {
+    METER
+        .f64_histogram("health_latency_ms")
+        .with_description("Latency of /health and /v1/ready probes.")
+        .with_unit("ms")
         .build()
 });
 
@@ -99,6 +123,38 @@ pub static TEST_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
         .build()
 });
 
+pub static VECTOR_INDEX_CREATION_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("vector_index_creation_duration_ms")
+        .with_description("Duration of vector search index (embeddings) creation.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static SEARCH_DURATION: LazyLock<Gauge<u64>> = LazyLock::new(|| {
+    METER
+        .u64_gauge("search_duration_ms")
+        .with_description("Total duration to process all search queries.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static SEARCH_RPS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("search_rps")
+        .with_description("Search queries per second.")
+        .with_unit("rps")
+        .build()
+});
+
+pub static SEARCH_P95_RESPONSE_TIME: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("search_p95_time_ms")
+        .with_description("95th percentile response time for search queries.")
+        .with_unit("ms")
+        .build()
+});
+
 pub static PEAK_MEMORY_USAGE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
     METER
         .f64_gauge("peak_memory_usage_mb")
@@ -128,5 +184,68 @@ pub static SCORE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
         .f64_gauge("score")
         .with_description("Test score.")
         .with_unit("score")
+        .build()
+});
+
+// Text to Sql specific metrics
+
+pub static AVERAGE_TEXT_TO_SQL_ATTEMPTS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_attempts")
+        .with_description(
+            "The average number of internal SQL queries performed to perform a text-to-SQL",
+        )
+        .with_unit("queries")
+        .build()
+});
+pub static TEXT_TO_SQL_EXACT_MATCH_RATE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_exact_match_rate")
+        .with_description(
+            "The rate at which a text-to-SQL operation correctly outputs an exact match",
+        )
+        .with_unit("ratio")
+        .build()
+});
+pub static TEXT_TO_SQL_ERROR_RATE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("text_to_sql_error_rate")
+        .with_description("The rate at which a text-to-SQL operation returns an error externally")
+        .with_unit("ratio")
+        .build()
+});
+
+// Spiced runtime metrics (scraped from /metrics endpoint)
+
+pub static SPICED_QUERY_COUNT: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("spiced_query_count")
+        .with_description("Total number of queries executed by spiced.")
+        .with_unit("queries")
+        .build()
+});
+
+#[expect(dead_code)]
+pub static SPICED_QUERY_DURATION_AVG: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("spiced_query_duration_avg_ms")
+        .with_description("Average query duration from spiced metrics.")
+        .with_unit("ms")
+        .build()
+});
+
+pub static SPICED_CACHE_HIT_RATE: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("spiced_cache_hit_rate")
+        .with_description("Cache hit rate from spiced metrics.")
+        .with_unit("ratio")
+        .build()
+});
+
+pub static SPICED_ACTIVE_CONNECTIONS: LazyLock<Gauge<f64>> = LazyLock::new(|| {
+    METER
+        .f64_gauge("spiced_active_connections")
+        .with_description("Peak active connections during test.")
+        .with_unit("connections")
         .build()
 });

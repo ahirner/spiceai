@@ -17,7 +17,6 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 use std::{error::Error, sync::Arc};
 
-use ::arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{catalog::CatalogProvider, datasource::TableProvider, sql::TableReference};
 
@@ -40,8 +39,10 @@ pub mod flight;
 #[cfg(feature = "flightsql")]
 pub mod flightsql;
 pub mod iceberg;
-#[cfg(feature = "debezium")]
+#[cfg(any(feature = "debezium", feature = "kafka"))]
 pub mod kafka;
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
 #[cfg(feature = "mssql")]
 pub mod mssql;
 #[cfg(feature = "mysql")]
@@ -52,6 +53,8 @@ pub mod odbc;
 pub mod oracle;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+pub mod refresh_skip;
+pub mod s3_single_file_cached;
 #[cfg(feature = "s3_vectors")]
 pub mod s3_vectors;
 
@@ -64,14 +67,18 @@ pub mod spark_connect;
 pub mod spice_cloud;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+#[cfg(feature = "turso")]
+pub mod turso;
 pub mod unity_catalog;
 
+pub mod git;
 pub mod github;
 pub mod rate_limit;
 
 pub mod cdc;
 pub mod delete;
 pub mod graphql;
+pub mod http;
 #[cfg(feature = "imap")]
 pub mod imap;
 pub mod object;
@@ -82,7 +89,6 @@ pub trait Read: Send + Sync {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
 }
 
@@ -91,7 +97,6 @@ pub trait ReadWrite: Send + Sync {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn Error + Send + Sync>>;
 }
 

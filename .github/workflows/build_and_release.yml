@@ -28,73 +28,95 @@ on:
   workflow_dispatch:
     inputs:
       platform_option:
-        description: "Which option do you want to run on? (Default is ALL)"
+        description: 'Which option do you want to run on? (Default is ALL)'
         required: false
         type: choice
         options:
-          - "all"
-          - "Linux x64"
-          - "Linux aarch64"
-          - "macOS aarch64 (Apple Silicon)"
-          - "Windows x64"
-          - "macOS x64 (Intel)"
-        default: "all"
+          - 'all'
+          - 'Linux x64'
+          - 'Linux aarch64'
+          - 'macOS aarch64 (Apple Silicon)'
+          - 'Windows x64'
+          - 'macOS x64 (Intel)'
+        default: 'all'
       profile_option:
-        description: "Which Rust build profile to use? (Default is release)"
+        description: 'Which Rust build profile to use? (Default is release)'
         required: false
         type: choice
         options:
-          - "release"
-          - "release-lto"
-        default: "release"
+          - 'release'
+          - 'release-lto'
+        default: 'release'
 
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v7
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: setup-matrix
         with:
           script: |
+            // Check if this is a tagged release
+            const isTaggedRelease = context.ref.startsWith('refs/tags/v');
+
+            // Check if this is a release branch
+            const isReleaseBranch = context.ref.startsWith('refs/heads/release-') ||
+                                     context.ref.startsWith('refs/heads/release/');
+
+            // Check if this is a manual workflow dispatch
+            const isManualDispatch = context.eventName === 'workflow_dispatch';
+
+            // Include Windows and Linux ARM only for tagged releases, release branches, or manual dispatch (exclude trunk pushes)
+            const includeWindowsAndLinuxArm = isTaggedRelease || isReleaseBranch || isManualDispatch;
+
+            // Use hosted macOS runners only for tagged releases, otherwise use self-hosted
+            const macosRunner = isTaggedRelease ? "macos-15" : "spiceai-macos";
+
             const matrix = [
               {
                 name: "Linux x64",
-                runner: "spiceai-runners",
+                runner: "spiceai-dev-runners",
                 target_os: "linux",
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
                 tags: ["default", "models", "odbc"],
               }, {
+                name: "macOS aarch64 (Apple Silicon)",
+                runner: macosRunner,
+                target_os: "darwin",
+                target_arch: "aarch64",
+                target_arch_go: "arm64",
+                tags: ["default", "models", "metal"],
+              }
+            ];
+
+            // Add Linux ARM and Windows only for tagged releases, release branches, or manual dispatch
+            if (includeWindowsAndLinuxArm) {
+              matrix.push({
                 name: "Linux aarch64",
                 runner: "hosted-linux-arm-runner",
                 target_os: "linux",
                 target_arch: "aarch64",
                 target_arch_go: "arm64",
                 tags: ["default", "models"],
-              }, {
-                name: "macOS aarch64 (Apple Silicon)",
-                runner: "macos-14",
-                target_os: "darwin",
-                target_arch: "aarch64",
-                target_arch_go: "arm64",
-                tags: ["default", "models", "metal"],
-              }, {
+              });
+              matrix.push({
                 name: "Windows x64",
                 runner: "windows-latest",
                 target_os: "windows",
                 target_arch: "x86_64",
                 target_arch_go: "amd64",
                 tags: ["default", "models"],
-              }
-            ];
+              });
+            }
 
             // If running via workflow_dispatch, filter based on input
-            if (context.eventName === 'workflow_dispatch') {
+            if (isManualDispatch) {
               const platform_option = context.payload.inputs.platform_option;
 
               if (platform_option === 'all') {
@@ -111,17 +133,20 @@ jobs:
     runs-on: ${{ matrix.target.runner }}
     needs: setup-matrix
     env:
-      GOVER: 1.24.2
+      GOVER: 1.25.3
       GOOS: ${{ matrix.target.target_os }}
       GOARCH: ${{ matrix.target.target_arch_go }}
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
 
     strategy:
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
@@ -133,9 +158,10 @@ jobs:
       - name: Set up Go
         # CLI is only built on the same runners as the default spiced binary
         if: contains(matrix.target.tags, 'default')
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@4dc6199c7b1a012772edbd06daecab0f50c9053c # v6
         with:
           go-version: ${{ env.GOVER }}
+          cache: false
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -168,8 +194,9 @@ jobs:
       - name: Install missing tools (Mac)
         if: matrix.target.target_os == 'darwin'
         run: |
+          brew update
           brew install protobuf
-          brew install cmake
+          brew list cmake || brew install cmake
           brew install unixodbc
           echo "RUSTFLAGS=-L /opt/homebrew/lib" >> $GITHUB_ENV
 
@@ -200,17 +227,27 @@ jobs:
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         run: ./spiced.exe --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spiced.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
+
+      - name: Upload spiced to Minio
+        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
+        uses: ./.github/actions/upload-to-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          source_path: spiced_linux_x86_64.tar.gz
+          destination_path: spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
 
       ## Models flavor
       - name: Build spiced (models)
@@ -240,17 +277,27 @@ jobs:
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'models')
         run: ./spiced.exe --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'models')
         with:
           name: spiced_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'models')
         with:
           name: spiced.exe_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced.exe_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
+
+      - name: Upload spiced_models to Minio
+        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'models')
+        uses: ./.github/actions/upload-to-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          source_path: spiced_models_linux_x86_64.tar.gz
+          destination_path: spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
 
       ## ODBC + Models flavor - for now, assume ODBC only builds with models because this binary is only used for internal testing.
       - name: Build spiced (odbc,models)
@@ -269,11 +316,21 @@ jobs:
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
         run: ./spiced --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
         with:
           name: spiced_odbc_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spiced_odbc_models_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
+
+      - name: Upload spiced_odbc_models to Minio
+        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'odbc') && contains(matrix.target.tags, 'models')
+        uses: ./.github/actions/upload-to-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+          source_path: spiced_odbc_models_linux_x86_64.tar.gz
+          destination_path: spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
 
       ## Models + metal flavor
       - name: Build spiced (models)
@@ -292,7 +349,7 @@ jobs:
         if: matrix.target.target_os == 'darwin'
         run: ./spiced --version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         if: matrix.target.target_os == 'darwin'
         with:
           name: spiced_models_metal_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
@@ -324,86 +381,27 @@ jobs:
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         run: ./spice.exe version
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spice_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         if: matrix.target.target_os == 'windows' && contains(matrix.target.tags, 'default')
         with:
           name: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           path: spice.exe_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}.tar.gz
-      
-      # Publish Linux x86_64 binaries to MinIO
-      - name: Setup MinIO
-        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64'
-        uses: ./.github/actions/setup-minio
-        with:
-          minio_endpoint: ${{ secrets.MINIO_ENDPOINT }}
-          minio_access_key: ${{ secrets.MINIO_ACCESS_KEY }}
-          minio_secret_key: ${{ secrets.MINIO_SECRET_KEY }}
-      
-      - name: Upload artifacts to Minio
-        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64'
-        run: |
-          if [ -f "spiced_linux_x86_64.tar.gz" ]; then
-            mc cp spiced_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
-          fi;
 
-          if [ -f "spiced_models_linux_x86_64.tar.gz" ]; then
-            mc cp spiced_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
-          fi;
-
-          if [ -f "spiced_odbc_models_linux_x86_64.tar.gz" ]; then
-            mc cp spiced_odbc_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/
-          fi;
-
-          if [ -f "spice_linux_x86_64.tar.gz" ]; then
-            mc cp spice_linux_x86_64.tar.gz spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/
-          fi;
-
-  upload_to_minio:
-    name: Upload artifacts to MinIO
-    needs: build
-    runs-on: spiceai-dev-runners
-    if: inputs.platform_option == 'Linux x64' || inputs.platform_option == 'all' || github.event_name == 'push'
-    steps:
-      - uses: actions/checkout@v4
-      - name: Setup MinIO
-        uses: ./.github/actions/setup-minio
+      - name: Upload spice CLI to Minio
+        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
+        uses: ./.github/actions/upload-to-minio
         with:
           minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
-
-      - name: download artifacts - spice_linux_x86_64
-        uses: actions/download-artifact@v4
-        with:
-          name: spice_linux_x86_64
-
-      - name: download artifacts - spiced_linux_x86_64
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_linux_x86_64
-      
-      - name: download artifacts - spiced_models_linux_x86_64
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_models_linux_x86_64
-      
-      - name: download artifacts - spiced_odbc_models_linux_x86_64
-        uses: actions/download-artifact@v4
-        with:
-          name: spiced_odbc_models_linux_x86_64
-
-      - name: Upload artifacts to Minio
-        run: |
-            mc cp spiced_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/spiced_linux_x86_64.tar.gz
-            mc cp spiced_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/spiced_models_linux_x86_64.tar.gz
-            mc cp spiced_odbc_models_linux_x86_64.tar.gz spice-minio/artifacts/spiced/linux-x86_64/${{ github.sha }}/spiced_odbc_models_linux_x86_64.tar.gz
-            mc cp spice_linux_x86_64.tar.gz spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/spice_linux_x86_64.tar.gz
+          source_path: spice_linux_x86_64.tar.gz
+          destination_path: spice-minio/artifacts/spice/linux-x86_64/${{ github.sha }}/
 
   publish:
     name: Publish ${{ matrix.target_os }}-${{ matrix.target_arch }} binaries
@@ -426,57 +424,57 @@ jobs:
 
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
 
       - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spice_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: spice.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: spiced.exe_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os != 'windows'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
 
       - name: download artifacts - spiced_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'windows'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: spiced.exe_models_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}
-      
-      # macOS metal 
+
+      # macOS metal
       - name: download artifacts - spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
         if: matrix.target_os == 'darwin'
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: spiced_models_metal_${{ matrix.target_os }}_${{ matrix.target_arch }}
           path: ${{ env.ARTIFACT_DIR }}

@@ -35,7 +35,6 @@ use async_trait::async_trait;
 use datafusion::{
     arrow::array::Int32Array,
     catalog::Session,
-    common::Statistics,
     datasource::{MemTable, TableProvider, memory::MemorySourceConfig},
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
@@ -59,8 +58,8 @@ use runtime::{
         parameters::ConnectorParams,
     },
     parameters::ParameterSpec,
-    request::{AsyncMarker, Protocol, RequestContext},
 };
+use runtime_request_context::{AsyncMarker, Protocol, RequestContext};
 use spicepod::{
     acceleration::Acceleration,
     component::dataset::{Dataset as SpicepodDataset, ReadyState},
@@ -308,10 +307,6 @@ impl ExecutionPlan for DelayedExecutionPlan {
 
         Ok(Box::pin(record_batch_stream))
     }
-
-    fn statistics(&self) -> datafusion::error::Result<Statistics> {
-        self.inner.statistics()
-    }
 }
 
 impl DisplayAs for DelayedExecutionPlan {
@@ -496,7 +491,6 @@ fn get_federated_dataset(
     dataset
 }
 
-#[allow(clippy::too_many_lines)]
 async fn run_ready_state_test(
     is_native: bool,
     ready_state: ReadyState,
@@ -535,10 +529,10 @@ async fn run_ready_state_test(
                 .build()
         };
 
+        configure_test_datafusion();
         let rt =
             Runtime::builder()
                 .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .build()
                 .await;
 
@@ -805,12 +799,12 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
                 ))
                 .build();
 
+             configure_test_datafusion();
             let rt =
-            Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+                Runtime::builder()
+                    .with_app(app)
+                    .build()
+                    .await;
 
             let cloned_rt = Arc::new(rt.clone());
 
@@ -920,12 +914,12 @@ async fn test_ready_state_mixed_duckdb_acceleration() -> Result<(), anyhow::Erro
                 ))
                 .build();
 
+             configure_test_datafusion();
             let rt =
-            Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+                Runtime::builder()
+                    .with_app(app)
+                    .build()
+                    .await;
 
             let cloned_rt = Arc::new(rt.clone());
 

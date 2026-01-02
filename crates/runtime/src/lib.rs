@@ -20,26 +20,34 @@ use ::tools::rename::with_name;
 use async_stream::stream;
 use init::scheduler::ScheduleRegistry;
 use std::collections::HashSet;
+use std::fmt::Debug;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Weak;
 use std::time::Duration;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::registry::TokenProviderRegistry;
+use tokio::runtime::Handle;
 use tokio::{sync::Mutex, task::JoinHandle, time::Instant};
 use tools::factory::{ToolFactory, default_catalog_names};
-use tracing::subscriber;
 use util::force_shutdown_signal;
 use worker::WorkerRegistry;
 
 use crate::dataaccelerator::AcceleratorEngineRegistry;
+use crate::model::ENABLE_MODEL_SUPPORT_MESSAGE;
+use crate::model::LLMResponsesModelStore;
 use crate::{
     auth::EndpointAuth, dataconnector::DataConnector, datafusion::DataFusion,
-    internal_table::Error as InternalTableError, model::ENABLE_MODEL_SUPPORT_MESSAGE,
+    internal_table::Error as InternalTableError,
 };
 
 use ::datafusion::error::DataFusionError;
 use ::datafusion::sql::{TableReference, sqlparser};
 use app::App;
+
+use {crate::Error::FailedToStartClusterExecutor, crate::config::ClusterRole};
+
 use builder::RuntimeBuilder;
 use cancellable_task::{CancellableTaskHandle, spawn_cancellable_task};
 use config::Config;
@@ -47,17 +55,17 @@ use dataconnector::ConnectorComponent;
 use datasets_health_monitor::DatasetsHealthMonitor;
 use extension::ExtensionFactory;
 use flight::RateLimits;
-use futures::Stream;
-use futures::future::{join_all, try_join_all};
+use futures::{
+    Stream, TryFutureExt,
+    future::{join_all, try_join_all},
+};
 #[cfg(feature = "openapi")]
 pub use http::get_api_doc;
-use model::{EmbeddingModelStore, EvalScorerRegistry, LLMModelStore};
+use model::{EmbeddingModelStore, EvalScorerRegistry, LLMChatCompletionsModelStore};
 
 use crate::tools::{Tooling, catalog::SpiceToolCatalog, factory::default_available_catalogs};
 use model_components::model::Model;
 pub use notify::Error as NotifyError;
-use secrecy::SecretString;
-use secrets::{ParamStr, Secrets};
 use snafu::prelude::*;
 use spicepod::component::eval::Eval;
 use status::ComponentStatus;
@@ -68,11 +76,13 @@ use tokio_util::sync::CancellationToken;
 pub use util::shutdown_signal;
 
 use crate::extension::Extension;
+use crate::udtfs::ListUDFTableFunc;
 pub mod accelerated_table;
 pub mod auth;
 mod builder;
 mod cancellable_task;
 pub mod catalogconnector;
+mod changes;
 pub mod component;
 pub mod config;
 pub mod dataaccelerator;
@@ -81,7 +91,6 @@ pub mod datafusion;
 pub mod datasets_health_monitor;
 pub mod dataupdate;
 pub mod embeddings;
-pub mod execution_plan;
 pub mod extension;
 pub mod federated_table;
 pub mod flight;
@@ -92,15 +101,20 @@ mod management;
 mod metrics;
 mod metrics_server;
 pub mod model;
-pub mod object_store_registry;
-pub mod objectstore;
 mod opentelemetry;
-pub mod parameters;
+pub mod otel_push_exporter;
+pub mod resource_monitor;
+
+pub use runtime_parameters as parameters;
+
 pub mod podswatcher;
 pub mod request;
 mod scheduling;
 pub mod search;
-pub mod secrets;
+pub mod secrets {
+    pub use runtime_secrets::*;
+}
+pub mod cluster;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
@@ -111,6 +125,7 @@ pub mod tools;
 pub mod topological_ordering;
 pub(crate) mod tracers;
 mod tracing_util;
+mod udtfs;
 mod view;
 mod worker;
 
@@ -120,7 +135,7 @@ pub enum Error {
     UnableToStartHttpServer { source: http::Error },
 
     #[snafu(display(
-        "Task execution failed: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Task execution failed: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToExecuteTask { source: tokio::task::JoinError },
 
@@ -130,8 +145,8 @@ pub enum Error {
     #[snafu(display("Unable to start Flight server: {source}"))]
     UnableToStartFlightServer { source: flight::Error },
 
-    #[snafu(display("Unable to start OpenTelemetry server: {source}"))]
-    UnableToStartOpenTelemetryServer { source: opentelemetry::Error },
+    #[snafu(display("Unable to start internal cluster server: {source}"))]
+    UnableToStartClusterServer { source: flight::Error },
 
     #[snafu(display("Unknown data source: {data_source}"))]
     UnknownDataSource { data_source: String },
@@ -174,17 +189,17 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Unknown data connector: {data_connector}.\nSpecify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"
+        "Unknown data connector: {data_connector}. Specify a valid data connector and retry. For details, visit: https://spiceai.org/docs/components/data-connectors"
     ))]
     UnknownDataConnector { data_connector: String },
 
     #[snafu(display(
-        "Unknown catalog connector: {catalog_connector}.\nSpecify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"
+        "Unknown catalog connector: {catalog_connector}. Specify a valid catalog connector and retry. For details, visit: https://spiceai.org/docs/components/catalogs"
     ))]
     UnknownCatalogConnector { catalog_connector: String },
 
     #[snafu(display(
-        "The runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
+        "The runtime is built without ODBC support. Build Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
     ))]
     OdbcNotInstalled,
 
@@ -202,7 +217,7 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to setup the {connector_component} ({data_connector}).\n{source}"))]
+    #[snafu(display("Failed to setup the {connector_component} ({data_connector}). {source}"))]
     UnableToAttachDataConnector {
         source: datafusion::Error,
         connector_component: ConnectorComponent,
@@ -239,7 +254,7 @@ pub enum Error {
     AcceleratedTableInvalidChanges { dataset_name: String },
 
     #[snafu(display(
-        "An accelerated table has invalid configuration: {source}.\nUpdate the configuration and retry. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+        "An accelerated table has invalid configuration: {source}. Update the configuration and retry. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     InvalidAccelerationConfiguration {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -249,7 +264,7 @@ pub enum Error {
     ExpectedAccelerationSettings { name: String },
 
     #[snafu(display(
-        "The accelerator engine {name} is not available. Valid engines are arrow, duckdb, sqlite, and postgres."
+        "The accelerator engine {name} is not available. Valid engines are arrow, cayenne, duckdb, sqlite, and postgres."
     ))]
     AcceleratorEngineNotAvailable { name: String },
 
@@ -350,22 +365,22 @@ pub enum Error {
     ForceTerminated,
 
     #[snafu(display(
-        "Configuration of '{view_name}' view is invalid: {reason}.\nUpdate the configuration and retry. For details, visit: https://spiceai.org/docs/components/views"
+        "Configuration of '{view_name}' view is invalid: {reason}. Update the configuration and retry. For details, visit: https://spiceai.org/docs/components/views"
     ))]
     AcceleratedViewInvalidConfiguration { view_name: String, reason: String },
 
     #[snafu(display(
-        "Failed to start scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to start scheduler. {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToStartScheduler { source: scheduler::Error },
 
     #[snafu(display(
-        "Failed to build scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to build scheduler. {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToBuildScheduler { source: scheduler::Error },
 
     #[snafu(display(
-        "Failed to add schedule '{name}' to the '{scheduler}' scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to add schedule '{name}' to the '{scheduler}' scheduler. {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToAddSchedule {
         source: scheduler::Error,
@@ -374,7 +389,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to create a cron schedule from the provided expression: '{cron}'\n{source}\nEnsure the cron expression is valid and try again."
+        "Failed to create a cron schedule from the provided expression: '{cron}' {source} Ensure the cron expression is valid and try again."
     ))]
     FailedToCreateCronChannel {
         cron: String,
@@ -382,7 +397,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to remove a schedule '{name}' from the '{scheduler}' scheduler.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to remove a schedule '{name}' from the '{scheduler}' scheduler. {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToRemoveSchedule {
         source: scheduler::Error,
@@ -391,15 +406,31 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to infer the worker type for the worker '{name}'.\nEnsure the worker has a valid configuration, and try again.\nFor details, visit: https://spiceai.org/docs/components/workers"
+        "Failed to infer the worker type for the worker '{name}'. Ensure the worker has a valid configuration, and try again. For details, visit: https://spiceai.org/docs/components/workers"
     ))]
     FailedToInferWorkerType { name: String },
+
+    #[snafu(display(
+        "Dataset {dataset_name}: acceleration is required for full text search. Ensure the dataset has an acceleration configuration, and try again. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    FullTextSearchRequiresAcceleration { dataset_name: String },
+
+    #[snafu(display("Failed to start Ballista scheduler: {source}"))]
+    FailedToStartClusterScheduler {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Failed to start or register Ballista executor: {source}"))]
+    FailedToStartClusterExecutor {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
+const CLUSTER_EXECUTOR: &str = "cluster_executor";
+const CLUSTER_INTERNAL_SERVER: &str = "cluster_internal_server";
 const HTTP_SERVER: &str = "http_server";
 const METRICS_SERVER: &str = "metrics_server";
 const FLIGHT_SERVER: &str = "flight_server";
-const OPENTELEMETRY_SERVER: &str = "opentelemetry_server";
 const PODS_WATCHER: &str = "pods_watcher";
 const COMPONENTS_INITIAL_LOAD: &str = "components_initial_load";
 
@@ -412,11 +443,14 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub struct LogErrors(pub bool);
 
 #[derive(Clone)]
+#[expect(clippy::struct_field_names)]
 pub struct Runtime {
     app: Arc<RwLock<Option<Arc<App>>>>,
     df: Arc<DataFusion>,
     models: Arc<RwLock<HashMap<String, Model>>>,
-    llms: Arc<RwLock<LLMModelStore>>,
+    completion_llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
+    // LLMs that support the OpenAI Responses API
+    responses_llms: Arc<RwLock<LLMResponsesModelStore>>,
     embeds: Arc<RwLock<EmbeddingModelStore>>,
     workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,
@@ -429,17 +463,28 @@ pub struct Runtime {
     metrics_endpoint: Option<SocketAddr>,
     prometheus_registry: Option<prometheus::Registry>,
     rate_limits: Arc<RateLimits>,
+    io_runtime: Handle,
 
     autoload_extensions: Arc<HashMap<String, Box<dyn ExtensionFactory>>>,
     extensions: Arc<RwLock<HashMap<String, Arc<dyn Extension>>>>,
     spaced_tracer: Arc<tracers::SpacedTracer>,
 
     status: Arc<status::RuntimeStatus>,
-    runtime_tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
+    tasks: Arc<RwLock<HashMap<String, CancellableTaskHandle>>>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     token_provider_registry: Arc<TokenProviderRegistry>,
 
     schedulers: Arc<ScheduleRegistry>,
+
+    resource_monitor: resource_monitor::ResourceMonitor,
+
+    config: Arc<Config>,
+}
+
+impl Debug for Runtime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Runtime {self:p}")
+    }
 }
 
 impl Runtime {
@@ -448,14 +493,30 @@ impl Runtime {
         RuntimeBuilder::new()
     }
 
+    /// Returns a handle to the Tokio runtime that should be used to spawn IO tasks.
+    #[must_use]
+    pub fn tokio_io_runtime(&self) -> Handle {
+        self.io_runtime.clone()
+    }
+
     #[must_use]
     pub fn datafusion(&self) -> Arc<DataFusion> {
         Arc::clone(&self.df)
     }
 
     #[must_use]
+    pub fn config(&self) -> Arc<Config> {
+        Arc::clone(&self.config)
+    }
+
+    #[must_use]
     pub fn secrets(&self) -> Arc<RwLock<secrets::Secrets>> {
         Arc::clone(&self.secrets)
+    }
+
+    #[must_use]
+    pub fn secrets_weak(&self) -> Weak<RwLock<secrets::Secrets>> {
+        Arc::downgrade(&self.secrets)
     }
 
     #[must_use]
@@ -466,6 +527,11 @@ impl Runtime {
     #[must_use]
     pub fn embeds(&self) -> Arc<RwLock<EmbeddingModelStore>> {
         Arc::clone(&self.embeds)
+    }
+
+    #[must_use]
+    pub fn completion_llms(&self) -> Arc<RwLock<LLMChatCompletionsModelStore>> {
+        Arc::clone(&self.completion_llms)
     }
 
     #[must_use]
@@ -484,6 +550,11 @@ impl Runtime {
     }
 
     #[must_use]
+    pub fn resource_monitor(&self) -> resource_monitor::ResourceMonitor {
+        self.resource_monitor.clone()
+    }
+
+    #[must_use]
     pub fn token_provider_registry(&self) -> Arc<TokenProviderRegistry> {
         Arc::clone(&self.token_provider_registry)
     }
@@ -491,6 +562,31 @@ impl Runtime {
     #[must_use]
     pub fn schedulers(&self) -> Arc<ScheduleRegistry> {
         Arc::clone(&self.schedulers)
+    }
+
+    #[must_use]
+    pub fn datasets_health_monitor(&self) -> Option<Arc<DatasetsHealthMonitor>> {
+        self.datasets_health_monitor.clone()
+    }
+
+    /// Initialize cache metrics after OpenTelemetry meter provider is set up.
+    /// Must be called after `init_metrics` in spiced to ensure metrics are registered.
+    pub fn init_cache_metrics(&self) {
+        use cache::metrics::CacheMetrics;
+        use cache::result::{
+            embeddings::CachedEmbeddingResult, query::CachedQueryResult, search::CachedSearchResult,
+        };
+
+        let caching = self.datafusion().caching();
+        if caching.results.is_some() {
+            CachedQueryResult::init();
+        }
+        if caching.search.is_some() {
+            CachedSearchResult::init();
+        }
+        if caching.embeddings.is_some() {
+            CachedEmbeddingResult::init();
+        }
     }
 
     /// Requests a loaded extension, or will attempt to load it if part of the autoloaded extensions.
@@ -528,7 +624,6 @@ impl Runtime {
     /// The future returned by this function drives the individual server futures and will only return once the servers are shutdown.
     ///
     /// It is recommended to start the servers in parallel to loading the Runtime components to speed up startup.
-    #[allow(clippy::too_many_lines)]
     pub async fn start_servers(
         self: Arc<Self>,
         config: Config,
@@ -539,26 +634,163 @@ impl Runtime {
             .register_metrics_table(self.prometheus_registry.is_some())
             .await?;
 
+        // Shutdown signal
+        let shutdown_signal_future = async {
+            let graceful_shutdown = async {
+                shutdown_signal().await;
+                tracing::debug!("Shutdown signal received. Press Ctrl-C again to force exit.");
+                self.shutdown().await;
+                Ok(())
+            };
+            tokio::select! {
+                result = graceful_shutdown => result,
+                () = force_shutdown_signal() => {
+                    tracing::info!("Force shutdown signal received. Terminating immediately.");
+                    // return error to force stop waiting for other tasks and terminate immediately
+                    Err(Error::ForceTerminated)
+                }
+            }
+        };
+
+        // - Scheduler: does some init, starts internal cluster gRPC server on separate port
+        // - Executor: does some init, but has a polling loop to fetch work from scheduler
+        #[expect(
+            clippy::items_after_statements,
+            reason = "type alias scoped to cluster setup"
+        )]
+        type BoxedClusterFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>>;
+        let maybe_cluster_future: Option<BoxedClusterFuture> =
+            match self.df.cluster_config.effective_role() {
+                Some(ClusterRole::Scheduler) => {
+                    cluster::initialize_cluster_scheduler(&self).await?;
+                    // Start internal cluster server for scheduler on separate port
+                    let internal_server_shutdown = CancellationToken::new();
+                    let self_ref = Arc::clone(&self);
+                    let cloned_shutdown = internal_server_shutdown.clone();
+                    let internal_server_fut = async move {
+                        cluster::start_internal_cluster_server(
+                            Arc::clone(&self_ref),
+                            Some(cloned_shutdown),
+                        )
+                        .await
+                        .context(UnableToStartClusterServerSnafu)
+                    };
+                    let self_for_task = Arc::clone(&self);
+                    Some(Box::pin(
+                        self_for_task
+                            .start_runtime_task(
+                                CLUSTER_INTERNAL_SERVER,
+                                Some(internal_server_shutdown),
+                                internal_server_fut,
+                            )
+                            .await,
+                    ))
+                }
+                Some(ClusterRole::Executor) => {
+                    let executor_fut =
+                        cluster::initialize_cluster_executor(Arc::clone(&self)).await?;
+                    let self_ref = Arc::clone(&self);
+                    Some(Box::pin(
+                        self_ref
+                            .start_runtime_task(CLUSTER_EXECUTOR, None, executor_fut)
+                            .await,
+                    ))
+                }
+                _ => None,
+            };
+
+        if self.df.cluster_config.effective_role().is_some() {
+            tracing::warn!(
+                "Distributed Query (Alpha) is in preview and should not be used in production."
+            );
+        }
+
+        // Start Flight server
+        let flight_shutdown = CancellationToken::new();
+        let self_ref = Arc::clone(&self);
+        let cloned_tls_config = tls_config.clone();
+        let flight_future: std::pin::Pin<Box<dyn Future<Output = Result<(), Error>> + Send>> =
+            if self.df.cluster_config.effective_role() == Some(ClusterRole::Executor) {
+                Box::pin(
+                    self.start_runtime_task(
+                        FLIGHT_SERVER,
+                        Some(flight_shutdown.clone()),
+                        async move {
+                            cluster::start_executor_flight_server(
+                                config.flight_bind_address,
+                                Arc::clone(&self_ref),
+                                Some(flight_shutdown),
+                            )
+                            .await
+                            .context(UnableToStartFlightServerSnafu)
+                        },
+                    )
+                    .await,
+                )
+            } else {
+                let cloned_endpoint_auth = endpoint_auth.clone();
+                let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
+
+                Box::pin(
+                    self.start_runtime_task(
+                        FLIGHT_SERVER,
+                        Some(flight_shutdown.clone()),
+                        async move {
+                            flight::start(
+                                config.flight_bind_address,
+                                cloned_app_ref,
+                                Arc::clone(&self_ref),
+                                cloned_tls_config,
+                                cloned_endpoint_auth,
+                                Arc::clone(&self_ref.rate_limits),
+                                Some(flight_shutdown),
+                            )
+                            .await
+                            .context(UnableToStartFlightServerSnafu)
+                        },
+                    )
+                    .await,
+                )
+            };
+
+        // If this is an executor, we only need the shutdown signal and flight server
+        if matches!(
+            self.df.cluster_config.effective_role(),
+            Some(ClusterRole::Executor)
+        ) {
+            let Some(executor_future) = maybe_cluster_future else {
+                return Err(FailedToStartClusterExecutor {
+                    source: "Executor work loop not bound. Report this bug on GitHub: https://github.com/spiceai/spiceai/issues"
+                        .to_string()
+                        .into(),
+                });
+            };
+
+            return tokio::try_join!(shutdown_signal_future, executor_future, flight_future,)
+                .map(|_| ());
+        }
+
         // Start Http server
         let cloned_tls_config = tls_config.clone();
         let cloned_config = config.clone();
-        let http_auth = endpoint_auth.http_auth.clone();
+        let auth = endpoint_auth.http_auth.clone();
         let self_ref = Arc::clone(&self);
         let http_shutdown = CancellationToken::new();
 
         let http_future = self
-            .start_runtime_task(HTTP_SERVER, Some(http_shutdown.clone()), async move {
+            .start_runtime_task(
+                HTTP_SERVER,
+                Some(http_shutdown.clone()),
                 http::start(
                     cloned_config.http_bind_address,
                     self_ref,
                     cloned_config.into(),
                     cloned_tls_config,
-                    http_auth,
+                    auth,
                     Some(http_shutdown),
                 )
-                .await
-                .context(UnableToStartHttpServerSnafu)
-            })
+                .map_err(Error::from),
+            )
             .await;
 
         // Start Metrics server
@@ -572,53 +804,6 @@ impl Runtime {
                     .await
                     .context(UnableToStartMetricsServerSnafu)
             })
-            .await;
-
-        // Start Flight server
-        let flight_shutdown = CancellationToken::new();
-        let self_ref = Arc::clone(&self);
-        let cloned_tls_config = tls_config.clone();
-        let cloned_endpoint_auth = endpoint_auth.clone();
-        let cloned_app_ref = self_ref.app.read().await.as_ref().map(Arc::clone);
-
-        let flight_future = self
-            .start_runtime_task(FLIGHT_SERVER, Some(flight_shutdown.clone()), async move {
-                flight::start(
-                    config.flight_bind_address,
-                    cloned_app_ref,
-                    Arc::clone(&self_ref),
-                    cloned_tls_config,
-                    cloned_endpoint_auth,
-                    Arc::clone(&self_ref.rate_limits),
-                    Some(flight_shutdown),
-                )
-                .await
-                .context(UnableToStartFlightServerSnafu)
-            })
-            .await;
-
-        // Start OpenTelemetry server
-        let opentelemetry_graceful_shutdown = CancellationToken::new();
-        let df_ref = Arc::clone(&self.df);
-        let cloned_tls_config = tls_config.clone();
-        let grpc_auth = endpoint_auth.grpc_auth.clone();
-
-        let opentelemetry_future = self
-            .start_runtime_task(
-                OPENTELEMETRY_SERVER,
-                Some(opentelemetry_graceful_shutdown.clone()),
-                async move {
-                    opentelemetry::start(
-                        config.open_telemetry_bind_address,
-                        df_ref,
-                        cloned_tls_config,
-                        grpc_auth,
-                        Some(opentelemetry_graceful_shutdown),
-                    )
-                    .await
-                    .context(UnableToStartOpenTelemetryServerSnafu)
-                },
-            )
             .await;
 
         if let Some(tls_config) = tls_config {
@@ -643,30 +828,25 @@ impl Runtime {
             })
             .await;
 
-        // Shutdown signal
-        let shutdown_signal_future = async {
-            let graceful_shutdown = async {
-                shutdown_signal().await;
-                tracing::debug!("Shutdown signal received. Press Ctrl-C again to force exit.");
-                self.shutdown().await;
-                Ok(())
-            };
-            tokio::select! {
-                result = graceful_shutdown => result,
-                () = force_shutdown_signal() => {
-                    tracing::info!("Force shutdown signal received. Terminating immediately.");
-                    // return error to force stop waiting for other tasks and terminate immediately
-                    Err(Error::ForceTerminated)
-                }
-            }
-        };
-
         // wait for all servers to shut down or if any of the servers fail to start
+        if let Some(cluster_future) = maybe_cluster_future {
+            return match tokio::try_join!(
+                http_future,
+                flight_future,
+                metrics_future,
+                pods_watcher_future,
+                cluster_future,
+                shutdown_signal_future
+            ) {
+                Err(err) => Err(err),
+                _ => Ok(()),
+            };
+        }
+
         match tokio::try_join!(
             http_future,
             flight_future,
             metrics_future,
-            opentelemetry_future,
             pods_watcher_future,
             shutdown_signal_future
         ) {
@@ -722,9 +902,9 @@ impl Runtime {
         }
 
         let valid_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
-        for view in valid_views {
+        for validated_view in valid_views {
             self.status
-                .update_view(&view.name, ComponentStatus::Initializing);
+                .update_view(&validated_view.view.name, ComponentStatus::Initializing);
         }
     }
 
@@ -732,7 +912,6 @@ impl Runtime {
     ///
     /// The future returned by this function will not resolve until all components have been loaded and marked as ready.
     /// This includes waiting for the first refresh of any accelerated tables to complete.
-    #[allow(clippy::too_many_lines)]
     pub async fn load_components(self: Arc<Self>) {
         Arc::clone(&self).set_components_initializing().await;
 
@@ -787,11 +966,11 @@ impl Runtime {
                 #[cfg(feature = "models")]
                 {
                     Arc::clone(&self_clone).load_workers().await;
-                    self_clone.load_eval_scorer().await;
-                    let () = self_clone.verify_evals().await;
                     let an_eval_exists = app_lock.as_ref().is_some_and(|app| !app.evals.is_empty());
                     if an_eval_exists {
+                        let () = self_clone.verify_evals().await;
                         drop(app_lock);
+                        self_clone.load_eval_scorer().await;
                         if let Err(err) = self_clone.load_eval_tables().await {
                             tracing::warn!("Failed to create internal eval tables: {err}");
                         }
@@ -810,11 +989,16 @@ impl Runtime {
             .await
             .as_ref()
             .and_then(|app| app.management.as_ref())
+            && let Err(err) = management::init_management(Arc::clone(&self), cfg).await
         {
-            if let Err(err) = management::init_management(Arc::clone(&self), cfg).await {
-                tracing::error!("Failed to initialize management of the Spice runtime: {err}");
-            }
+            tracing::error!("Failed to initialize management of the Spice runtime: {err}");
         }
+
+        let ctx = &self.datafusion().ctx;
+        ctx.register_udtf(
+            "list_udfs",
+            Arc::new(ListUDFTableFunc::new(Arc::clone(ctx))),
+        );
 
         let components = vec![task_history, datasets, catalogs, models_and_evals];
 
@@ -905,7 +1089,7 @@ impl Runtime {
         let start_time = Instant::now();
 
         // shutdown all running components except the HTTP and Metrics servers
-        let mut runtime_tasks = self.runtime_tasks.write().await;
+        let mut runtime_tasks = self.tasks.write().await;
 
         // HTTP and METRICS servers must be shutdown last
         let mut first_shutdown_group = Vec::new();
@@ -966,13 +1150,13 @@ impl Runtime {
         component_name: &str,
         cancellation_token: Option<CancellationToken>,
         task_fn: F,
-    ) -> impl Future<Output = Result<(), Error>>
+    ) -> impl Future<Output = Result<(), Error>> + use<F>
     where
         F: Future<Output = Result<(), Error>> + Send + 'static,
     {
         let (future, handle) = spawn_cancellable_task(cancellation_token, task_fn);
 
-        self.runtime_tasks
+        self.tasks
             .write()
             .await
             .insert(component_name.to_string(), handle);
@@ -1032,25 +1216,6 @@ impl Runtime {
     }
 }
 
-#[allow(clippy::implicit_hasher)]
-pub async fn get_params_with_secrets(
-    secrets: Arc<RwLock<Secrets>>,
-    params: &HashMap<String, String>,
-) -> HashMap<String, SecretString> {
-    let secrets = secrets.read().await;
-
-    let mut params_with_secrets: HashMap<String, SecretString> = HashMap::new();
-
-    // Inject secrets from the user-supplied params.
-    // This will replace any instances of `${ store:key }` with the actual secret value.
-    for (k, v) in params {
-        let secret = secrets.inject_secrets(k, ParamStr(v)).await;
-        params_with_secrets.insert(k.clone(), secret);
-    }
-
-    params_with_secrets
-}
-
 #[must_use]
 pub fn spice_data_base_path() -> String {
     let Ok(working_dir) = std::env::current_dir() else {
@@ -1061,17 +1226,22 @@ pub fn spice_data_base_path() -> String {
     base_folder.to_str().unwrap_or(".").to_string()
 }
 
+#[expect(clippy::result_large_err)]
 pub(crate) fn make_spice_data_directory() -> Result<()> {
-    let base_folder = spice_data_base_path();
-    std::fs::create_dir_all(base_folder).context(UnableToCreateDirectorySnafu)
+    make_spice_data_sub_directory(&[])?;
+    Ok(())
 }
 
-pub fn in_tracing_context<F, R>(f: F) -> R
-where
-    F: FnOnce() -> R,
-{
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_ansi(true)
-        .finish();
-    subscriber::with_default(subscriber, f)
+#[expect(clippy::result_large_err)]
+pub(crate) fn make_spice_data_sub_directory(directory: &[String]) -> Result<PathBuf> {
+    let mut base_folder = PathBuf::from(spice_data_base_path());
+    base_folder.extend(directory);
+    std::fs::create_dir_all(base_folder.clone()).context(UnableToCreateDirectorySnafu)?;
+    Ok(base_folder)
+}
+
+impl From<http::Error> for Error {
+    fn from(err: http::Error) -> Self {
+        Error::UnableToStartHttpServer { source: err }
+    }
 }

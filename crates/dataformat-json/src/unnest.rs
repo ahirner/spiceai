@@ -16,12 +16,13 @@ limitations under the License.
 
 use arrow::array::{Array, RecordBatch, StructArray};
 use arrow::datatypes::{DataType, Field, Fields, Schema};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Represents a path to a field in the original nested schema
 #[derive(Debug, Clone, PartialEq)]
-#[allow(clippy::doc_link_with_quotes)]
+#[expect(clippy::doc_link_with_quotes)]
 pub struct FieldPath {
     /// The field names along the path (e.g., ["person", "name"])
     pub field_names: Vec<String>,
@@ -182,6 +183,37 @@ pub fn find_col_index(
         .fields()
         .iter()
         .position(|field| field.name() == root_field_name)
+}
+
+#[must_use]
+pub fn flatten_json_obj(value: &Value, delimiter: &str) -> Value {
+    let mut out = serde_json::Map::new();
+    flatten_json(value, String::new(), delimiter, &mut out);
+    Value::Object(out)
+}
+
+fn flatten_json(
+    value: &Value,
+    prefix: String,
+    delimiter: &str,
+    out: &mut serde_json::Map<String, Value>,
+) {
+    match value {
+        Value::Object(map) => {
+            for (k, v) in map {
+                let new_prefix = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}{delimiter}{k}")
+                };
+                flatten_json(v, new_prefix, delimiter, out);
+            }
+        }
+        _ => {
+            // For arrays and scalar values (null, boolean, number, string)
+            out.insert(prefix, value.clone());
+        }
+    }
 }
 
 /// Projects a nested schema to only include top-level fields that are referenced
@@ -900,7 +932,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::similar_names)]
+    #[expect(clippy::similar_names)]
     fn test_find_col_index_complex_structure() {
         // Test the complex structure from earlier tests
         let a_field = Field::new("a", DataType::Int32, false);
@@ -1376,7 +1408,7 @@ mod tests {
         let name_field = Field::new("name", DataType::Utf8, false);
         let age_field = Field::new("age", DataType::Int32, false);
         let email_field = Field::new("email", DataType::Utf8, false);
-        let person_fields = Fields::from(vec![name_field.clone(), age_field, email_field]);
+        let person_fields = Fields::from(vec![name_field, age_field, email_field]);
         let person_field = Field::new("person", DataType::Struct(person_fields.clone()), false);
         let id_field = Field::new("id", DataType::Int32, false);
         let status_field = Field::new("status", DataType::Utf8, false);
@@ -1458,5 +1490,181 @@ mod tests {
             .expect("Status should be StringArray");
         assert_eq!(status_col.value(0), "active");
         assert_eq!(status_col.value(1), "inactive");
+    }
+
+    #[test]
+    fn test_flatten_json_obj_simple() {
+        // Test basic flattening with a simple nested object
+        let nested = serde_json::json!({
+            "person": {
+                "name": "John",
+                "age": 30
+            },
+            "status": "active"
+        });
+
+        let flattened = flatten_json_obj(&nested, ".");
+
+        // Expected: {"person.name": "John", "person.age": 30, "status": "active"}
+        let expected = serde_json::json!({
+            "person.name": "John",
+            "person.age": 30,
+            "status": "active"
+        });
+
+        assert_eq!(flattened, expected);
+    }
+
+    #[test]
+    fn test_flatten_json_obj_deeply_nested() {
+        // Test with deeply nested objects
+        let nested = serde_json::json!({
+            "user": {
+                "details": {
+                    "profile": {
+                        "name": "Alice",
+                        "contact": {
+                            "email": "alice@example.com",
+                            "phone": "555-1234"
+                        }
+                    }
+                },
+                "settings": {
+                    "theme": "dark"
+                }
+            },
+            "id": 123
+        });
+
+        let flattened = flatten_json_obj(&nested, ".");
+
+        // Expected flattened structure
+        let expected = serde_json::json!({
+            "user.details.profile.name": "Alice",
+            "user.details.profile.contact.email": "alice@example.com",
+            "user.details.profile.contact.phone": "555-1234",
+            "user.settings.theme": "dark",
+            "id": 123
+        });
+
+        assert_eq!(flattened, expected);
+    }
+
+    #[test]
+    fn test_flatten_json_obj_arrays() {
+        // Test that arrays are preserved as values, not flattened
+        let nested = serde_json::json!({
+            "user": {
+                "name": "Bob",
+                "hobbies": ["reading", "hiking", "coding"],
+                "scores": [85, 92, 78]
+            },
+            "tags": ["important", "urgent"]
+        });
+
+        let flattened = flatten_json_obj(&nested, ".");
+
+        // Expected: arrays should be preserved as is
+        let expected = serde_json::json!({
+            "user.name": "Bob",
+            "user.hobbies": ["reading", "hiking", "coding"],
+            "user.scores": [85, 92, 78],
+            "tags": ["important", "urgent"]
+        });
+
+        assert_eq!(flattened, expected);
+    }
+
+    #[test]
+    fn test_flatten_json_obj_custom_delimiter() {
+        // Test flattening with custom delimiter
+        let nested = serde_json::json!({
+            "person": {
+                "name": "John",
+                "age": 30
+            },
+            "status": "active"
+        });
+
+        let flattened = flatten_json_obj(&nested, "_");
+
+        // Expected: {"person_name": "John", "person_age": 30, "status": "active"}
+        let expected = serde_json::json!({
+            "person_name": "John",
+            "person_age": 30,
+            "status": "active"
+        });
+
+        assert_eq!(flattened, expected);
+    }
+
+    #[test]
+    fn test_flatten_json_obj_empty_objects() {
+        // Test with empty objects
+        let nested = serde_json::json!({
+            "user": {
+                "details": {}
+            },
+            "metadata": {}
+        });
+
+        let flattened = flatten_json_obj(&nested, ".");
+
+        // Empty objects should result in no keys
+        let expected = serde_json::json!({});
+
+        assert_eq!(flattened, expected);
+    }
+
+    #[test]
+    fn test_flatten_json_obj_null_values() {
+        // Test with null values
+        let nested = serde_json::json!({
+            "user": {
+                "name": "Charlie",
+                "email": null,
+                "details": {
+                    "age": null
+                }
+            },
+            "active": null
+        });
+
+        let flattened = flatten_json_obj(&nested, ".");
+
+        // Null values should be preserved
+        let expected = serde_json::json!({
+            "user.name": "Charlie",
+            "user.email": null,
+            "user.details.age": null,
+            "active": null
+        });
+
+        assert_eq!(flattened, expected);
+    }
+
+    #[test]
+    fn test_flatten_json_obj_special_characters() {
+        // Test with keys containing special characters
+        let nested = serde_json::json!({
+            "user-info": {
+                "first.name": "John",
+                "last_name": "Doe"
+            },
+            "meta.data": {
+                "key-value": 123
+            }
+        });
+
+        let flattened = flatten_json_obj(&nested, ":");
+
+        // Special characters in keys should be preserved
+        let expected = serde_json::json!({
+            "user-info:first.name": "John",
+            "user-info:last_name": "Doe",
+            "meta.data:key-value": 123
+        });
+
+        assert_eq!(flattened, expected);
     }
 }

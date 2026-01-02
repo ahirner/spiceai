@@ -24,8 +24,12 @@ use super::{
     },
 };
 
-use crate::{component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS};
+use crate::{
+    Runtime, component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
+    register_data_connector,
+};
 
+use datafusion::parquet::arrow::async_reader::ObjectVersionType;
 use snafu::prelude::*;
 use std::any::Any;
 use std::clone::Clone;
@@ -50,56 +54,63 @@ static VALIDATORS: LazyLock<
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "S3 auth method 'key' requires an AWS access secret.\nSpecify an access secret with the `s3_secret` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
+        "S3 auth method 'key' requires an AWS access secret. Specify an access secret with the `s3_secret` parameter. For details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
     ))]
     NoAccessSecret,
 
     #[snafu(display(
-        "S3 auth method 'key' requires an AWS access key.\nSpecify an access key with the `s3_key` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
+        "S3 auth method 'key' requires an AWS access key. Specify an access key with the `s3_key` parameter. For details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
     ))]
     NoAccessKey,
 
     #[snafu(display(
-        "Unsupported S3 auth method '{method}'.\nUse 'public', 'iam_role', or 'key' for `s3_auth` parameter.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
+        "Unsupported S3 auth method '{method}'. Use 'public', 'iam_role', or 'key' for `s3_auth` parameter. For details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
     ))]
     UnsupportedAuthenticationMethod { method: String },
 
     #[snafu(display(
-        "The '{parameter}' parameter requires `s3_auth` set to '{auth}'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
+        "The '{parameter}' parameter requires `s3_auth` set to '{auth}'. For details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
     ))]
     InvalidAuthParameterCombination { parameter: String, auth: String },
 
     #[snafu(display(
-        "The `s3_endpoint` parameter must be a HTTP/S URL, but '{endpoint}' was provided.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#params"
+        "The `s3_endpoint` parameter must be a HTTP/S URL, but '{endpoint}' was provided. For details, visit: https://spiceai.org/docs/components/data-connectors/s3#params"
     ))]
     InvalidEndpoint { endpoint: String },
 
     #[snafu(display(
-        "The `s3_region` parameter must be a valid AWS region code, but '{region}' was provided.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#params"
+        "The `s3_region` parameter must be a valid AWS region code, but '{region}' was provided. For details, visit: https://spiceai.org/docs/components/data-connectors/s3#params"
     ))]
     InvalidRegion { region: String },
 
     #[snafu(display(
-        "The `s3_region` parameter requires a lowercase AWS region code, but '{region}' was provided.\nSpice will automatically convert the region code to lowercase.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#params"
+        "The `s3_region` parameter requires a lowercase AWS region code, but '{region}' was provided. Spice will automatically convert the region code to lowercase. For details, visit: https://spiceai.org/docs/components/data-connectors/s3#params"
     ))]
     InvalidRegionCorrected { region: String },
 
     #[snafu(display(
-        "IAM role authentication failed.\nAre you sure you're running in an environment with an IAM role?\n{source}\nFor details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
+        "IAM role authentication failed. Are you sure you're running in an environment with an IAM role? {source} For details, visit: https://spiceai.org/docs/components/data-connectors/s3#auth"
     ))]
     InvalidIAMRoleAuthentication {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"
+        "The '{endpoint}' is a HTTP URL, but `allow_http` is not enabled. Set the parameter `allow_http: true` and retry. For details, visit: https://spiceai.org/docs/components/data-connectors/abfs#params"
     ))]
     InsecureEndpointWithoutAllowHTTP { endpoint: String },
 }
 
-#[derive(Debug)]
 pub struct S3 {
     pub(crate) params: Parameters,
+    pub(crate) runtime: Option<Runtime>,
+    pub(crate) tokio_io_runtime: tokio::runtime::Handle,
+}
+
+impl std::fmt::Debug for S3 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "S3(params: {:?})", self.params)
+    }
 }
 
 #[derive(Default, Copy, Clone)]
@@ -128,6 +139,9 @@ pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             ParameterSpec::component("auth")
                 .description("Configures the authentication method for S3. Supported methods are: public (i.e. no auth), iam_role, key.")
                 .secret(),
+            ParameterSpec::component("versioning")
+                .description("Enables S3 obejct versioning support when set to 'enabled'. Defaults to 'enabled'.")
+                .default("enabled"),
             ParameterSpec::runtime("client_timeout")
                 .description("The timeout setting for S3 client."),
             ParameterSpec::runtime("allow_http")
@@ -146,14 +160,25 @@ impl DataConnectorFactory for S3Factory {
         &self,
         mut params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        if let Some(endpoint) = params.parameters.get("endpoint").expose().ok() {
-            if endpoint.ends_with('/') {
-                tracing::warn!("Trimming trailing '/' from S3 endpoint {endpoint}");
-                params.parameters.insert(
-                    "endpoint".to_string(),
-                    endpoint.trim_end_matches('/').to_string().into(),
-                );
-            }
+        if let Some(endpoint) = params.parameters.get("endpoint").expose().ok()
+            && endpoint.ends_with('/')
+        {
+            tracing::warn!("Trimming trailing '/' from S3 endpoint {endpoint}");
+            params.parameters.insert(
+                "endpoint".to_string(),
+                endpoint.trim_end_matches('/').to_string().into(),
+            );
+        }
+
+        if let Some(versioning) = params.parameters.get("versioning").expose().ok()
+            && !matches!(versioning, "enabled" | "disabled")
+        {
+            tracing::warn!(
+                "Invalid S3 versioning setting '{versioning}'. Defaulting to 'enabled'."
+            );
+            params
+                .parameters
+                .insert("versioning".to_string(), "enabled".to_string().into());
         }
 
         Box::pin(async move {
@@ -161,8 +186,34 @@ impl DataConnectorFactory for S3Factory {
                 validator.validate(&mut params).await?;
             }
 
+            // Initialize AWS SDK credentials for IAM role authentication.
+            // Skip initialization for 'public' and 'key' auth methods which use explicit credentials.
+            // Default to 'public' if no auth method is specified.
+            let auth = params
+                .parameters
+                .get("auth")
+                .expose()
+                .ok()
+                .unwrap_or("public");
+
+            match auth {
+                "public" | "key" => {
+                    // Skip AWS SDK initialization - use explicit auth method directly
+                }
+                _ => {
+                    // Initialize AWS SDK for IAM role or any other auth method
+                    if let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await {
+                        tracing::warn!(
+                            "Unable to initialize AWS credentials for S3 connector: {err}"
+                        );
+                    }
+                }
+            }
+
             let s3 = S3 {
                 params: params.parameters,
+                runtime: params.runtime.map(Arc::unwrap_or_clone),
+                tokio_io_runtime: params.io_runtime,
             };
             Ok(Arc::new(s3) as Arc<dyn DataConnector>)
         })
@@ -184,12 +235,24 @@ impl std::fmt::Display for S3 {
 }
 
 impl ListingTableConnector for S3 {
+    fn object_versioning_type(&self) -> Option<ObjectVersionType> {
+        if self.params.get("versioning").expose().ok() == Some("disabled") {
+            return None;
+        }
+
+        Some(ObjectVersionType::Version)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
 
     fn get_params(&self) -> &Parameters {
         &self.params
+    }
+
+    fn get_tokio_io_runtime(&self) -> tokio::runtime::Handle {
+        self.tokio_io_runtime.clone()
     }
 
     fn get_object_store_url(
@@ -203,7 +266,7 @@ impl ListingTableConnector for S3 {
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("The specified URL is not valid: {url}.\nEnsure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/{PREFIX}#from"),
+                    message: format!("The specified URL is not valid: {url}. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/{PREFIX}#from"),
                     connector_component: ConnectorComponent::from(dataset)
                 })?;
 
@@ -222,6 +285,10 @@ impl ListingTableConnector for S3 {
         )));
 
         Ok(s3_url)
+    }
+
+    fn get_runtime(&self) -> Option<Runtime> {
+        self.runtime.clone()
     }
 
     fn handle_object_store_error(
@@ -256,3 +323,5 @@ impl ListingTableConnector for S3 {
         }
     }
 }
+
+register_data_connector!("s3", S3Factory);

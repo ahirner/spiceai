@@ -8,7 +8,7 @@ on:
       - release-*
       - release/*
     paths:
-      - "crates/llms/**"
+      - 'crates/llms/**'
 
   workflow_dispatch:
     inputs:
@@ -26,16 +26,21 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
 jobs:
   setup-matrix:
     name: Setup strategy matrix
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     outputs:
       matrix: ${{ steps.setup-matrix.outputs.result }}
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v7
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: setup-matrix
         with:
           script: |
@@ -43,14 +48,14 @@ jobs:
               {
                 name: 'self-hosted',
                 needs_env: false,
-                runner: 'macOS',
+                runner: 'spiceai-macos',
                 model_allowlist: 'local_phi3,hf_phi3'
               },
               {
                 name: 'hosted',
                 needs_env: true,
-                runner: 'macOS',
-                model_allowlist: 'anthropic,openai,xai,perplexity'
+                runner: 'spiceai-macos',
+                model_allowlist: 'anthropic,bedrock,openai,xai,perplexity'
               }
             ];
 
@@ -67,9 +72,23 @@ jobs:
 
   build:
     name: Build Test Binary
-    runs-on: [self-hosted, macOS]
+    runs-on: [self-hosted, spiceai-macos]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+        with:
+          fetch-depth: 1 # Shallow clone for faster checkout
+
+      # Cache Cargo dependencies
+      - name: Cache Cargo registry
+        uses: actions/cache@9255dc7a253b0ccc959486e2bca901246202afeb # v5.0.1
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -77,19 +96,23 @@ jobs:
           os: darwin
 
       - name: Build LLMs integration test binary
+        env:
+          # Metal runners do not have `xcrun metal`
+          # See `https://github.com/EricLBuehler/mistral.rs/pull/1311`
+          MISTRALRS_METAL_PRECOMPILE: 0
         run: |
           TEST_BINARY_PATH=$(cargo test -p llms --test integration --features metal --no-run --message-format=json | jq -r 'select(.reason == "compiler-artifact" and (.target.kind | contains(["test"])) and .executable != null) | .executable')
           cp $TEST_BINARY_PATH ./llms_integration_test
 
       - name: Upload test binary
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         with:
           name: llms-integration-test-binary
           path: ./llms_integration_test
           retention-days: 1
 
   test:
-    runs-on: [self-hosted, macOS]
+    runs-on: [self-hosted, spiceai-macos]
     needs: [build, setup-matrix]
     strategy:
       matrix:
@@ -97,9 +120,9 @@ jobs:
     permissions: read-all
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
       - name: Download test binary
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         with:
           name: llms-integration-test-binary
           path: ./integration_test
@@ -114,22 +137,33 @@ jobs:
           SPICE_ANTHROPIC_API_KEY: ${{ secrets.SPICE_SECRET_ANTHROPIC_API_KEY }}
           SPICE_XAI_API_KEY: ${{ secrets.SPICE_SECRET_XAI_API_KEY }}
           SPICE_PERPLEXITY_AUTH_TOKEN: ${{ secrets.SPICE_SECRET_PERPLEXITY_AUTH_TOKEN }}
+          SPICE_BEDROCK_ACCESS_KEY: ${{ secrets.AWS_BEDROCK_KEY }}
+          SPICE_BEDROCK_SECRET_KEY: ${{ secrets.AWS_BEDROCK_SECRET }}
         run: |
           if [ "${{ matrix.target.needs_env }}" == "true" ]; then
             if [ -z "$SPICE_OPENAI_API_KEY" ]; then
-              echo "Error: OpenAI API key is not defined."
+              echo "Error: 'SPICE_OPENAI_API_KEY' is not defined."
               exit 1
             fi
             if [ -z "$SPICE_ANTHROPIC_API_KEY" ]; then
-              echo "Error: Anthropic API key is not defined."
+              echo "Error: 'SPICE_ANTHROPIC_API_KEY' is not defined."
               exit 1
             fi
             if [ -z "$SPICE_XAI_API_KEY" ]; then
-              echo "Error: xAI API key is not defined."
+              echo "Error: 'SPICE_XAI_API_KEY' is not defined."
               exit 1
             fi
             if [ -z "$SPICE_PERPLEXITY_AUTH_TOKEN" ]; then
-              echo "Error: Perplexity API key is not defined."
+              echo "Error: 'SPICE_PERPLEXITY_AUTH_TOKEN' is not defined."
+              exit 1
+            fi
+            export SPICE_BEDROCK_REGION="us-east-1"
+            if [ -z "$SPICE_BEDROCK_ACCESS_KEY" ]; then
+              echo "Error: 'SPICE_BEDROCK_ACCESS_KEY' is not defined."
+              exit 1
+            fi
+            if [ -z "$SPICE_BEDROCK_SECRET_KEY" ]; then
+              echo "Error: 'SPICE_BEDROCK_SECRET_KEY' is not defined."
               exit 1
             fi
           fi

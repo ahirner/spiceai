@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::time::Duration;
 
-use backoff::backoff::Backoff;
+pub use backoff::backoff::Backoff;
 
 // Fibonacci-based backoff delay intervals capped at 5 mins
 const BACKOFF_INTERVALS_MS: [u64; 14] = [
@@ -51,10 +51,10 @@ impl Backoff for FibonacciBackoff {
     fn next_backoff(&mut self) -> Option<Duration> {
         self.num_retries += 1;
 
-        if let Some(max_retries) = self.max_retries {
-            if self.num_retries > max_retries {
-                return None;
-            }
+        if let Some(max_retries) = self.max_retries
+            && self.num_retries > max_retries
+        {
+            return None;
         }
 
         let interval = if self.num_retries >= BACKOFF_INTERVALS_MS.len() {
@@ -161,13 +161,13 @@ impl Default for FibonacciBackoffBuilder {
     }
 }
 
-#[allow(clippy::cast_precision_loss)]
+#[expect(clippy::cast_precision_loss)]
 fn duration_to_nanos(d: Duration) -> f64 {
     d.as_secs() as f64 * 1_000_000_000.0 + f64::from(d.subsec_nanos())
 }
 
-#[allow(clippy::cast_possible_truncation)]
-#[allow(clippy::cast_sign_loss)]
+#[expect(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_sign_loss)]
 fn nanos_to_duration(nanos: f64) -> Duration {
     let secs = nanos / 1_000_000_000.0;
     let nanos = nanos as u64 % 1_000_000_000;

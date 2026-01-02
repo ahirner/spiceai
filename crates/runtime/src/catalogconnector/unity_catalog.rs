@@ -21,7 +21,6 @@ use super::Parameters;
 use crate::Runtime;
 use crate::component::catalog::Catalog;
 use crate::dataconnector::parameters::ConnectorParams;
-use crate::get_params_with_secrets;
 use async_trait::async_trait;
 use data_components::Read;
 use data_components::RefreshableCatalogProvider;
@@ -30,6 +29,7 @@ use data_components::unity_catalog::UCTable;
 use data_components::unity_catalog::UnityCatalog as UnityCatalogClient;
 use data_components::unity_catalog::provider::UnityCatalogProvider;
 use datafusion::sql::TableReference;
+use runtime_secrets::get_params_with_secrets;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use std::any::Any;
@@ -51,7 +51,7 @@ impl UnityCatalog {
     }
 }
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
+pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("token").secret().description(
         "The personal access token used to authenticate against the Unity Catalog API.",
     ),
@@ -108,7 +108,7 @@ impl CatalogConnector for UnityCatalog {
             return Err(
                 super::Error::InvalidConfigurationNoSource {
                     connector: "unity_catalog".into(),
-                    message: "A Catalog Path is required for Unity Catalog.\nFor details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#from".into(),
+                    message: "A Catalog Path is required for Unity Catalog. For details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                 },
             );
@@ -131,7 +131,14 @@ impl CatalogConnector for UnityCatalog {
             Arc::new(StaticTokenProvider::new(token.clone())) as Arc<dyn TokenProvider>
         });
 
-        let client = Arc::new(UnityCatalogClient::new(endpoint, token_provider));
+        let client = UnityCatalogClient::new(endpoint, token_provider).map_err(|source| {
+            super::Error::InternalWithSource {
+                connector: "unity_catalog".to_string(),
+                connector_component: ConnectorComponent::from(catalog),
+                source: Box::new(source),
+            }
+        })?;
+        let client = Arc::new(client);
 
         // Copy the catalog params into the dataset params, and allow user to override
         let mut dataset_params: HashMap<String, SecretString> =
@@ -157,8 +164,10 @@ impl CatalogConnector for UnityCatalog {
             connector_component: ConnectorComponent::from(catalog),
         })?;
 
-        let delta_table_creator =
-            Arc::new(DeltaTableFactory::new(params.to_secret_map())) as Arc<dyn Read>;
+        let delta_table_creator = Arc::new(DeltaTableFactory::new(
+            params.to_secret_map(),
+            runtime.tokio_io_runtime(),
+        )) as Arc<dyn Read>;
 
         let catalog_provider = match UnityCatalogProvider::try_new(
             client,

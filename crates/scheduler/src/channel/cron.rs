@@ -14,11 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use chrono::Local;
 use croner::Cron;
+use croner::parser::{CronParser, Seconds, Year};
 use snafu::{OptionExt, ResultExt};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -27,7 +28,6 @@ use crate::Result;
 use crate::task::TaskRequest;
 
 use super::TaskRequestChannel;
-
 pub struct CronRequestChannel {
     cancellation: Option<Arc<CancellationToken>>,
     task_completion: Option<Arc<tokio::sync::Notify>>,
@@ -35,6 +35,13 @@ pub struct CronRequestChannel {
     tx: Option<Arc<tokio::sync::mpsc::Sender<Arc<TaskRequest>>>>,
     cron: Arc<Cron>,
 }
+
+static CRON_PARSER: LazyLock<CronParser> = LazyLock::new(|| {
+    CronParser::builder()
+        .seconds(Seconds::Optional)
+        .year(Year::Disallowed) // TODO: allow optional years in 2.0.0 - https://github.com/spiceai/spiceai/issues/6548
+        .build()
+});
 
 impl CronRequestChannel {
     /// Creates a new `CronRequestChannel` with the given cron expression.
@@ -49,9 +56,8 @@ impl CronRequestChannel {
             reset: None,
             tx: None,
             cron: Arc::new(
-                Cron::new(cron)
-                    .with_seconds_optional()
-                    .parse()
+                CRON_PARSER
+                    .parse(cron)
                     .context(crate::FailedToParseCronSnafu)?,
             ),
         })
@@ -125,6 +131,8 @@ impl TaskRequestChannel for CronRequestChannel {
                     .find_next_occurrence(&time, false)
                     .context(crate::FailedToDetermineNextCronRunTimeSnafu)?;
 
+                tracing::debug!("Next cron run time: {next}");
+
                 let duration_till = next.signed_duration_since(time);
                 // .to_std() errors when the duration is less than zero - the next expression time is in the past
                 let interval = duration_till.to_std().unwrap_or(Duration::from_secs(1));
@@ -180,7 +188,7 @@ mod tests {
         let request = rx.recv().await.expect("Should receive a task request");
         let now = Local::now();
         assert!(
-            now.second() % 5 == 0,
+            now.second().is_multiple_of(5),
             "The request should be sent at a 5-second interval"
         );
         assert!(!request.cancel_running);
@@ -199,7 +207,7 @@ mod tests {
             "The next request should be sent after 5 seconds"
         );
         assert!(
-            next_now.second() % 5 == 0,
+            next_now.second().is_multiple_of(5),
             "The request should be sent at a 5-second interval"
         );
         assert!(!request.cancel_running);
@@ -244,7 +252,7 @@ mod tests {
         let request = rx.recv().await.expect("Should receive a task request");
         let last_now = Local::now();
         assert!(
-            last_now.second() % 5 == 0,
+            last_now.second().is_multiple_of(5),
             "The request should be sent at a 5-second interval"
         );
         assert!(!request.cancel_running);
@@ -281,7 +289,7 @@ mod tests {
             "The next request should be sent after 5 seconds"
         );
         assert!(
-            next_now.second() % 5 == 0,
+            next_now.second().is_multiple_of(5),
             "The request should be sent at a 5-second interval"
         );
         assert!(!request.cancel_running);

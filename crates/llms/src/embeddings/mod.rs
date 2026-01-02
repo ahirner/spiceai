@@ -12,22 +12,25 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 
-use crate::chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
-use async_openai::{
-    error::{ApiError, OpenAIError},
-    types::{
-        CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingInput, EmbeddingUsage,
-        EmbeddingVector, EncodingFormat,
-    },
+pub use async_openai::types::embeddings::EmbeddingInput;
+use async_openai::types::embeddings::{
+    CreateEmbeddingRequest, CreateEmbeddingResponse, Embedding, EmbeddingUsage, EmbeddingVector,
+    EncodingFormat,
 };
+
 use async_trait::async_trait;
+use cache::{CacheProvider, key::CacheKey, result::embeddings::CachedEmbeddingResult};
+use chunking::{Chunker, ChunkingConfig, RecursiveSplittingChunker};
 use hf_hub::api::tokio::ApiError as HfApiError;
 use snafu::{ResultExt, Snafu};
 use std::{fmt::Debug, sync::Arc};
+use tokio::runtime::Handle;
+use tokio::task;
 
 pub mod candle;
 
 #[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
 pub enum Error {
     #[snafu(display(
         "Embedding health check failed. {source}. Verify the embedding configuration."
@@ -43,6 +46,11 @@ pub enum Error {
 
     #[snafu(display("Failed to create embedding. {source}."))]
     FailedToCreateEmbedding {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display("Embedding rate limit exceeded. {source}."))]
+    RateLimited {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
@@ -100,6 +108,23 @@ pub enum Error {
         "A model identifier must be provided for source '{model_source}' via `from: {model_source}:<model_id>`"
     ))]
     ModelNotProvided { model_source: String },
+
+    #[snafu(display("Failed to acquire a rate controller permit. {source}"))]
+    FailedToAcquireRateControllerPermit { source: runtime_rate_control::Error },
+
+    #[snafu(display(
+        "Invalid OpenAI usage tier '{tier}'. Specify a valid tier of 'free', 'tier1', 'tier2', 'tier3', 'tier4', or 'tier5'."
+    ))]
+    InvalidOpenAITier { tier: String },
+
+    #[snafu(display("Failed to extract embeddings from AWS Bedrock: {message}"))]
+    FailedToExtractEmbeddings { message: String },
+
+    #[snafu(display("Failed to construct request blobs: {message}"))]
+    FailedToConstructRequestBlobs { message: String },
+
+    #[snafu(display("Unsupported embedding input for {model}: {message}"))]
+    UnsupportedEmbeddingInput { model: String, message: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -118,6 +143,60 @@ fn encode_embedding(format: &EncodingFormat, array: Vec<f32>) -> EmbeddingVector
 #[async_trait]
 pub trait Embed: Debug + Sync + Send {
     async fn embed(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>>;
+
+    fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
+        None
+    }
+
+    fn model_name(&self) -> Option<&str> {
+        None
+    }
+
+    fn embedding_input_cache_key<'a>(&'a self, input: &'a EmbeddingInput) -> Option<CacheKey<'a>> {
+        if let Some(model_name) = self.model_name() {
+            Some((model_name, input).into())
+        } else {
+            tracing::trace!(
+                "dyn Embed does not implement model_name, therefore cannot generate cache key solely against embedding input: {:?} ",
+                self
+            );
+            None
+        }
+    }
+
+    async fn get_cached_embed(&self, key: CacheKey<'_>) -> Option<CachedEmbeddingResult> {
+        if let Some(embeddings_cache) = self.cache()
+            && let Some(cached) = embeddings_cache
+                .get_raw_key(&key.as_raw_key(embeddings_cache.hasher()).as_u64())
+                .await
+        {
+            return Some(cached);
+        }
+
+        None
+    }
+
+    async fn put_cached_embed(&self, key: CacheKey<'_>, value: CachedEmbeddingResult) {
+        if let Some(embeddings_cache) = self.cache() {
+            embeddings_cache
+                .put_raw_key(&key.as_raw_key(embeddings_cache.hasher()).as_u64(), value)
+                .await;
+        }
+    }
+
+    fn embed_sync(&self, input: EmbeddingInput) -> Result<Vec<Vec<f32>>> {
+        task::block_in_place(move || Handle::current().block_on(self.embed(input)))
+    }
+
+    fn supports_sync_embeddings(&self) -> bool {
+        false
+    }
+
+    /// Configured model parallelism as read by an execution plan.
+    /// `None` if unsupported.
+    fn parallelism(&self) -> Option<usize> {
+        None
+    }
 
     /// A basic health check to ensure the model can process future [`Self::embed`] requests.
     /// Default implementation is a basic call to [`embed()`].
@@ -142,20 +221,10 @@ pub trait Embed: Debug + Sync + Send {
 
     /// An OpenAI-compatible interface for the embedding trait. If not implemented, the default
     /// implementation will be constructed based on the trait's [`embed`] method.
-    #[allow(clippy::cast_possible_truncation)]
-    async fn embed_request(
-        &self,
-        req: CreateEmbeddingRequest,
-    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+    #[expect(clippy::cast_possible_truncation)]
+    async fn embed_request(&self, req: CreateEmbeddingRequest) -> Result<CreateEmbeddingResponse> {
         let format = req.encoding_format.unwrap_or_default();
-        let result = self.embed(req.input).await.map_err(|e| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })?;
+        let result = self.embed(req.input).await?;
 
         Ok(CreateEmbeddingResponse {
             object: "list".to_string(),
@@ -177,7 +246,7 @@ pub trait Embed: Debug + Sync + Send {
     }
 }
 
-#[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
+#[expect(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
 pub async fn get_or_infer_size(inner: &Arc<dyn Embed>) -> Result<i32> {
     let size = inner.size();
     if size != -1 {

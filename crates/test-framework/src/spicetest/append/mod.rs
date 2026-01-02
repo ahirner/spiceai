@@ -17,12 +17,13 @@ limitations under the License.
 use std::{
     collections::BTreeMap,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant, SystemTime},
 };
 
 use crate::{
     metrics::QueryStatus,
-    queries::{QueryOverrides, QuerySet},
+    queries::{self, QuerySet},
 };
 use anyhow::{Context, Result};
 use futures::future::join_all;
@@ -38,16 +39,21 @@ mod worker;
 use worker::{AppendConfig, AppendWorker};
 
 mod sources;
+use crate::queries::QueryOverrides;
 use sources::FileAppendableSource;
 
 #[derive(Default)]
 pub struct NotStarted {
     query_set: QuerySet,
-    queries: Vec<(&'static str, &'static str)>,
+    queries: Vec<queries::Query>,
     query_count: usize,
     parallel_count: usize,
     end_duration: Duration,
     tempdir_path: Option<PathBuf>,
+    load_interval: Option<Duration>,
+    load_steps: Option<u16>,
+    with_conflict_data: bool,
+    with_retention_test_data: bool,
 }
 
 impl NotStarted {
@@ -62,16 +68,15 @@ impl NotStarted {
         self
     }
 
-    #[must_use]
-    pub fn with_query_set(
+    pub async fn with_query_set(
         mut self,
         query_set: QuerySet,
         overrides: Option<QueryOverrides>,
-    ) -> Self {
-        self.queries = query_set.get_queries(overrides);
+    ) -> Result<Self> {
+        self.queries = query_set.get_queries(overrides, None, None).await?;
         self.query_count = self.queries.len();
         self.query_set = query_set;
-        self
+        Ok(self)
     }
 
     #[must_use]
@@ -86,6 +91,30 @@ impl NotStarted {
         self
     }
 
+    #[must_use]
+    pub fn with_load_interval(mut self, load_interval: Duration) -> Self {
+        self.load_interval = Some(load_interval);
+        self
+    }
+
+    #[must_use]
+    pub fn with_load_steps(mut self, load_steps: u16) -> Self {
+        self.load_steps = Some(load_steps);
+        self
+    }
+
+    #[must_use]
+    pub fn with_conflict_data(mut self, with_conflict_data: bool) -> Self {
+        self.with_conflict_data = with_conflict_data;
+        self
+    }
+
+    #[must_use]
+    pub fn with_retention_test_data(mut self, with_retention_test_data: bool) -> Self {
+        self.with_retention_test_data = with_retention_test_data;
+        self
+    }
+
     pub fn get_tempdir_path(&self) -> Result<&PathBuf> {
         self.tempdir_path
             .as_ref()
@@ -94,7 +123,7 @@ impl NotStarted {
 }
 
 pub struct AppendStarted {
-    queries: Vec<(&'static str, &'static str)>,
+    queries: Vec<queries::Query>,
     append_worker: JoinHandle<Result<()>>,
     query_count: usize,
     parallel_count: usize,
@@ -127,11 +156,21 @@ impl SpiceTest<NotStarted> {
             return Err(anyhow::anyhow!("Parallel count must be greater than 0"));
         }
 
-        let append_config = AppendConfig::new(
+        let mut append_config = AppendConfig::new(
             self.state.end_duration,
-            self.state.query_set,
+            self.state.query_set.clone(),
             self.state.get_tempdir_path()?.clone(),
-        );
+        )
+        .with_conflict_data(self.state.with_conflict_data)
+        .with_retention_test_data(self.state.with_retention_test_data);
+
+        if let Some(load_interval) = self.state.load_interval {
+            append_config = append_config.with_load_interval(load_interval);
+        }
+
+        if let Some(load_steps) = self.state.load_steps {
+            append_config = append_config.with_load_steps(load_steps);
+        }
         let append_source = FileAppendableSource::new(&append_config);
 
         let append_worker = AppendWorker::new(append_config, Box::new(append_source))
@@ -169,9 +208,9 @@ impl SpiceTest<AppendStarted> {
             None
         };
 
-        let flight_client = self
+        let spice_client = self
             .get_spiced()?
-            .flight_client(self.api_key.clone())
+            .spice_client(self.api_key.clone(), false)
             .await?;
 
         let query_workers = (0..self.state.parallel_count)
@@ -180,11 +219,12 @@ impl SpiceTest<AppendStarted> {
                     id,
                     self.state.queries.clone(),
                     EndCondition::Duration(self.state.end_duration),
-                    flight_client.clone(),
                     self.name.clone(),
                 )
+                .with_flight_client(spice_client.clone())
                 .with_explain_plan_snapshot(self.explain_plan_snapshot)
-                .with_results_snapshot(self.results_snapshot_predicate);
+                .with_results_snapshot(self.results_snapshot_predicate)
+                .with_validate_row_counts(false);
 
                 if let Some(multi) = &multi {
                     worker.with_progress_bar(multi.add(self.get_new_progress_bar()))
@@ -221,21 +261,21 @@ impl SpiceTest<Running> {
         let mut query_durations = BTreeMap::new();
         let mut query_iteration_durations = BTreeMap::new();
         let mut row_counts = BTreeMap::new();
-        let mut query_statuses = BTreeMap::new();
+        let mut query_statuses: BTreeMap<Arc<str>, QueryStatus> = BTreeMap::new();
         match self.state.append_worker.await {
             Err(e) => {
                 self.state.query_workers.iter().for_each(|worker| {
                     worker.abort();
                 });
 
-                return Err(anyhow::anyhow!("Append worker failed: {}", e));
+                return Err(anyhow::anyhow!("Append worker failed: {e}"));
             }
             Ok(Err(e)) => {
                 self.state.query_workers.iter().for_each(|worker| {
                     worker.abort();
                 });
 
-                return Err(anyhow::anyhow!("Append worker failed: {}", e));
+                return Err(anyhow::anyhow!("Append worker failed: {e}"));
             }
             _ => {}
         }
@@ -269,15 +309,16 @@ impl SpiceTest<Running> {
             }
 
             for (query, worker_status) in worker_result.query_statuses {
+                let worker_status_clone = worker_status.clone();
                 query_statuses
                     .entry(query)
                     .and_modify(|existing_status| {
                         // If the worker reports failure, update the status to Failed
-                        if worker_status == QueryStatus::Failed {
-                            *existing_status = QueryStatus::Failed;
+                        if let QueryStatus::Failed(msg) = worker_status {
+                            *existing_status = QueryStatus::Failed(msg);
                         }
                     })
-                    .or_insert(worker_status);
+                    .or_insert(worker_status_clone);
             }
         }
 

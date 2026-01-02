@@ -29,6 +29,7 @@ import (
 	"github.com/logrusorgru/aurora"
 	"github.com/spf13/cobra"
 	"github.com/spiceai/spiceai/bin/spice/pkg/spec"
+	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 	"gopkg.in/yaml.v3"
 )
 
@@ -84,7 +85,7 @@ spice dataset configure
 
 		if strings.Contains(datasetName, "-") {
 			// warn that dataset name with hyphen should be quoted in queries
-			cmd.Println(fmt.Sprintf("%v", aurora.BrightYellow(fmt.Sprintf("Dataset names with hyphens should be quoted in queries:\ni.e. SELECT * FROM \"%s\"", datasetName))))
+			cmd.Println(fmt.Sprintf("%v", aurora.BrightYellow(fmt.Sprintf("Dataset names containing hyphens (-) are deprecated and will no longer be supported starting with version 2.0.\nDataset names with hyphens should be quoted in queries:\ni.e. SELECT * FROM \"%s\"", datasetName))))
 		}
 
 		cmd.Print("description: ")
@@ -173,15 +174,15 @@ spice dataset configure
 		}
 
 		dirPath := fmt.Sprintf("datasets/%s", dataset.Name)
-		err = os.MkdirAll(dirPath, 0766)
+		// Limit dataset configs to the current user to avoid leaking credentials
+		err = os.MkdirAll(dirPath, 0700)
 		if err != nil {
 			slog.Error("creating dataset directory", "error", err)
 			os.Exit(1)
 		}
 
 		filePath := fmt.Sprintf("%s/dataset.yaml", dirPath)
-		err = os.WriteFile(filePath, datasetBytes, 0766)
-		if err != nil {
+		if err := util.WriteSecureFile(filePath, datasetBytes); err != nil {
 			slog.Error(fmt.Sprintf("writing dataset file to %s", filePath), "error", err)
 			os.Exit(1)
 		}
@@ -217,8 +218,7 @@ spice dataset configure
 				os.Exit(1)
 			}
 
-			err = os.WriteFile("spicepod.yaml", spicepodBytes, 0766)
-			if err != nil {
+			if err := util.WriteSecureFile("spicepod.yaml", spicepodBytes); err != nil {
 				slog.Error("writing spicepod.yaml", "error", err)
 				os.Exit(1)
 			}

@@ -16,6 +16,7 @@ limitations under the License.
 
 use crate::component::ComponentInitialization;
 use crate::component::dataset::Dataset;
+use crate::register_data_connector;
 use crate::token_providers::databricks::{
     AuthCredentials, DatabricksM2MTokenProvider, DatabricksU2MTokenProvider,
 };
@@ -35,6 +36,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use token_provider::registry::TokenProviderRegistry;
 use token_provider::{StaticTokenProvider, TokenProvider};
+use tokio::runtime::Handle;
 
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
@@ -44,44 +46,44 @@ use super::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        "Missing required parameter: {parameter}. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     MissingParameter { parameter: String },
 
     #[snafu(display(
-        "Invalid `databricks_use_ssl` value: '{value}'. Use 'true' or 'false'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        "Invalid `databricks_use_ssl` value: '{value}'. Use 'true' or 'false'. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     InvalidUsessl { value: String },
 
     #[snafu(display(
-        "Failed to connect to Databricks Spark.\n{source}\nVerify the connector configuration, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        "Failed to connect to Databricks Spark. {source} Verify the connector configuration, and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     UnableToConstructDatabricksSpark {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Failed to connect to Databricks SQL Warehouse.\n{source}\nVerify the connector configuration, and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        "Failed to connect to Databricks SQL Warehouse. {source} Verify the connector configuration, and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     UnableToConstructDatabricksSqlWarehouse { source: sql_warehouse::Error },
 
     #[snafu(display(
-        "Invalid `mode` value: '{value}'. Use 'delta_lake' or 'spark_connect'.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        "Invalid `mode` value: '{value}'. Use 'delta_lake' or 'spark_connect'. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     InvalidMode { value: String },
 
     #[snafu(display(
-        "Invalid configuration: {message}.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
+        "Invalid configuration: {message}. For details, visit: https://spiceai.org/docs/components/data-connectors/databricks#parameters"
     ))]
     InvalidConfiguration { message: String },
 
     #[snafu(display(
-        "Failed to build Databricks connector: required component '{missing_component}' is missing.\nAn unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
+        "Failed to build Databricks connector: required component '{missing_component}' is missing. An unexpected error occurred. Report a bug to request support: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToBuild { missing_component: String },
 
     #[snafu(display(
-        "Failed to obtain Databricks service principal token for machine-to-machine authentication.\n{source}"
+        "Failed to obtain Databricks service principal token for machine-to-machine authentication. {source}"
     ))]
     UnableToGetToken {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -104,6 +106,7 @@ impl std::fmt::Debug for Databricks {
 impl Databricks {
     pub async fn new(
         params: Parameters,
+        io_runtime: Handle,
         token_provider_registry: Arc<TokenProviderRegistry>,
     ) -> Result<Self> {
         let mode = params.get("mode").expose().ok().unwrap_or_default();
@@ -115,7 +118,7 @@ impl Databricks {
         let auth_credentials = Self::build_auth_credentials(&params)?;
         let initialization = match auth_credentials {
             AuthCredentials::U2M(_) => ComponentInitialization::OnTrigger,
-            _ => ComponentInitialization::OnStartup,
+            _ => ComponentInitialization::default(),
         };
 
         match mode {
@@ -163,6 +166,7 @@ impl Databricks {
                     Endpoint(endpoint.to_string()),
                     storage_options,
                     token_provider,
+                    io_runtime,
                 );
 
                 Ok(Self {
@@ -221,7 +225,7 @@ impl Databricks {
         })
     }
 
-    pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials> {
+    pub fn build_auth_credentials(params: &Parameters) -> Result<AuthCredentials<'_>> {
         let token = params.get("token").ok();
         let client_id = params.get("client_id").expose().ok();
         let client_secret = params.get("client_secret").ok();
@@ -321,7 +325,7 @@ impl Databricks {
             read_provider,
 
             // Databricks spark connect doesn't support U2M, so no deferred loading
-            initialization: ComponentInitialization::OnStartup,
+            initialization: ComponentInitialization::default(),
         })
     }
 
@@ -463,9 +467,26 @@ impl DataConnectorFactory for DatabricksFactory {
         params: ConnectorParams,
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         if let Some(runtime) = params.runtime {
+            let param_map = params.parameters.to_secret_map();
             Box::pin(async move {
-                let databricks =
-                    Databricks::new(params.parameters, runtime.token_provider_registry()).await?;
+                // Initialize AWS SDK credentials if not using explicit credentials
+                if !aws_sdk_credential_bridge::has_explicit_credentials(
+                    &param_map,
+                    "aws_access_key_id",
+                    "aws_secret_access_key",
+                ) && let Err(err) = aws_sdk_credential_bridge::get_or_init_sdk_config().await
+                {
+                    tracing::warn!(
+                        "Unable to initialize AWS credentials for Databricks connector: {err}"
+                    );
+                }
+
+                let databricks = Databricks::new(
+                    params.parameters,
+                    params.io_runtime,
+                    runtime.token_provider_registry(),
+                )
+                .await?;
                 Ok(Arc::new(databricks) as Arc<dyn DataConnector>)
             })
         } else {
@@ -500,7 +521,7 @@ impl DataConnector for Databricks {
         let table_reference = TableReference::from(dataset.path());
         Ok(self
             .read_provider
-            .table_provider(table_reference, dataset.schema())
+            .table_provider(table_reference)
             .await
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "databricks",
@@ -645,3 +666,5 @@ mod tests {
         }
     }
 }
+
+register_data_connector!("databricks", DatabricksFactory);

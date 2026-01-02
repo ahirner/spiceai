@@ -14,12 +14,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
+use std::{fmt::Write, sync::Arc, time::Duration};
 
 use datafusion::sql::TableReference;
 use serde::Deserialize;
 use snafu::prelude::*;
-use std::fmt::Write;
 use url::Url;
 
 use token_provider::TokenProvider;
@@ -29,22 +28,22 @@ pub mod provider;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#configuration"
+        "Missing required parameter: {parameter}. Specify a value. For details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#configuration"
     ))]
     MissingParameter { parameter: String },
 
     #[snafu(display(
-        "Failed to connect to the Unity Catalog API.\nCheck the Unity Catalog API endpoint is valid and accessible.\nThe following connection error occurred: {source}"
+        "Failed to connect to the Unity Catalog API. Check the Unity Catalog API endpoint is valid and accessible. The following connection error occurred: {source}"
     ))]
     ConnectionError { source: reqwest::Error },
 
     #[snafu(display(
-        "Failed to connect to the Unity Catalog API.\nCheck the Unity Catalog API endpoint is valid and accessible.\nThe following HTTP status code was received when connecting: {status}"
+        "Failed to connect to the Unity Catalog API. Check the Unity Catalog API endpoint is valid and accessible. The following HTTP status code was received when connecting: {status}"
     ))]
     UnexpectedStatusCode { status: reqwest::StatusCode },
 
     #[snafu(display(
-        "Expected a valid URL, but '{url}' was provided.\nFor details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#configuration"
+        "Expected a valid URL, but '{url}' was provided. For details, visit: https://spiceai.org/docs/components/catalogs/unity-catalog#configuration"
     ))]
     URLParseError {
         url: String,
@@ -52,22 +51,25 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "An invalid catalog URL was provided: '{url}'.\nExpected a catalog URL in the format of: 'https://<host>/api/2.1/unity-catalog/catalogs/<catalog_id>'",
+        "An invalid catalog URL was provided: '{url}'. Expected a catalog URL in the format of: 'https://<host>/api/2.1/unity-catalog/catalogs/<catalog_id>'",
     ))]
     InvalidCatalogURL { url: String },
 
     #[snafu(display(
-        "Failed to find the catalog with ID '{catalog_id}'.\nVerify the catalog exists, and try again."
+        "Failed to find the catalog with ID '{catalog_id}'. Verify the catalog exists, and try again."
     ))]
     CatalogDoesntExist { catalog_id: String },
 
     #[snafu(display(
-        "Failed to find the schema '{schema}' in the catalog '{catalog_id}'.\nVerify the schema and catalog exist, and try again."
+        "Failed to find the schema '{schema}' in the catalog '{catalog_id}'. Verify the schema and catalog exist, and try again."
     ))]
     SchemaDoesntExist { schema: String, catalog_id: String },
 
-    #[snafu(display("Failed to get token.\n{source}"))]
+    #[snafu(display("Failed to get token. {source}"))]
     UnableToGetToken { source: token_provider::Error },
+
+    #[snafu(display("Failed to create HTTP client for Unity Catalog: {source}"))]
+    UnableToCreateHttpClient { source: reqwest::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -90,27 +92,40 @@ pub struct Endpoint(pub String);
 pub struct CatalogId(pub String);
 
 impl UnityCatalog {
-    #[must_use]
-    #[allow(clippy::needless_pass_by_value)]
-    pub fn new(endpoint: Endpoint, token_provider: Option<Arc<dyn TokenProvider>>) -> Self {
+    #[expect(clippy::needless_pass_by_value)]
+    pub fn new(endpoint: Endpoint, token_provider: Option<Arc<dyn TokenProvider>>) -> Result<Self> {
         let mut endpoint_str = endpoint.0.trim_end_matches('/').to_string();
         if !endpoint_str.starts_with("http") {
             endpoint_str = format!("https://{endpoint_str}");
         }
 
-        let mut user_agent: Option<String> = None;
+        let user_agent: Option<String>;
+        #[cfg(not(feature = "databricks"))]
+        {
+            user_agent = None;
+        }
         #[cfg(feature = "databricks")]
         // Include user_agent, if connects to Databricks instance
-        if endpoint.0.contains("databricks") {
-            user_agent = Some(crate::databricks::user_agent().to_string());
+        {
+            user_agent = if endpoint.0.contains("databricks") {
+                Some(crate::databricks::user_agent().to_string())
+            } else {
+                None
+            };
         }
 
-        Self {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
+            .build()
+            .context(UnableToCreateHttpClientSnafu)?;
+
+        Ok(Self {
             endpoint: endpoint_str,
             token_provider,
-            client: reqwest::Client::new(),
+            client,
             user_agent,
-        }
+        })
     }
 
     /// Parses a catalog url into the endpoint and catalog id.

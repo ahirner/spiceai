@@ -48,7 +48,6 @@ pub fn get_s3_hive_partitioned_dataset(
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -85,10 +84,10 @@ async fn s3_metadata_columns() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
+            configure_test_datafusion();
             let rt = Arc::new(
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await,
             );

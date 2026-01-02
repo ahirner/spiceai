@@ -24,47 +24,13 @@ use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
 use datafusion::error::Result as DFResult;
 use futures::future::try_join_all;
+use globset::GlobSet;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 use iceberg_datafusion::IcebergTableProvider;
-use snafu::prelude::*;
 use tokio::sync::Semaphore;
 
 use crate::RefreshableCatalogProvider;
-
-use super::catalog::RestCatalog;
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    #[snafu(display(
-        "An unknown error occurred while interacting with the Iceberg catalog.\nReport an issue at https://github.com/spiceai/spiceai/issues\n{source}"
-    ))]
-    Unknown { source: iceberg::Error },
-
-    #[snafu(display(
-        "The data in the Iceberg table is invalid. The table may be corrupted or incomplete.\n{source}"
-    ))]
-    DataInvalid { source: iceberg::Error },
-
-    #[snafu(display(
-        "This Iceberg feature is not yet supported.\nReport an issue at https://github.com/spiceai/spiceai/issues\n{source}"
-    ))]
-    FeatureUnsupported { source: iceberg::Error },
-
-    #[snafu(display(
-        "The namespace '{namespace}' does not exist in the Iceberg catalog, verify the namespace name and try again."
-    ))]
-    NamespaceDoesNotExist { namespace: String },
-
-    #[snafu(display(
-        "Failed to connect to the Iceberg catalog or object store at {url}, verify the Iceberg catalog is accessible and try again."
-    ))]
-    FailedToConnect { url: String, source: iceberg::Error },
-
-    #[snafu(display(
-        "Internal error: could not acquire a semaphore permit for concurrency control: {source}"
-    ))]
-    SemaphoreError { source: tokio::sync::AcquireError },
-}
+use crate::iceberg::catalog::Error;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -90,8 +56,9 @@ impl IcebergCatalogProvider {
     /// attempts to create a schema provider for each namespace, and
     /// collects these providers into a `HashMap`.
     pub async fn try_new(
-        client: Arc<RestCatalog>,
+        client: Arc<dyn Catalog>,
         root_namespace: Option<NamespaceIdent>,
+        includes: Option<&GlobSet>,
     ) -> Result<Self> {
         // Create the semaphore first, so we can use it in the closures below
         let load_semaphore = Arc::new(Semaphore::new(10));
@@ -106,14 +73,13 @@ impl IcebergCatalogProvider {
                     // Unfortunately, there isn't a better way to handle this
                     let err_msg = e.to_string();
 
-                    if let Some(namespace) = root_namespace {
-                        if err_msg.contains("NoSuchNamespaceException")
-                            || err_msg.contains("Namespace does not exist")
-                        {
-                            return Err(Error::NamespaceDoesNotExist {
-                                namespace: namespace.join("."),
-                            });
-                        }
+                    if let Some(namespace) = root_namespace
+                        && (err_msg.contains("NoSuchNamespaceException")
+                            || err_msg.contains("Namespace does not exist"))
+                    {
+                        return Err(Error::NamespaceDoesNotExist {
+                            namespace: namespace.join("."),
+                        });
                     }
 
                     return Err(handle_iceberg_error(e));
@@ -122,19 +88,15 @@ impl IcebergCatalogProvider {
             },
         };
 
-        let providers = try_join_all(
-            schema_names
-                .iter()
-                .map(|name| {
-                    let semaphore_clone = Arc::clone(&load_semaphore);
-                    IcebergSchemaProvider::try_new(
-                        Arc::clone(&client),
-                        NamespaceIdent::new(name.clone()),
-                        semaphore_clone,
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
+        let providers = try_join_all(schema_names.iter().map(|name| {
+            let semaphore_clone = Arc::clone(&load_semaphore);
+            IcebergSchemaProvider::try_new(
+                Arc::clone(&client),
+                NamespaceIdent::new(name.clone()),
+                semaphore_clone,
+                includes,
+            )
+        }))
         .await?;
 
         let schemas: HashMap<String, Arc<dyn SchemaProvider>> = schema_names
@@ -191,14 +153,26 @@ impl IcebergSchemaProvider {
     /// attempts to create a table provider for each table name, and
     /// collects these providers into a `HashMap`.
     pub(crate) async fn try_new(
-        client: Arc<RestCatalog>,
+        client: Arc<dyn Catalog>,
         namespace: NamespaceIdent,
         load_semaphore: Arc<Semaphore>,
+        include: Option<&GlobSet>,
     ) -> Result<Self> {
         let table_names: Vec<_> = client
             .list_tables(&namespace)
             .await
-            .map_err(handle_iceberg_error)?;
+            .map_err(handle_iceberg_error)?
+            .into_iter()
+            .filter(|table| {
+                // If include is None, we include all tables
+                if let Some(glob_set) = &include {
+                    // Check if the table name matches any of the glob patterns
+                    glob_set.is_match(table.to_string())
+                } else {
+                    true // Include all tables if no glob patterns are specified
+                }
+            })
+            .collect();
 
         // Transform each load_table call to return Result<(TableIdent, Option<Arc<dyn TableProvider>>)>
         let table_futures: Vec<_> = table_names
@@ -231,7 +205,7 @@ impl IcebergSchemaProvider {
     }
 
     async fn load_table(
-        client: Arc<RestCatalog>,
+        client: Arc<dyn Catalog>,
         table_name: Arc<TableIdent>,
         semaphore: Arc<Semaphore>,
     ) -> Result<Option<Arc<dyn TableProvider>>> {
@@ -295,6 +269,8 @@ fn handle_iceberg_error(e: iceberg::Error) -> Error {
             // This is also returned when we cannot connect to the Iceberg catalog, so check for that.
             // i.e. Unexpected => Failed to execute http request, source: error sending request for url (http://localhoster:8181/v1/config)
             let err_msg = e.to_string();
+            let err_in_detail = format!("{e:?}");
+            let err_in_detail_lc = err_in_detail.to_lowercase();
             if err_msg.contains("error sending request for url") {
                 // Extract the URL from the error message
                 let url = err_msg
@@ -302,6 +278,20 @@ fn handle_iceberg_error(e: iceberg::Error) -> Error {
                     .nth(1)
                     .unwrap_or_default()
                     .trim();
+
+                // Special case for detailed certificate errors
+                if err_in_detail_lc.contains("certificate")
+                    || err_in_detail_lc.contains("tls")
+                    || err_in_detail_lc.contains("ssl")
+                {
+                    return Error::CertificateError {
+                        url: url.to_string(),
+                        detail: err_in_detail,
+                        source: e,
+                    };
+                }
+
+                // Return a generic connection error for all other cases
                 return Error::FailedToConnect {
                     url: url.to_string(),
                     source: e,

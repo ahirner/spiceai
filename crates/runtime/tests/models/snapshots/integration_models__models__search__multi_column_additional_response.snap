@@ -1,7 +1,6 @@
 ---
 source: crates/runtime/tests/models/search.rs
-expression: normalize_search_response(response)
-snapshot_kind: text
+expression: normalize_search_response(resp)
 ---
 {
   "duration_ms": "duration_ms_val",
@@ -12,13 +11,12 @@ snapshot_kind: text
       },
       "dataset": "multi_column_search",
       "matches": {
-        "cp_department": "DEPARTMENT",
-        "cp_description": "In general basic characters welcome. Clearly lively friends con"
+        "cp_description": "Heavily direct problems try eventually on a nurses. Courses may make "
       },
       "primary_key": {
-        "cp_catalog_page_sk": 1
+        "cp_catalog_page_sk": 8
       },
-      "score": 0.032
+      "score": 0.01
     },
     {
       "data": {
@@ -26,12 +24,12 @@ snapshot_kind: text
       },
       "dataset": "multi_column_search",
       "matches": {
-        "cp_description": "Close customers might struggle away different mem"
+        "cp_department": "DEPARTMENT"
       },
       "primary_key": {
-        "cp_catalog_page_sk": 15
+        "cp_catalog_page_sk": 2
       },
-      "score": 0.016
+      "score": 0.01
     }
   ]
 }

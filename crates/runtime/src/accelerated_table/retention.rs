@@ -20,9 +20,13 @@ use arrow::array::UInt64Array;
 use cache::Caching;
 use data_components::delete::get_deletion_provider;
 use datafusion::{
-    catalog::TableProvider, logical_expr::Operator, physical_plan::collect,
-    prelude::SessionContext, sql::TableReference,
+    catalog::TableProvider,
+    logical_expr::Operator,
+    physical_plan::collect,
+    prelude::{Expr, SessionContext},
+    sql::TableReference,
 };
+use tokio::runtime::Handle;
 
 use crate::{
     accelerated_table::{DataRetentionFilter, Retention, refresh},
@@ -31,18 +35,17 @@ use crate::{
         builder::get_df_default_config, filter_converter::TimestampFilterConvert,
         is_spice_internal_dataset,
     },
-    object_store_registry::default_runtime_env,
 };
+use runtime_object_store::registry::default_runtime_env;
 
 impl super::AcceleratedTable {
-    #[allow(clippy::cast_possible_wrap)]
-    #[allow(clippy::cast_possible_truncation)]
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::cast_possible_truncation)]
     pub(crate) async fn start_retention_check(
         dataset_name: TableReference,
         accelerator: Arc<dyn TableProvider>,
         retention: Retention,
         caching: Option<Arc<Caching>>,
+        io_runtime: Handle,
     ) {
         let mut interval_timer = tokio::time::interval(retention.check_interval);
 
@@ -97,20 +100,28 @@ impl super::AcceleratedTable {
                                 &dataset_name,
                                 &format!("where {time_column} < {timestamp}"),
                             );
-                            exprs.push(expr);
+                            exprs.push(Box::new(expr));
                         }
                     }
                 }
 
-                tracing::trace!("[retention] Exprs {exprs:?}");
+                // Combine all expressions into a single OR expression as time and SQL expressions are applied independently
+                let Some(expr) = exprs.into_iter().map(|e| *e).reduce(Expr::or) else {
+                    tracing::warn!(
+                        "[retention] No valid retention filters found for dataset {dataset_name}"
+                    );
+                    continue;
+                };
+
+                tracing::trace!("[retention] Expr {expr:?}");
 
                 let ctx = SessionContext::new_with_config_rt(
                     get_df_default_config(),
-                    default_runtime_env(),
+                    default_runtime_env(io_runtime.clone()),
                 );
 
                 let plan = deleted_table_provider
-                    .delete_from(&ctx.state(), &exprs)
+                    .delete_from(&ctx.state(), &[expr])
                     .await;
                 match plan {
                     Ok(plan) => match collect(plan, ctx.task_ctx()).await {
@@ -127,17 +138,15 @@ impl super::AcceleratedTable {
 
                             log_retention_result(&dataset_name, num_records);
 
-                            if num_records > 0 {
-                                if let Some(cache_provider) = caching.as_ref() {
-                                    if let Err(e) =
-                                        cache_provider.invalidate_for_table(dataset_name.clone())
-                                    {
-                                        tracing::error!(
-                                            "Failed to invalidate cached results for dataset {}: {e}",
-                                            &dataset_name
-                                        );
-                                    }
-                                }
+                            if num_records > 0
+                                && let Some(cache_provider) = caching.as_ref()
+                                && let Err(e) =
+                                    cache_provider.invalidate_for_table(dataset_name.clone())
+                            {
+                                tracing::error!(
+                                    "Failed to invalidate cached results for dataset {}: {e}",
+                                    &dataset_name
+                                );
                             }
                         }
                     },
@@ -224,7 +233,7 @@ mod tests {
         let schema = create_test_schema();
 
         // Create test data with different timestamps (some old, some recent)
-        #[allow(clippy::cast_possible_wrap)]
+        #[expect(clippy::cast_possible_wrap)]
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("to get current time")
@@ -293,6 +302,7 @@ mod tests {
                 accelerator.schema(),
             )
             .expect("Failed to parse retention SQL")
+            .delete_expr
         });
 
         let retention = Retention::builder()
@@ -314,6 +324,7 @@ mod tests {
             Arc::clone(&accelerator),
             retention,
             caching,
+            Handle::current(),
         ));
 
         // Wait for retention to run

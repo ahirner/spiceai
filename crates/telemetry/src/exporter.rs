@@ -19,17 +19,17 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
 use flight_client::{Credentials, FlightClient};
-use opentelemetry_sdk::metrics::MetricError;
+use opentelemetry_sdk::error::OTelSdkResult;
 use snafu::prelude::*;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "An endpoint is required to connect to telemetry.\nSupply an endpoint to the telemetry builder.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "An endpoint is required to connect to telemetry. Supply an endpoint to the telemetry builder. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     MissingEndpoint,
     #[snafu(display(
-        "A service name is required to connect to telemetry.\nSupply a service name to the telemetry builder.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "A service name is required to connect to telemetry. Supply a service name to the telemetry builder. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     MissingServiceName,
 }
@@ -99,7 +99,7 @@ pub struct TelemetryExporter {
 
 #[async_trait]
 impl otel_arrow::ArrowExporter for TelemetryExporter {
-    async fn export(&self, metrics: RecordBatch) -> Result<(), MetricError> {
+    async fn export(&self, metrics: RecordBatch) -> OTelSdkResult {
         let Some(mut flight_client) = self.flight_client.clone() else {
             return Ok(());
         };
@@ -114,11 +114,11 @@ impl otel_arrow::ArrowExporter for TelemetryExporter {
         Ok(())
     }
 
-    async fn force_flush(&self) -> Result<(), MetricError> {
+    fn force_flush(&self) -> OTelSdkResult {
         Ok(())
     }
 
-    fn shutdown(&self) -> Result<(), MetricError> {
+    fn shutdown(&self) -> OTelSdkResult {
         Ok(())
     }
 }

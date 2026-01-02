@@ -1,4 +1,5 @@
 name: benchmark e2e tests
+run-name: bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
 
 on:
   workflow_dispatch:
@@ -37,6 +38,7 @@ on:
           - 'oracle'
           - 'duckdb'
           - 'duckdb-zero-results'
+          - 'duckdb-partitioned'
           - 'snowflake'
           - 'spark'
           - 'iceberg-sf1'
@@ -44,6 +46,8 @@ on:
           - 'glue-catalog'
           - 'databricks-catalog'
           - 'spicecloud'
+          - 'iceberg-hadoop'
+          - 'dynamodb'
       ready_wait:
         description: 'How long (in seconds) to wait for spiced to start'
         required: true
@@ -65,9 +69,10 @@ on:
       update_snapshots:
         description: 'Update the snapshots?'
         required: false
-        default: 'no'
+        default: 'default'
         type: choice
         options:
+          - 'default'
           - 'always'
           - 'no'
       validate_results:
@@ -90,14 +95,39 @@ jobs:
           MSSQL_SA_PASSWORD: S3cretP@ssw0rd
           DB_NAME: tpch_sf1
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
-      - name: Extract spicepod filename path
-        id: extract_spicepod_filename
+      - name: Determine snapshot update mode
+        id: determine_update_snapshots
         run: |
-          SPICEPOD_PATH="${{ github.event.inputs.spicepod_path }}"
-          SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
-          echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
+          update_mode="${{ github.event.inputs.update_snapshots }}"
+          if [ "${update_mode}" = "default" ] || [ -z "${update_mode}" ]; then
+            branch_name="${{ github.ref_name }}"
+            if [[ "${branch_name}" == "release/"* ]]; then
+              update_mode="no"
+            else
+              update_mode="always"
+            fi
+          fi
+
+          echo "Using update_snapshots=${update_mode}" >&2
+          echo "update_snapshots=${update_mode}" >> "${GITHUB_OUTPUT}"
+
+      - name: Set spicepod path
+        id: set_spicepod_path
+        run: |
+          query_set="${{ github.event.inputs.query_set }}"
+          query_set="${query_set%%\[*\]*}"
+          SPICEPOD_PATH="./test/spicepods/${query_set}/sf${{ github.event.inputs.scale_factor }}/${{ github.event.inputs.spicepod_path }}"
+          echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+
+      - name: Validate spicepod file exists
+        run: |
+          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
+            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
@@ -106,18 +136,33 @@ jobs:
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
+      - name: Build spicepod validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Validate spicepod
+        run: |
+          spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
         id: setup-spiced
         with:
           spiced_commit: ${{ github.event.inputs.spiced_commit }}
-          with_odbc: ${{ contains(steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME, 'odbc') }}
+          with_odbc: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
 
       - name: Display spiced commit
         run: echo "SPICED_COMMIT=${{ steps.setup-spiced.outputs.SPICED_COMMIT }}"
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Setup Testoperator
         uses: ./.github/actions/setup-testoperator-data
@@ -134,28 +179,20 @@ jobs:
           fi
 
       - name: Setup ODBC
-        if: ${{ contains(steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME, 'odbc') }}
+        if: ${{ contains(github.event.inputs.spicepod_path, 'odbc') }}
         uses: ./.github/actions/setup-odbc
 
       - name: Install Oracle ODPI-C
-        if: ${{ contains(steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME, 'oracle') }}
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libaio1
-          
-          curl -Lo basic.zip https://download.oracle.com/otn_software/linux/instantclient/instantclient-basic-linuxx64.zip
-          mkdir linux
-          unzip basic.zip -d linux -x "META-INF/*"
-          IC_DIR=$PWD/$(ls -d linux/instantclient*)
-          echo LD_LIBRARY_PATH=$IC_DIR:$LD_LIBRARY_PATH >> $GITHUB_ENV
+        if: ${{ contains(github.event.inputs.spicepod_path, 'oracle') }}
+        uses: ./.github/actions/setup-oracle-odpi
 
-      - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
+      - name: Run the benchmark test - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
             -s /usr/local/bin/spiced \
-            -p ${{ github.event.inputs.spicepod_path }} \
+            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
@@ -177,6 +214,8 @@ jobs:
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          AWS_DYNAMODB_ACCESS_KEY_ID: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
+          AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
           GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
@@ -186,22 +225,23 @@ jobs:
           MYSQL_TCP_PORT: 3306
           MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
           MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
+          MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
+          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
           POSTGRES_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
           POSTGRES_RW_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
           SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
-          SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
-          SPICEAI_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCDS_BENCHMARK_KEY }}
           SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
+          SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
           SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
           SQL_WAREHOUSE_DATABRICKS_HOST: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_HOST }}
           SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
           DREMIO_ENDPOINT: ${{ secrets.TEST_DREMIO_ENDPOINT}}
           DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
           DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots}}
+          INSTA_UPDATE: ${{ steps.determine_update_snapshots.outputs.update_snapshots}}
           MSSQL_HOST: localhost
           MSSQL_USER: sa
           MSSQL_PASSWORD: S3cretP@ssw0rd
@@ -209,13 +249,13 @@ jobs:
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
 
-      - name: Run the benchmark test (with overrides) - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
+      - name: Run the benchmark test (with overrides) - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides != '' }}
         run: |
           rm -rf .spice/data
           INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" testoperator run bench \
             -s /usr/local/bin/spiced \
-            -p ${{ github.event.inputs.spicepod_path }} \
+            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
             --query-overrides ${{ github.event.inputs.query_overrides }} \
@@ -238,6 +278,8 @@ jobs:
           AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY: ${{ secrets.AWS_DATABRICKS_DELTA_SECRET_ACCESS_KEY }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
+          AWS_DYNAMODB_ACCESS_KEY_ID: ${{ secrets.AWS_DYNAMODB_ACCESS_KEY_ID }}
+          AWS_DYNAMODB_SECRET_ACCESS_KEY: ${{ secrets.AWS_DYNAMODB_SECRET_ACCESS_KEY }}
           GLUE_AWS_KEY: ${{ secrets.AWS_S3_ATHENA_ACCESS_KEY_ID }}
           GLUE_AWS_SECRET: ${{ secrets.AWS_S3_ATHENA_SECRET_ACCESS_KEY }}
           SNOWFLAKE_ACCOUNT: ${{ secrets.SNOWFLAKE_ACCOUNT }}
@@ -247,22 +289,23 @@ jobs:
           MYSQL_TCP_PORT: 3306
           MYSQL_USER: ${{ secrets.TEST_MYSQL_USERNAME }}
           MYSQL_PASSWORD: ${{ secrets.TEST_MYSQL_PASSWORD }}
+          MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
+          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
           POSTGRES_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
           POSTGRES_RW_HOST: ${{ secrets.TEST_POSTGRES_HOST }}
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
           SPICEAI_TEST_ENDPOINT: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
           SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
-          SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
-          SPICEAI_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCDS_BENCHMARK_KEY }}
           SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
+          SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
           SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
           SQL_WAREHOUSE_DATABRICKS_HOST: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_HOST }}
           SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_SQL_WAREHOUSE_ID }}
           DREMIO_ENDPOINT: ${{ secrets.TEST_DREMIO_ENDPOINT}}
           DREMIO_USERNAME: ${{ secrets.TEST_DREMIO_USERNAME}}
           DREMIO_PASSWORD: ${{ secrets.TEST_DREMIO_PASSWORD}}
-          INSTA_UPDATE: ${{ github.event.inputs.update_snapshots}}
+          INSTA_UPDATE: ${{ steps.determine_update_snapshots.outputs.update_snapshots}}
           MSSQL_HOST: localhost
           MSSQL_USER: sa
           MSSQL_PASSWORD: S3cretP@ssw0rd
@@ -275,7 +318,7 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
 
       - name: Install GH CLI
-        if: github.event.inputs.update_snapshots == 'always'
+        if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
         run: |
           (type -p wget >/dev/null || (sudo apt update && sudo apt-get install wget -y)) \
           && sudo mkdir -p -m 755 /etc/apt/keyrings \
@@ -287,7 +330,7 @@ jobs:
           && sudo apt install gh -y
 
       - name: Upload benchmark snapshots to branch
-        if: github.event.inputs.update_snapshots == 'always'
+        if: steps.determine_update_snapshots.outputs.update_snapshots == 'always'
         run: |
           # if the spiced commit is set, use that as the branch ID
           if [ -n "${{ github.event.inputs.spiced_commit || '' }}" ]; then

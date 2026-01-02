@@ -95,19 +95,19 @@ impl FuzzyMatch {
         }
 
         // Collapse multiple whitespaces
-        let normalized = no_punct.split_whitespace().collect::<Vec<&str>>().join(" ");
-
-        normalized
+        no_punct.split_whitespace().collect::<Vec<&str>>().join(" ")
     }
 }
 
-#[allow(deprecated)]
+#[expect(deprecated)]
 #[cfg(test)]
 mod tests {
     use super::FuzzyMatch;
     use super::Scorer;
     use super::{DatasetInput, DatasetOutput};
-    use async_openai::types::{ChatChoice, ChatCompletionResponseMessage, FinishReason, Role};
+    use async_openai::types::chat::{
+        ChatChoice, ChatCompletionResponseMessage, FinishReason, Role,
+    };
     use paste::paste;
 
     // Macro to define test cases for FuzzyMatch scorer with AssistantResponse variant.
@@ -148,6 +148,7 @@ mod tests {
                                 content: Some(content.to_string()),
                                 role: Role::Assistant,
                                 function_call: None,
+                                annotations: None,
                                 tool_calls: None,
                                 refusal: None,
                                 audio: None,
@@ -166,6 +167,7 @@ mod tests {
                                 role: Role::Assistant,
                                 function_call: None,
                                 tool_calls: None,
+                                annotations: None,
                                 refusal: None,
                                 audio: None,
                             },

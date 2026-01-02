@@ -43,6 +43,7 @@ use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use datafusion::prelude::ident;
 use datafusion::sql::TableReference;
 use datafusion::sql::unparser::Unparser;
+use linkme::distributed_slice;
 use parameters::ConnectorParams;
 use snafu::prelude::*;
 use std::any::Any;
@@ -51,10 +52,80 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::{Arc, LazyLock};
 use tokio::sync::Mutex;
+use tracing::Level;
 
 use std::future::Future;
 
 pub mod listing;
+
+#[derive(Clone, Copy)]
+pub struct DataConnectorRegistration {
+    pub name: &'static str,
+    pub constructor: fn() -> Arc<dyn DataConnectorFactory>,
+}
+
+impl DataConnectorRegistration {
+    pub const fn new(
+        name: &'static str,
+        constructor: fn() -> Arc<dyn DataConnectorFactory>,
+    ) -> Self {
+        Self { name, constructor }
+    }
+}
+
+/// Distributed slice that automatically collects all data connector registrations at link time
+/// via the `linkme` crate. Entries are added using the [`register_data_connector!`] macro.
+#[distributed_slice]
+pub static DATA_CONNECTOR_REGISTRATIONS: [DataConnectorRegistration] = [..];
+
+/// Registers a data connector factory by name.
+///
+/// This macro creates a constructor function for the specified connector factory type and
+/// registers it in the global distributed slice of data connectors. This allows
+/// the runtime to discover and instantiate connectors without updating a central registry.
+///
+/// # Example (simple form)
+///
+/// ```
+/// register_data_connector!("file", FileFactory);
+/// ```
+///
+/// # Example (explicit form)
+///
+/// ```
+/// register_data_connector!(
+///     register_file_connector,
+///     FILE_CONNECTOR_REGISTRATION,
+///     "file",
+///     FileFactory
+/// );
+/// ```
+///
+/// Using this macro automatically adds the connector to the distributed slice,
+/// making it available for discovery by the runtime.
+#[macro_export]
+macro_rules! register_data_connector {
+    ($fn_name:ident, $static_name:ident, $name:expr, $factory:path) => {
+        fn $fn_name() -> ::std::sync::Arc<dyn $crate::dataconnector::DataConnectorFactory> {
+            <$factory>::new_arc()
+        }
+
+        #[linkme::distributed_slice($crate::dataconnector::DATA_CONNECTOR_REGISTRATIONS)]
+        pub static $static_name: $crate::dataconnector::DataConnectorRegistration =
+            $crate::dataconnector::DataConnectorRegistration::new($name, $fn_name);
+    };
+
+    ($name:expr, $factory:ident) => {
+        ::paste::paste! {
+            $crate::register_data_connector!(
+                [<__register_data_connector_fn_ $factory:snake>],
+                [<__REGISTER_DATA_CONNECTOR_ $factory:upper>],
+                $name,
+                $factory
+            );
+        }
+    };
+}
 
 pub mod abfs;
 #[cfg(feature = "clickhouse")]
@@ -76,15 +147,22 @@ pub mod file;
 pub mod flightsql;
 #[cfg(feature = "ftp")]
 pub mod ftp;
+pub mod git;
 pub mod github;
 pub mod graphql;
 pub mod https;
+#[cfg(feature = "kafka")]
+pub mod kafka;
 pub mod localpod;
 pub mod memory;
+#[cfg(feature = "mongodb")]
+pub mod mongodb;
 #[cfg(feature = "mssql")]
 pub mod mssql;
 #[cfg(feature = "mysql")]
 pub mod mysql;
+#[cfg(feature = "nfs")]
+pub mod nfs;
 #[cfg(feature = "odbc")]
 pub mod odbc;
 #[cfg(feature = "oracle")]
@@ -104,6 +182,8 @@ pub mod sftp;
 #[cfg(feature = "sharepoint")]
 pub mod sharepoint;
 pub mod sink;
+#[cfg(feature = "smb")]
+pub mod smb;
 #[cfg(feature = "snowflake")]
 pub mod snowflake;
 #[cfg(feature = "spark")]
@@ -112,7 +192,7 @@ pub mod spiceai;
 
 #[derive(Debug, Snafu)]
 pub enum DataConnectorError {
-    #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}).\n{source}"))]
+    #[snafu(display("Cannot connect to the {connector_component} ({dataconnector}). {source}"))]
     UnableToConnectInternal {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -120,7 +200,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot connect to the {connector_component} ({dataconnector}) on {host}:{port}.\nEnsure that the host and port are correctly configured in the spicepod, and that the host is reachable."
+        "Cannot connect to the {connector_component} ({dataconnector}) on {host}:{port}. Ensure that the host and port are correctly configured in the spicepod, and that the host is reachable."
     ))]
     UnableToConnectInvalidHostOrPort {
         dataconnector: String,
@@ -130,7 +210,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot connect to the {connector_component} ({dataconnector}). Authentication failed.\nEnsure that the username and password are correctly configured in the spicepod."
+        "Cannot connect to the {connector_component} ({dataconnector}). Authentication failed. Ensure that the username and password are correctly configured in the spicepod."
     ))]
     UnableToConnectInvalidUsernameOrPassword {
         dataconnector: String,
@@ -138,28 +218,28 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot connect to the {connector_component} ({dataconnector}). A TLS error occurred.\nEnsure that the corresponding TLS/secure option is configured to match the data connector's TLS security requirements."
+        "Cannot connect to the {connector_component} ({dataconnector}). A TLS error occurred. Ensure that the corresponding TLS/secure option is configured to match the data connector's TLS security requirements."
     ))]
     UnableToConnectTlsError {
         dataconnector: String,
         connector_component: ConnectorComponent,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\n{source}"))]
+    #[snafu(display("Failed to load the {connector_component} ({dataconnector}). {source}"))]
     UnableToGetReadProvider {
         dataconnector: String,
         connector_component: ConnectorComponent,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to load the {connector_component} ({dataconnector}).\n{source}"))]
+    #[snafu(display("Failed to load the {connector_component} ({dataconnector}). {source}"))]
     UnableToGetReadWriteProvider {
         dataconnector: String,
         connector_component: ConnectorComponent,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to setup the {connector_component} ({dataconnector}).\n{source}"))]
+    #[snafu(display("Failed to setup the {connector_component} ({dataconnector}). {source}"))]
     UnableToGetCatalogProvider {
         dataconnector: String,
         connector_component: ConnectorComponent,
@@ -167,7 +247,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "The {connector_component} ({dataconnector}) has been rate limited.\n{source}"
+        "The {connector_component} ({dataconnector}) has been rate limited. {source}"
     ))]
     RateLimited {
         dataconnector: String,
@@ -176,7 +256,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{message}"
+        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {message}"
     ))]
     InvalidConfiguration {
         dataconnector: String,
@@ -186,7 +266,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{source}"
+        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {source}"
     ))]
     InvalidConfigurationSourceOnly {
         dataconnector: String,
@@ -195,7 +275,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration.\n{message}"
+        "Cannot setup the {connector_component} ({dataconnector}) with an invalid configuration. {message}"
     ))]
     InvalidConfigurationNoSource {
         dataconnector: String,
@@ -204,7 +284,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Cannot setup the {connector_component} ({dataconnector}).\nThe connector '{dataconnector}' is not a valid connector.\nFor details, visit: https://spiceai.org/docs/components/data-connectors"
+        "Cannot setup the {connector_component} ({dataconnector}). The connector '{dataconnector}' is not a valid connector. For details, visit: https://spiceai.org/docs/components/data-connectors"
     ))]
     InvalidConnectorType {
         dataconnector: String,
@@ -212,7 +292,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\n An invalid glob pattern was provided '{pattern}'. Ensure the glob pattern is valid.\n{source}"
+        "Failed to load the {connector_component} ({dataconnector}). An invalid glob pattern was provided '{pattern}'. Ensure the glob pattern is valid. {source}"
     ))]
     InvalidGlobPattern {
         dataconnector: String,
@@ -222,7 +302,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nThe table, '{table_name}', was not found. Verify the source table name in the Spicepod configuration."
+        "Failed to load the {connector_component} ({dataconnector}). The table, '{table_name}', was not found. Verify the source table name in the Spicepod configuration."
     ))]
     InvalidTableName {
         dataconnector: String,
@@ -231,7 +311,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nFailed to detect a table schema. Ensure the table, '{table_name}', exists in the data source."
+        "Failed to load the {connector_component} ({dataconnector}). Failed to detect a table schema. Ensure the table, '{table_name}', exists in the data source."
     ))]
     UnableToGetSchema {
         dataconnector: String,
@@ -240,7 +320,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nAn unknown Data Connector Error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to load the {connector_component} ({dataconnector}). An unknown Data Connector Error occurred: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     InternalWithSource {
         dataconnector: String,
@@ -249,7 +329,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nAn internal error occurred in the {dataconnector} Data Connector.\nReport a bug on GitHub (https://github.com/spiceai/spiceai/issues) and reference the code: {code}"
+        "Failed to load the {connector_component} ({dataconnector}). An internal error occurred in the {dataconnector} Data Connector. Report a bug on GitHub (https://github.com/spiceai/spiceai/issues) and reference the code: {code}"
     ))]
     Internal {
         dataconnector: String,
@@ -259,7 +339,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nFailed to infer the table schema.\nReport a bug on GitHub (https://github.com/spiceai/spiceai/issues) and reference the error: {source}"
+        "Failed to load the {connector_component} ({dataconnector}). Failed to infer the table schema. Report a bug on GitHub (https://github.com/spiceai/spiceai/issues) and reference the error: {source}"
     ))]
     UnableToGetSchemaInternal {
         dataconnector: String,
@@ -268,7 +348,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nUnsupported type action is not enabled for the {dataconnector} Data Connector.\nRemove the parameter from your dataset configuration."
+        "Failed to load the {connector_component} ({dataconnector}). Unsupported type action is not enabled for the {dataconnector} Data Connector. Remove the parameter from your dataset configuration."
     ))]
     UnsupportedTypeAction {
         dataconnector: String,
@@ -276,7 +356,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({dataconnector}).\nThe field '{field_name}' has an unsupported data type: {data_type}.\nSkip loading this field by setting the `unsupported_type_action` parameter to `ignore` or `warn` in the dataset configuration.\nFor details, visit: https://spiceai.org/docs/reference/spicepod/datasets#unsupported_type_action"
+        "Failed to load the {connector_component} ({dataconnector}). The field '{field_name}' has an unsupported data type: {data_type}. Skip loading this field by setting the `unsupported_type_action` parameter to `ignore` or `warn` in the dataset configuration. For details, visit: https://spiceai.org/docs/reference/spicepod/datasets#unsupported_type_action"
     ))]
     UnsupportedDataType {
         dataconnector: String,
@@ -286,14 +366,14 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "Failed to initialize the {connector_component} (ODBC).\nThe runtime is built without ODBC support.\nBuild Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
+        "Failed to initialize the {connector_component} (ODBC). The runtime is built without ODBC support. Build Spice.ai OSS with the `odbc` feature enabled or use the Docker image that includes ODBC support. For details, visit: https://spiceai.org/docs/components/data-connectors/odbc"
     ))]
     OdbcNotInstalled {
         connector_component: ConnectorComponent,
     },
 
     #[snafu(display(
-        "Schema mismatch between remote table and acceleration for {dataset_name}. {differences}. The existing accelerated data is available, but updates are disabled.\nVerify if the remote table schema update is expected and rebuild the acceleration if necessary."
+        "Schema mismatch between remote table and acceleration for {dataset_name}. {differences}. The existing accelerated data is available, but updates are disabled. Verify if the remote table schema update is expected and rebuild the acceleration if necessary."
     ))]
     SchemaMismatch {
         dataset_name: String,
@@ -301,7 +381,7 @@ pub enum DataConnectorError {
     },
 
     #[snafu(display(
-        "The name '{keyword}' is reserved and cannot be used as a name for a dataset for the {dataconnector} data connector.\nChange the name in the Spicepod and try again."
+        "The name '{keyword}' is reserved and cannot be used as a name for a dataset for the {dataconnector} data connector. Change the name in the Spicepod and try again."
     ))]
     UseOfProtectedKeyword {
         dataconnector: String,
@@ -371,57 +451,9 @@ pub async fn create_new_connector(
 }
 
 pub async fn register_all() {
-    register_connector_factory("sink", sink::SinkConnectorFactory::new_arc()).await;
-    #[cfg(feature = "databricks")]
-    register_connector_factory("databricks", databricks::DatabricksFactory::new_arc()).await;
-    #[cfg(feature = "delta_lake")]
-    register_connector_factory("delta_lake", delta_lake::DeltaLakeFactory::new_arc()).await;
-    #[cfg(feature = "dremio")]
-    register_connector_factory("dremio", dremio::DremioFactory::new_arc()).await;
-    register_connector_factory("file", file::FileFactory::new_arc()).await;
-    #[cfg(feature = "flightsql")]
-    register_connector_factory("flightsql", flightsql::FlightSQLFactory::new_arc()).await;
-    register_connector_factory("s3", s3::S3Factory::new_arc()).await;
-    register_connector_factory("abfs", abfs::AzureBlobFSFactory::new_arc()).await;
-    #[cfg(feature = "ftp")]
-    register_connector_factory("ftp", ftp::FTPFactory::new_arc()).await;
-    #[cfg(feature = "imap")]
-    register_connector_factory("imap", imap::ImapFactory::new_arc()).await;
-    register_connector_factory("http", https::HttpsFactory::new_arc()).await;
-    register_connector_factory("https", https::HttpsFactory::new_arc()).await;
-    register_connector_factory("github", github::GithubFactory::new_arc()).await;
-    #[cfg(feature = "ftp")]
-    register_connector_factory("sftp", sftp::SFTPFactory::new_arc()).await;
-    register_connector_factory("spice.ai", spiceai::SpiceAIFactory::new_arc()).await;
-    register_connector_factory("memory", memory::MemoryConnectorFactory::new_arc()).await;
-    #[cfg(feature = "mssql")]
-    register_connector_factory("mssql", mssql::SqlServerFactory::new_arc()).await;
-    #[cfg(feature = "mysql")]
-    register_connector_factory("mysql", mysql::MySQLFactory::new_arc()).await;
-    #[cfg(feature = "postgres")]
-    register_connector_factory("postgres", postgres::PostgresFactory::new_arc()).await;
-    #[cfg(feature = "duckdb")]
-    register_connector_factory("duckdb", duckdb::DuckDBFactory::new_arc()).await;
-    #[cfg(feature = "clickhouse")]
-    register_connector_factory("clickhouse", clickhouse::ClickhouseFactory::new_arc()).await;
-    register_connector_factory("graphql", graphql::GraphQLFactory::new_arc()).await;
-    #[cfg(feature = "odbc")]
-    register_connector_factory("odbc", odbc::ODBCFactory::new_arc()).await;
-    #[cfg(feature = "oracle")]
-    register_connector_factory("oracle", oracle::OracleFactory::new_arc()).await;
-    #[cfg(feature = "sharepoint")]
-    register_connector_factory("sharepoint", sharepoint::SharepointFactory::new_arc()).await;
-    #[cfg(feature = "spark")]
-    register_connector_factory("spark", spark::SparkFactory::new_arc()).await;
-    #[cfg(feature = "snowflake")]
-    register_connector_factory("snowflake", snowflake::SnowflakeFactory::new_arc()).await;
-    #[cfg(feature = "debezium")]
-    register_connector_factory("debezium", debezium::DebeziumFactory::new_arc()).await;
-    register_connector_factory("localpod", localpod::LocalPodFactory::new_arc()).await;
-    #[cfg(feature = "dynamodb")]
-    register_connector_factory("dynamodb", dynamodb::DynamoDBFactory::new_arc()).await;
-    register_connector_factory("iceberg", iceberg::IcebergDataConnectorFactory::new_arc()).await;
-    register_connector_factory("glue", glue::GlueDataConnectorFactory::new_arc()).await;
+    for registration in DATA_CONNECTOR_REGISTRATIONS {
+        register_connector_factory(registration.name, (registration.constructor)()).await;
+    }
 }
 
 pub async fn unregister_all() {
@@ -492,7 +524,11 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
         false
     }
 
-    fn changes_stream(&self, _federated_table: Arc<FederatedTable>) -> Option<ChangesStream> {
+    fn changes_stream(
+        &self,
+        _federated_table: Arc<FederatedTable>,
+        _dataset: &Dataset,
+    ) -> Option<ChangesStream> {
         None
     }
 
@@ -512,7 +548,7 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
     }
 
     /// A hook that is called when an accelerated table is registered to the
-    /// DataFusion context for this data connector.
+    /// `DataFusion` context for this data connector.
     ///
     /// Allows running any setup logic specific to the data connector when its
     /// accelerated table is registered, i.e. setting up a file watcher to refresh
@@ -534,7 +570,16 @@ pub trait DataConnector: Debug + Send + Sync + 'static {
 
     /// Returns whether the data connector should be initialized on startup or on trigger.
     fn initialization(&self) -> ComponentInitialization {
-        ComponentInitialization::OnStartup
+        ComponentInitialization::default()
+    }
+
+    /// Returns whether the data connector should be initialized on startup or on trigger,
+    /// with dataset-specific logic.
+    ///
+    /// This method allows connectors to make initialization decisions based on the specific
+    /// dataset configuration. The default implementation delegates to `initialization()`.
+    fn initialization_for_dataset(&self, _dataset: &Dataset) -> ComponentInitialization {
+        self.initialization()
     }
 }
 
@@ -587,6 +632,13 @@ pub async fn get_data(
 
     for filter in filters {
         df = df.filter(filter).map_err(find_datafusion_root)?;
+    }
+
+    if tracing::enabled!(Level::TRACE)
+        && let Ok(explained) = df.clone().explain(false, false)
+        && let Ok(explained) = explained.to_string().await
+    {
+        tracing::trace!("Data refresh plan for {}:\n{}", table_name, explained);
     }
 
     let sql = Unparser::default()
@@ -674,6 +726,7 @@ fn include_computed_columns(
 #[cfg(test)]
 mod tests {
     use datafusion_table_providers::UnsupportedTypeAction;
+    use tokio::runtime::Handle;
     use tokio::sync::RwLock;
 
     use super::*;
@@ -748,7 +801,7 @@ mod tests {
             ConnectorComponent::Dataset(Arc::new(dataset)),
         );
 
-        let result = builder.build(secrets).await;
+        let result = builder.build(secrets, Handle::current()).await;
         assert!(result.is_ok());
 
         let params = result.expect("failed to build connector params");

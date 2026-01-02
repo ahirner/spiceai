@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,7 +23,10 @@ use super::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use data_components::{
     github::error_checker,
-    graphql::{ErrorChecker, FilterPushdownResult, GraphQLContext, Result, client::GraphQLQuery},
+    graphql::{
+        ErrorChecker, FilterPushdownResult, GraphQLContext, Result,
+        client::{GraphQLQuery, UnnestBehavior},
+    },
 };
 use datafusion::{logical_expr::TableProviderFilterPushDown, prelude::Expr};
 use std::sync::Arc;
@@ -69,6 +72,14 @@ impl GraphQLContext for IssuesTableArgs {
     fn error_checker(&self) -> Option<ErrorChecker> {
         Some(Arc::new(error_checker))
     }
+
+    fn query_cost(&self) -> Option<u32> {
+        // issues(first: 100) could retrieve up to 100 issues
+        // each query returns labels, comments and assignees which are each additional requests
+        // 1 + 100 (labels) + 100 (comments) + 100 (assignees) = 301 points
+        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
+        Some(301)
+    }
 }
 
 impl GitHubTableArgs for IssuesTableArgs {
@@ -103,6 +114,7 @@ impl GitHubTableArgs for IssuesTableArgs {
                             milestone_title: milestone {{ milestone_title: title }}
                             comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
                             assignees(first: 100) {{ assignees: nodes {{ login }} }}
+                            type: issueType {{ type: name, type_color: color }}
                         }}
                     }}
                 }}
@@ -135,6 +147,7 @@ impl GitHubTableArgs for IssuesTableArgs {
                             milestone_title: milestone {{ milestone_title: title }}
                             comments(first: 100) {{ comments_count: totalCount, comments: nodes {{ body, author {{ login }} }} }}
                             assignees(first: 100) {{ assignees: nodes {{ login }} }}
+                            type: issueType {{ type: name, type_color: color }}
                         }}
                     }}
                 }}
@@ -144,7 +157,12 @@ impl GitHubTableArgs for IssuesTableArgs {
             ),
         };
 
-        GitHubTableGraphQLParams::new(query.into(), None, 2, Some(gql_schema()))
+        GitHubTableGraphQLParams::new(
+            query.into(),
+            None,
+            UnnestBehavior::Depth(2),
+            Some(gql_schema()),
+        )
     }
 }
 

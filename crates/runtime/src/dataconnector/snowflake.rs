@@ -24,7 +24,7 @@ use data_components::Read;
 use data_components::snowflake::SnowflakeTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::DbConnectionPool;
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use datafusion::datasource::TableProvider;
 use db_connection_pool::snowflakepool::SnowflakeConnectionPool;
 use itertools::Itertools;
@@ -97,7 +97,7 @@ impl DataConnectorFactory for SnowflakeFactory {
     ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
         Box::pin(async move {
             let pool: Arc<
-                dyn DbConnectionPool<Arc<SnowflakeApi>, &'static (dyn Sync)> + Send + Sync,
+                dyn DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> + Send + Sync,
             > = Arc::new(
                 SnowflakeConnectionPool::new(&params.parameters.to_secret_map())
                     .await
@@ -145,13 +145,13 @@ impl DataConnector for Snowflake {
             })
             .join(".");
 
-        Ok(
-            Read::table_provider(&self.table_factory, path.into(), dataset.schema())
-                .await
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "snowflake",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?,
-        )
+        Ok(Read::table_provider(&self.table_factory, path.into())
+            .await
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "snowflake",
+                connector_component: ConnectorComponent::from(dataset),
+            })?)
     }
 }
+
+register_data_connector!("snowflake", SnowflakeFactory);

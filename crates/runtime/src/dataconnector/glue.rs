@@ -14,8 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
-
 use async_trait::async_trait;
 use aws_config::SdkConfig;
 use aws_credential_types::provider::error::CredentialsError;
@@ -23,26 +21,30 @@ use aws_sdk_glue::{Client, types::Table};
 use aws_sdk_sts::config::ProvideCredentials;
 use datafusion::catalog::TableProvider;
 use iceberg::{
-    NamespaceIdent, TableIdent,
+    CatalogBuilder, NamespaceIdent, TableIdent,
     io::{S3_ACCESS_KEY_ID, S3_REGION, S3_SECRET_ACCESS_KEY, S3_SESSION_TOKEN},
 };
 use iceberg_catalog_glue::{
-    AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN, GlueCatalog,
-    GlueCatalogConfig,
+    AWS_ACCESS_KEY_ID, AWS_REGION_NAME, AWS_SECRET_ACCESS_KEY, AWS_SESSION_TOKEN,
+    GLUE_CATALOG_PROP_CATALOG_ID, GLUE_CATALOG_PROP_WAREHOUSE, GlueCatalogBuilder,
 };
 use iceberg_datafusion::IcebergTableProvider;
+use secrecy::ExposeSecret;
 use snafu::prelude::*;
+use std::sync::LazyLock;
+use std::{any::Any, collections::HashMap, path::Path, pin::Pin, sync::Arc};
 
 use crate::{
     component::dataset::Dataset,
     parameters::{ParameterSpec, Parameters},
+    register_data_connector,
 };
 
 use super::{
     DataConnector, DataConnectorFactory,
     parameters::{
         ConnectorParams,
-        aws::{self, load_config},
+        aws::{self, initiate_config_with_credentials},
     },
     s3::S3,
 };
@@ -52,47 +54,47 @@ static PREFIX: &str = "glue";
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Cannot retrieve table '{table}' from Glue database '{database}'.\nVerify that the database and table exist and are accessible.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "Cannot retrieve table '{table}' from Glue database '{database}'. Verify that the database and table exist and are accessible. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     GetTable { database: String, table: String },
     #[snafu(display(
-        "Cannot load AWS configuration for Glue data connector.\nVerify your AWS credentials and region settings.\nFor help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue\n{source}"
+        "Cannot load AWS configuration for Glue data connector. Verify your AWS credentials and region settings. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/data-connectors/glue {source}"
     ))]
     AWSConfig { source: aws::Error },
     #[snafu(display(
-        "No schema specified in path '{path}'.\nEnsure the dataset path includes a valid schema."
+        "No schema specified in path '{path}'. Ensure the dataset path includes a valid schema."
     ))]
     MissingSchema { path: String },
     #[snafu(display(
-        "No AWS region specified.\nAdd 'glue_region' to your configuration.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "No AWS region specified. Add 'glue_region' to your configuration. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     MissingRegion,
     #[snafu(display(
-        "Cannot retrieve AWS credentials.\nEnsure credentials are configured correctly.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "Cannot retrieve AWS credentials. Ensure credentials are configured correctly. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     MissingCredentials,
     #[snafu(display(
-        "Invalid AWS credentials provided.\nVerify your credentials and try again.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue\n{source}"
+        "Invalid AWS credentials provided. Verify your credentials and try again. For help, visit: https://docs.spiceai.org/components/data-connectors/glue {source}"
     ))]
     InvalidCredentials { source: CredentialsError },
     #[snafu(display(
-        "Cannot retrieve metadata location for table '{table}'.\nEnsure the table is correctly configured in AWS Glue.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue\n{message}"
+        "Cannot retrieve metadata location for table '{table}'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue {message}"
     ))]
     MissingMetadataLocation { table: String, message: String },
     #[snafu(display(
-        "Cannot retrieve input format for table '{table}'.\nEnsure the table is correctly configured in AWS Glue.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "Cannot retrieve input format for table '{table}'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     MissingInputFormat { table: String },
     #[snafu(display(
-        "The input format {input_format} for table '{table}' is not supported.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "The input format {input_format} for table '{table}' is not supported. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     InvalidInputFormat { input_format: String, table: String },
     #[snafu(display(
-        "No storage descriptor found for table '{table}'.\nEnsure the table is correctly configured in AWS Glue.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "No storage descriptor found for table '{table}'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     MissingStorageDescriptor { table: String },
     #[snafu(display(
-        "No storage location specified for table '{table}'.\nEnsure the table has a valid S3 location in AWS Glue.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue"
+        "No storage location specified for table '{table}'. Ensure the table has a valid S3 location in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue"
     ))]
     MissingStorageLocation { table: String },
 }
@@ -100,72 +102,19 @@ pub enum Error {
 #[derive(Clone, Debug)]
 pub struct GlueDataConnector {
     params: Parameters,
+    tokio_io_runtime: tokio::runtime::Handle,
 }
 
 impl GlueDataConnector {
     #[must_use]
-    pub fn new(params: Parameters) -> Self {
-        Self { params }
-    }
-}
-
-impl GlueDataConnector {
-    async fn config(&self) -> Result<SdkConfig, aws::Error> {
-        let config = load_config(
-            "GlueCatalogConnector",
-            "region",
-            "key",
-            "secret",
-            "session_token",
-            &self.params,
-        )
-        .await?;
-
-        Ok(config)
-    }
-}
-
-#[derive(Default, Debug, Copy, Clone)]
-pub struct GlueDataConnectorFactory {}
-
-impl GlueDataConnectorFactory {
-    #[must_use]
-    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
-        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
-    }
-}
-
-impl DataConnectorFactory for GlueDataConnectorFactory {
-    fn as_any(&self) -> &dyn Any {
-        self
+    pub fn new(params: Parameters, tokio_io_runtime: tokio::runtime::Handle) -> Self {
+        Self {
+            params,
+            tokio_io_runtime,
+        }
     }
 
-    fn create(
-        &self,
-        params: ConnectorParams,
-    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
-        Box::pin(async move {
-            let glue = GlueDataConnector::new(params.parameters);
-            Ok(Arc::new(glue) as Arc<dyn DataConnector>)
-        })
-    }
-
-    fn prefix(&self) -> &'static str {
-        PREFIX
-    }
-
-    fn parameters(&self) -> &'static [ParameterSpec] {
-        crate::dataconnector::s3::PARAMETERS.as_ref()
-    }
-}
-
-#[async_trait]
-impl DataConnector for GlueDataConnector {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn read_provider(
+    async fn create_table_provider(
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
@@ -202,24 +151,24 @@ impl DataConnector for GlueDataConnector {
 
         let client = Client::new(&config);
 
-        let get_table_output = client
-            .get_table()
-            .database_name(database)
-            .name(table)
-            .send()
-            .await
-            .map_err(|_| {
-                let e = Error::GetTable {
-                    database: database.to_string(),
-                    table: table.to_string(),
-                };
-                super::DataConnectorError::InvalidConfiguration {
-                    dataconnector: PREFIX.to_string(),
-                    connector_component: dataset.into(),
-                    message: e.to_string(),
-                    source: Box::new(e),
-                }
-            })?;
+        let mut glue_table_builder = client.get_table().database_name(database).name(table);
+
+        if let Some(catalog_id) = self.params.get("catalog_id").ok() {
+            glue_table_builder = glue_table_builder.catalog_id(catalog_id.expose_secret());
+        }
+
+        let get_table_output = glue_table_builder.send().await.map_err(|_| {
+            let e = Error::GetTable {
+                database: database.to_string(),
+                table: table.to_string(),
+            };
+            super::DataConnectorError::InvalidConfiguration {
+                dataconnector: PREFIX.to_string(),
+                connector_component: dataset.into(),
+                message: e.to_string(),
+                source: Box::new(e),
+            }
+        })?;
 
         let table = get_table_output.table.ok_or_else(|| {
             let e = Error::GetTable {
@@ -243,7 +192,14 @@ impl DataConnector for GlueDataConnector {
             }
         })? {
             input_format @ (InputFormat::Parquet | InputFormat::Csv) => {
-                create_s3_provider(input_format, dataset.clone(), self.params.clone(), &table).await
+                create_s3_provider(
+                    input_format,
+                    dataset.clone(),
+                    self.params.clone(),
+                    &table,
+                    self.tokio_io_runtime.clone(),
+                )
+                .await
             }
             InputFormat::Iceberg => {
                 create_iceberg_provider(dataset, &config, database.to_string(), &table).await
@@ -251,6 +207,90 @@ impl DataConnector for GlueDataConnector {
         }
     }
 }
+
+impl GlueDataConnector {
+    async fn config(&self) -> Result<SdkConfig, aws::Error> {
+        let config = initiate_config_with_credentials(
+            "GlueCatalogConnector",
+            "region",
+            "key",
+            "secret",
+            "session_token",
+            &self.params,
+        )
+        .await?
+        .load()
+        .await;
+
+        Ok(config)
+    }
+}
+
+#[derive(Default, Debug, Copy, Clone)]
+pub struct GlueDataConnectorFactory {}
+
+impl GlueDataConnectorFactory {
+    #[must_use]
+    pub fn new_arc() -> Arc<dyn DataConnectorFactory> {
+        Arc::new(Self {}) as Arc<dyn DataConnectorFactory>
+    }
+}
+
+pub(crate) static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    let mut all_parameters = Vec::new();
+    all_parameters.extend_from_slice(&[ParameterSpec::component("catalog_id").secret()]);
+    all_parameters.extend_from_slice(crate::dataconnector::s3::PARAMETERS.as_ref());
+    all_parameters
+});
+
+impl DataConnectorFactory for GlueDataConnectorFactory {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn create(
+        &self,
+        params: ConnectorParams,
+    ) -> Pin<Box<dyn Future<Output = super::NewDataConnectorResult> + Send>> {
+        Box::pin(async move {
+            let glue = GlueDataConnector::new(params.parameters, params.io_runtime);
+            Ok(Arc::new(glue) as Arc<dyn DataConnector>)
+        })
+    }
+
+    fn prefix(&self) -> &'static str {
+        PREFIX
+    }
+
+    fn parameters(&self) -> &'static [ParameterSpec] {
+        PARAMETERS.as_ref()
+    }
+}
+
+#[async_trait]
+impl DataConnector for GlueDataConnector {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn read_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
+        self.create_table_provider(dataset).await
+    }
+
+    #[cfg(feature = "iceberg-write")]
+    async fn read_write_provider(
+        &self,
+        dataset: &Dataset,
+    ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
+        // Iceberg supports read and write operations through the same TableProvider interface.
+        Some(self.create_table_provider(dataset).await)
+    }
+}
+
+register_data_connector!("glue", GlueDataConnectorFactory);
 
 #[derive(Debug, PartialEq, Clone, Copy)]
 pub enum InputFormat {
@@ -387,18 +427,30 @@ async fn create_iceberg_provider(
         props.insert(S3_SESSION_TOKEN.to_string(), session_token.to_string());
     }
 
-    let config = GlueCatalogConfig::builder()
-        .warehouse(metadata_location)
-        .props(props)
-        .build();
+    // Disable OpenDAL's automatic credential loading from environment variables and config files.
+    // As we provide explicit credentials, we don't want OpenDAL to pick up AWS_SESSION_TOKEN
+    // or other credentials from the environment that may not be valid for this specific connection.
+    props.insert("s3.disable-config-load".to_string(), "true".to_string());
 
-    let catalog = GlueCatalog::new(config).await.map_err(|e| {
-        super::DataConnectorError::InvalidConfiguration {
-            dataconnector: PREFIX.to_string(),
-            connector_component: dataset.into(),
-            message: format!("Cannot initialize Glue catalog for dataset '{} (glue)'.\nVerify your AWS Glue configuration and credentials.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name),
-            source: e.into(),
-        }
+    props.insert(
+        GLUE_CATALOG_PROP_WAREHOUSE.to_string(),
+        metadata_location.to_string(),
+    );
+
+    if let Some(catalog_id) = table.catalog_id.clone() {
+        props.insert(GLUE_CATALOG_PROP_CATALOG_ID.to_string(), catalog_id);
+    }
+
+    let catalog = GlueCatalogBuilder::default()
+        .load("glue", props)
+        .await
+        .map_err(|e| {
+            super::DataConnectorError::InvalidConfiguration {
+                dataconnector: PREFIX.to_string(),
+                connector_component: dataset.into(),
+                message: format!("Cannot initialize Glue catalog for dataset '{} (glue)'. Verify your AWS Glue configuration and credentials. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", dataset.name),
+                source: e.into(),
+            }
     })?;
 
     let identifier = TableIdent::new(NamespaceIdent::new(database), table.name().to_string());
@@ -408,7 +460,7 @@ async fn create_iceberg_provider(
         .map_err(|e| super::DataConnectorError::InvalidConfiguration {
             dataconnector: PREFIX.to_string(),
             connector_component: dataset.into(),
-            message: format!("Cannot load Iceberg table '{}' for dataset '{} (glue)'.\nEnsure the table is correctly configured in AWS Glue.\nFor help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
+            message: format!("Cannot load Iceberg table '{}' for dataset '{} (glue)'. Ensure the table is correctly configured in AWS Glue. For help, visit: https://docs.spiceai.org/components/data-connectors/glue", table.name(), dataset.name),
             source: e.into(),
         })?;
 
@@ -420,6 +472,7 @@ async fn create_s3_provider(
     mut dataset: Dataset,
     mut params: Parameters,
     table: &Table,
+    tokio_io_runtime: tokio::runtime::Handle,
 ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
     let Some(storage_descriptor) = table.storage_descriptor() else {
         let e = Error::MissingStorageDescriptor {
@@ -468,7 +521,11 @@ async fn create_s3_provider(
 
     // Add required file_format parameter for S3
     params.insert("file_format".into(), input_format.file_format().into());
-    let s3 = S3 { params };
+    let s3 = S3 {
+        params,
+        runtime: Some(Arc::unwrap_or_clone(dataset.runtime())),
+        tokio_io_runtime,
+    };
 
     dataset.from = from;
 

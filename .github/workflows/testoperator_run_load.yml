@@ -1,4 +1,5 @@
 name: load tests
+run-name: load - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}
 
 on:
   workflow_dispatch:
@@ -41,16 +42,15 @@ on:
           - 'odbc-databricks'
           - 'duckdb'
           - 'duckdb-zero-results'
+          - 'duckdb-partitioned'
           - 'snowflake'
           - 'spark'
           - 'iceberg-sf1'
           - 'spicecloud-catalog'
+          - 'glue-catalog'
+          - 'databricks-catalog'
           - 'spicecloud'
-      ready_wait:
-        description: 'How long (in seconds) to wait for spiced to start'
-        required: true
-        default: '30'
-        type: string
+          - 'iceberg-hadoop'
       runner_type:
         description: 'Runner type'
         required: true
@@ -59,11 +59,25 @@ on:
         options:
           - 'spiceai-dev-runners'
           - 'spiceai-dev-large-runners'
-      concurrency_count:
+      concurrency:
         description: 'How many concurrent client connections to use?'
         required: true
         default: '8'
         type: string
+      random_param_set_count:
+        description: 'Number of random parameter sets to generate for parameterized queries (optional)'
+        required: false
+        type: string
+      http_clients:
+        description: 'Use HTTP clients for the test?'
+        required: false
+        type: boolean
+        default: false
+      scrape_spiced_metrics:
+        description: 'Scrape Prometheus metrics from spiced during the test'
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-load:
@@ -71,7 +85,23 @@ jobs:
     runs-on: ${{ github.event.inputs.runner_type }}
     timeout-minutes: 600
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
+
+      - name: Set spicepod path
+        id: set_spicepod_path
+        run: |
+          query_set="${{ github.event.inputs.query_set }}"
+          query_set="${query_set%%\[*\]*}"
+          SPICEPOD_PATH="./test/spicepods/${query_set}/sf1/${{ github.event.inputs.spicepod_path }}"
+          echo "SPICEPOD_PATH=${SPICEPOD_PATH}" >> $GITHUB_OUTPUT
+
+      - name: Validate spicepod file exists
+        run: |
+          if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
+            echo "Error: Spicepod file not found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+            exit 1
+          fi
+          echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
@@ -80,6 +110,17 @@ jobs:
           minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
+      - name: Build spicepod validator
+        uses: ./.github/actions/build-spicepod-validator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Validate spicepod
+        run: |
+          spicepod-validator "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
       - name: Setup spiced
         uses: ./.github/actions/setup-spiced
         with:
@@ -87,6 +128,10 @@ jobs:
 
       - name: Build Testoperator
         uses: ./.github/actions/build-testoperator
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Setup Testoperator
         uses: ./.github/actions/setup-testoperator-data
@@ -101,26 +146,28 @@ jobs:
             echo "MYSQL_DB=tpch_sf1" >> $GITHUB_ENV
           fi
 
-      - name: Extract spicepod filename path
-        id: extract_spicepod_filename
+      - name: Install OpenMP runtime library
         run: |
-          SPICEPOD_PATH="${{ github.event.inputs.spicepod_path }}"
-          SPICEPOD_FILENAME=$(basename $SPICEPOD_PATH)
-          echo "SPICEPOD_FILENAME=${SPICEPOD_FILENAME}" >> $GITHUB_OUTPUT
+          sudo apt-get update
+          sudo apt-get install -y libgomp1
 
-      - name: Run the load test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
+      - name: Run the load test - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides == '' }}
         run: |
           rm -rf .spice/data
           testoperator run load \
             -s /usr/local/bin/spiced \
-            -p ${{ github.event.inputs.spicepod_path }} \
+            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --ready-wait 900 \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
-            --concurrency ${{ github.event.inputs.concurrency_count }}
+            --concurrency ${{ github.event.inputs.concurrency }} \
+            ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
+            ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
+            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }} \
+            --metrics
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
@@ -144,8 +191,6 @@ jobs:
           SPICEAI_TEST_ENDPOINT: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
           SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
-          SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
-          SPICEAI_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCDS_BENCHMARK_KEY }}
           SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
           SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
           SQL_WAREHOUSE_DATABRICKS_HOST: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_HOST }}
@@ -153,21 +198,28 @@ jobs:
           DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
           DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
+          MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
+          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
 
-      - name: Run the load test (with overrides) - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
+      - name: Run the load test (with overrides) - ${{ github.event.inputs.spicepod_path }}
         if: ${{ github.event.inputs.query_overrides != '' }}
         run: |
           rm -rf .spice/data
           testoperator run load \
             -s /usr/local/bin/spiced \
-            -p ${{ github.event.inputs.spicepod_path }} \
+            -p ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }} \
             -d /opt/spiced/data \
             --query-set ${{ github.event.inputs.query_set }} \
-            --ready-wait ${{ github.event.inputs.ready_wait }} \
+            --ready-wait 900 \
             --disable-progress-bars \
             --duration ${{ github.event.inputs.duration }} \
             --query-overrides ${{ github.event.inputs.query_overrides }} \
-            --concurrency ${{ github.event.inputs.concurrency_count }}
+            --concurrency ${{ github.event.inputs.concurrency }} \
+            ${{ github.event.inputs.random_param_set_count && format('--random-param-set-count {0}', github.event.inputs.random_param_set_count) || '' }} \
+            ${{ github.event.inputs.http_clients == 'true' && '--http-clients' || '' }} \
+            ${{ github.event.inputs.scrape_spiced_metrics == 'true' && '--scrape-spiced-metrics' || '' }} \
+            --metrics
         env:
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT}}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY}}
@@ -191,8 +243,6 @@ jobs:
           SPICEAI_TEST_ENDPOINT: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_ENDPOINT }}
           SPICEAI_TEST_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCH_BENCHMARK_KEY }}
           SPICEAI_TEST_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TEST_TPCDS_BENCHMARK_KEY }}
-          SPICEAI_TPCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCH_BENCHMARK_KEY }}
-          SPICEAI_TPCDS_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_TPCDS_BENCHMARK_KEY }}
           SPICEAI_CLICKBENCH_API_KEY: ${{ secrets.SPICE_SECRET_SPICEAI_CLICKBENCH_BENCHMARK_KEY }}
           SQL_WAREHOUSE_DATABRICKS_TOKEN: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_TOKEN }}
           SQL_WAREHOUSE_DATABRICKS_HOST: ${{ secrets.SQL_WAREHOUSE_DATABRICKS_HOST }}
@@ -200,3 +250,6 @@ jobs:
           DREMIO_ENDPOINT: ${{ secrets.SPICE_DREMIO_ENDPOINT}}
           DREMIO_USERNAME: ${{ secrets.SPICE_DREMIO_USERNAME}}
           DREMIO_PASSWORD: ${{ secrets.SPICE_DREMIO_PASSWORD}}
+          MONGODB_HOST: ${{ secrets.TEST_MONGODB_HOST }}
+          MONGODB_PASSWORD: ${{ secrets.TEST_MONGODB_PASSWORD }}
+          SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}

@@ -14,9 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use rand::Rng;
 use regex::Regex;
 use std::{
+    fs,
     future::Future,
     hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
@@ -45,16 +45,6 @@ where
     false
 }
 
-pub(crate) fn get_random_element<T>(vec: &[T]) -> Option<&T> {
-    if vec.is_empty() {
-        None
-    } else {
-        let mut rng = rand::rng();
-        let index = rng.random_range(0..vec.len());
-        Some(&vec[index])
-    }
-}
-
 pub fn hash<T: Hash>(value: &T) -> u64 {
     let mut hasher = DefaultHasher::new();
     value.hash(&mut hasher);
@@ -64,7 +54,7 @@ pub fn hash<T: Hash>(value: &T) -> u64 {
 // replace insta headers with an empty string
 const INSTA_HEADER_REGEX: &str = r"^---\n(([\w\W]*\n)+)---\n";
 static INSTA_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
-    #[allow(clippy::expect_used)] // the regex is valid
+    #[expect(clippy::expect_used)] // the regex is valid
     Regex::new(INSTA_HEADER_REGEX).expect("Insta header replacement regex should build")
 });
 
@@ -121,8 +111,11 @@ pub fn median_observed_memory(readings: &[MemoryReading]) -> anyhow::Result<f64>
     memory_usages.sort_by(f64::total_cmp);
 
     let len = memory_usages.len();
-    if len % 2 == 0 {
-        Ok((memory_usages[len / 2] + memory_usages[len / 2 - 1]) / 2.0)
+    if len.is_multiple_of(2) {
+        Ok(f64::midpoint(
+            memory_usages[len / 2],
+            memory_usages[len / 2 - 1],
+        ))
     } else {
         Ok(memory_usages[len / 2])
     }
@@ -141,4 +134,19 @@ pub async fn observe_memory(
     println!("Max memory usage: {max_memory:.2} GB");
     println!("Median memory usage: {median_memory:.2} GB");
     Ok((max_memory, median_memory))
+}
+
+pub fn recursively_get_dir_size(dir: &PathBuf) -> anyhow::Result<usize> {
+    let mut total_size = 0;
+    if dir.exists() {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                total_size += usize::try_from(entry.metadata()?.len())?;
+            } else if entry.file_type()?.is_dir() {
+                total_size += recursively_get_dir_size(&entry.path())?;
+            }
+        }
+    }
+    Ok(total_size)
 }

@@ -17,7 +17,7 @@ limitations under the License.
 use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorFactory, ParameterSpec,
 };
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
@@ -34,18 +34,18 @@ use std::{future::Future, sync::Arc};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/flightsql#params"
+        "Missing required parameter: {parameter}. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/flightsql#params"
     ))]
     MissingParameter { parameter: String },
 
-    #[snafu(display("Failed to connect to the Flight server. A TLS error occurred.\n{source}"))]
+    #[snafu(display("Failed to connect to the Flight server. A TLS error occurred. {source}"))]
     UnableToConstructTlsChannel { source: flight_client::tls::Error },
 
-    #[snafu(display("Failed to connect to the Flight server.\n{source}"))]
+    #[snafu(display("Failed to connect to the Flight server. {source}"))]
     UnableToPerformHandshake { source: arrow::error::ArrowError },
 
     #[snafu(display(
-        "Failed to apply parameter '{parameter}': {source}. Ensure the value is valid and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/flightsql#params"
+        "Failed to apply parameter '{parameter}': {source}. Ensure the value is valid and retry. For details, visit: https://spiceai.org/docs/components/data-connectors/flightsql#params"
     ))]
     InvalidParameterValue {
         parameter: String,
@@ -155,15 +155,15 @@ impl DataConnector for FlightSQL {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        Ok(Read::table_provider(
-            &self.flightsql_factory,
-            dataset.path().into(),
-            dataset.schema(),
+        Ok(
+            Read::table_provider(&self.flightsql_factory, dataset.path().into())
+                .await
+                .context(super::UnableToGetReadProviderSnafu {
+                    dataconnector: "flightsql",
+                    connector_component: ConnectorComponent::from(dataset),
+                })?,
         )
-        .await
-        .context(super::UnableToGetReadProviderSnafu {
-            dataconnector: "flightsql",
-            connector_component: ConnectorComponent::from(dataset),
-        })?)
     }
 }
+
+register_data_connector!("flightsql", FlightSQLFactory);

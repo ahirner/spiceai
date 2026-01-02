@@ -13,24 +13,25 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use async_trait::async_trait;
-use datafusion::sql::TableReference;
-use itertools::Itertools;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use snafu::ResultExt;
-use std::{borrow::Cow, collections::HashMap, sync::Arc};
-
 use crate::{
     Runtime,
     datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA},
     tools::SpiceModelTool,
 };
+use async_trait::async_trait;
+use datafusion::sql::TableReference;
+use itertools::Itertools;
+use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use snafu::ResultExt;
+use std::{borrow::Cow, collections::HashMap, sync::Arc};
+use tracing_futures::Instrument;
 
 pub struct ListDatasetsTool {
     name: String,
     description: String,
-    table_allowlist: Option<Vec<String>>,
+    table_allowlist: Option<ResolvedTableAwareAllowlist>,
     rt: Arc<Runtime>,
 }
 
@@ -39,7 +40,7 @@ impl ListDatasetsTool {
     pub fn new(
         name: Option<&str>,
         description: Option<&str>,
-        table_allowlist: Option<Vec<&str>>,
+        table_allowlist: Option<ResolvedTableAwareAllowlist>,
         rt: Arc<Runtime>,
     ) -> Self {
         Self {
@@ -48,7 +49,7 @@ impl ListDatasetsTool {
             description: description
                 .unwrap_or("List all SQL tables available.")
                 .to_string(),
-            table_allowlist: table_allowlist.map(|t| t.iter().map(ToString::to_string).collect()),
+            table_allowlist,
         }
     }
 }
@@ -76,24 +77,38 @@ impl SpiceModelTool for ListDatasetsTool {
     async fn call(&self, arg: &str) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::list_datasets", tool = self.name().to_string(), input = arg);
 
-        let elements = get_dataset_elements(Arc::clone(&self.rt), self.table_allowlist.as_deref())
-            .await
-            .iter()
-            .map(serde_json::value::to_value)
-            .collect::<Result<Vec<Value>, _>>()
-            .boxed()?;
+        let result: Result<Vec<Value>, Box<dyn std::error::Error + Send + Sync>> = async {
+            let elements =
+                get_dataset_elements(Arc::clone(&self.rt), self.table_allowlist.as_ref())
+                    .await
+                    .iter()
+                    .map(serde_json::value::to_value)
+                    .collect::<Result<Vec<Value>, _>>()
+                    .boxed()?;
 
-        let captured_output_json = serde_json::to_string(&elements).boxed()?;
-        tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+            let captured_output_json = serde_json::to_string(&elements).boxed()?;
+            tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+            Ok(elements)
+        }.instrument(span.clone()).await;
 
-        Ok(Value::Array(elements))
+        match result {
+            Ok(value) => {
+                let captured_output_json = serde_json::to_string(&value).boxed()?;
+                tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
+                Ok(Value::Array(value))
+            }
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                Err(e)
+            }
+        }
     }
 }
 
 /// Return all datasets available in the runtime, with the properties visible to LLMs.
 pub async fn get_dataset_elements(
     rt: Arc<Runtime>,
-    opt_include: Option<&[String]>,
+    opt_include: Option<&ResolvedTableAwareAllowlist>,
 ) -> Vec<ListDatasetElement> {
     let mut tables = get_table_elements(Arc::clone(&rt), opt_include).await;
     let views = get_view_elements(Arc::clone(&rt), opt_include).await;
@@ -106,7 +121,7 @@ pub async fn get_dataset_elements(
 
 pub async fn get_table_elements(
     rt: Arc<Runtime>,
-    opt_include: Option<&[String]>,
+    opt_include: Option<&ResolvedTableAwareAllowlist>,
 ) -> Vec<ListDatasetElement> {
     let Some(app) = &*rt.app.read().await else {
         return vec![];
@@ -114,7 +129,9 @@ pub async fn get_table_elements(
 
     app.datasets
         .iter()
-        .filter(|d| opt_include.is_none_or(|ts| ts.contains(&d.name)))
+        .filter(|&d| {
+            opt_include.is_none_or(|ts| ts.table_is_allowed(&TableReference::parse_str(&d.name)))
+        })
         .map(|d| ListDatasetElement {
             table: TableReference::parse_str(&d.name)
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)
@@ -128,7 +145,7 @@ pub async fn get_table_elements(
 
 pub async fn get_catalog_elements(
     rt: Arc<Runtime>,
-    _opt_include: Option<&[String]>,
+    opt_include: Option<&ResolvedTableAwareAllowlist>,
 ) -> Vec<ListDatasetElement> {
     let Some(ref app) = *rt.app.read().await else {
         return vec![];
@@ -148,13 +165,14 @@ pub async fn get_catalog_elements(
                     };
                     schm.table_names()
                         .iter()
-                        .map(|t| ListDatasetElement {
-                            table: TableReference::Full {
-                                table: t.as_str().into(),
-                                schema: s.as_str().into(),
-                                catalog: c.name.as_str().into(),
-                            }
-                            .to_string(),
+                        .map(|t| TableReference::Full {
+                            table: t.as_str().into(),
+                            schema: s.as_str().into(),
+                            catalog: c.name.as_str().into(),
+                        })
+                        .filter(|d| opt_include.is_none_or(|ts| ts.table_is_allowed(d)))
+                        .map(|table| ListDatasetElement {
+                            table: table.to_string(),
                             can_search_documents: false,
                             description: None,
                             metadata: HashMap::new(),
@@ -168,7 +186,7 @@ pub async fn get_catalog_elements(
 
 pub async fn get_view_elements(
     rt: Arc<Runtime>,
-    opt_include: Option<&[String]>,
+    opt_include: Option<&ResolvedTableAwareAllowlist>,
 ) -> Vec<ListDatasetElement> {
     let Some(app) = &*rt.app.read().await else {
         return vec![];
@@ -176,7 +194,9 @@ pub async fn get_view_elements(
 
     app.views
         .iter()
-        .filter(|v| opt_include.is_none_or(|ts| ts.contains(&v.name)))
+        .filter(|&v| {
+            opt_include.is_none_or(|ts| ts.table_is_allowed(&TableReference::parse_str(&v.name)))
+        })
         .map(|v| ListDatasetElement {
             table: TableReference::parse_str(&v.name)
                 .resolve(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA)

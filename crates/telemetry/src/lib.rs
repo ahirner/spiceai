@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use meter::METER;
+use opentelemetry::metrics::UpDownCounter;
 use opentelemetry::{
     KeyValue,
     metrics::{Counter, Histogram},
@@ -24,9 +25,16 @@ use std::{sync::LazyLock, time::Duration};
 #[cfg(feature = "anonymous_telemetry")]
 pub mod anonymous;
 pub mod exporter;
+pub mod hardware;
 pub mod meter;
 pub mod noop;
 pub mod reader;
+
+// As recommended by the OpenTelemetry Semantic Conventions:
+// https://opentelemetry.io/docs/specs/semconv/database/database-metrics/#metric-dbclientresponsereturned_rows
+pub const ROWS_RETURNED_HISTOGRAM_BUCKETS: [f64; 13] = [
+    1.0, 2.0, 5.0, 10.0, 20.0, 50.0, 100.0, 200.0, 500.0, 1000.0, 2000.0, 5000.0, 10000.0,
+];
 
 static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
     METER
@@ -38,6 +46,24 @@ static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
 
 pub fn track_query_count(dimensions: &[KeyValue]) {
     QUERY_COUNT.add(1, dimensions);
+}
+
+static QUERY_ACTIVE_COUNT: LazyLock<UpDownCounter<i64>> = LazyLock::new(|| {
+    METER
+        .i64_up_down_counter("query_active_count")
+        .with_description(
+            "Number of concurrent top-level queries actively being processed in the runtime.",
+        )
+        .with_unit("queries")
+        .build()
+});
+
+pub fn inc_query_active_count(dimensions: &[KeyValue]) {
+    QUERY_ACTIVE_COUNT.add(1, dimensions);
+}
+
+pub fn dec_query_active_count(dimensions: &[KeyValue]) {
+    QUERY_ACTIVE_COUNT.add(-1, dimensions);
 }
 
 static BYTES_PROCESSED: LazyLock<Counter<u64>> = LazyLock::new(|| {
@@ -62,6 +88,19 @@ static BYTES_RETURNED: LazyLock<Counter<u64>> = LazyLock::new(|| {
 
 pub fn track_bytes_returned(bytes: u64, dimensions: &[KeyValue]) {
     BYTES_RETURNED.add(bytes, dimensions);
+}
+
+static ROWS_RETURNED: LazyLock<Histogram<u64>> = LazyLock::new(|| {
+    METER
+        .u64_histogram("query_returned_rows")
+        .with_description("Number of rows returned to query clients.")
+        .with_boundaries(ROWS_RETURNED_HISTOGRAM_BUCKETS.to_vec())
+        .with_unit("rows")
+        .build()
+});
+
+pub fn track_rows_returned(rows: u64, dimensions: &[KeyValue]) {
+    ROWS_RETURNED.record(rows, dimensions);
 }
 
 static QUERY_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
@@ -102,4 +141,76 @@ static AI_INFERENCES_WITH_SPICE_COUNT: LazyLock<Counter<u64>> = LazyLock::new(||
 
 pub fn track_ai_inferences_with_spice_count(dimensions: &[KeyValue]) {
     AI_INFERENCES_WITH_SPICE_COUNT.add(1, dimensions);
+}
+
+static TEXT_EMBEDDINGS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("text_embeddings")
+        .with_description("Number of text embeddings requests.")
+        .with_unit("embedding")
+        .build()
+});
+
+pub fn track_text_embedding(dimensions: &[KeyValue]) {
+    TEXT_EMBEDDINGS.add(1, dimensions);
+}
+
+static TEXT_SEARCHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("text_searches")
+        .with_description("Number of text search requests.")
+        .with_unit("search")
+        .build()
+});
+
+pub fn track_text_search(dimensions: &[KeyValue]) {
+    TEXT_SEARCHES.add(1, dimensions);
+}
+
+static VECTOR_SEARCHES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("vector_searches")
+        .with_description("Number of vector search requests.")
+        .with_unit("search")
+        .build()
+});
+
+pub fn track_vector_search(dimensions: &[KeyValue]) {
+    VECTOR_SEARCHES.add(1, dimensions);
+}
+
+static QUERY_PRODUCED_SPILLS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("query_produced_spills")
+        .with_description("Number of spills produced by the query")
+        .with_unit("spills")
+        .build()
+});
+
+pub fn track_produced_spills(value: u64, dimensions: &[KeyValue]) {
+    QUERY_PRODUCED_SPILLS.add(value, dimensions);
+}
+
+static QUERY_SPILLED_BYTES: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("query_spilled_bytes")
+        .with_description("Number of spilled bytes produced by the query")
+        .with_unit("By")
+        .build()
+});
+
+pub fn track_spilled_bytes(value: u64, dimensions: &[KeyValue]) {
+    QUERY_SPILLED_BYTES.add(value, dimensions);
+}
+
+static QUERY_SPILLED_ROWS: LazyLock<Counter<u64>> = LazyLock::new(|| {
+    METER
+        .u64_counter("query_spilled_rows")
+        .with_description("Number of spilled rows produced by the query")
+        .with_unit("rows")
+        .build()
+});
+
+pub fn track_spilled_rows(value: u64, dimensions: &[KeyValue]) {
+    QUERY_SPILLED_ROWS.add(value, dimensions);
 }

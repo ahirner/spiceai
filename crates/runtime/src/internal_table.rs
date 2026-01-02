@@ -24,7 +24,9 @@ use tokio::sync::RwLock;
 
 use crate::Runtime;
 use crate::accelerated_table::{AcceleratedTableBuilderError, Retention};
-use crate::component::dataset::{Mode, acceleration::Acceleration, builder::DatasetBuilder};
+use crate::component::access::AccessMode;
+use crate::component::dataset::acceleration::Acceleration;
+use crate::component::dataset::builder::DatasetBuilder;
 use crate::federated_table::FederatedTable;
 use crate::secrets::Secrets;
 use crate::status;
@@ -32,7 +34,6 @@ use crate::{
     accelerated_table::{AcceleratedTable, refresh::Refresh},
     dataaccelerator::{self},
     dataconnector::{DataConnector, DataConnectorError, sink::SinkConnector},
-    datafusion::handle_accelerated_table_behavior,
 };
 
 #[derive(Debug, Snafu)]
@@ -96,7 +97,7 @@ async fn get_local_table_provider(
             code: "IT-GLTP-BD-B".to_string(), // InternalTable - GetLocalTableProvider - DatasetBuilder - Build
         })?;
 
-    dataset.mode = Mode::ReadWrite;
+    dataset.access = AccessMode::ReadWrite;
 
     let mut sink = SinkConnector::new(Arc::clone(schema));
     if let Some(pk) = primary_key {
@@ -114,7 +115,7 @@ async fn get_local_table_provider(
     Ok(source_table_provider)
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(clippy::too_many_arguments)]
 pub async fn create_internal_accelerated_table(
     runtime_status: Arc<status::RuntimeStatus>,
     name: TableReference,
@@ -131,7 +132,7 @@ pub async fn create_internal_accelerated_table(
     let federated_table = Arc::new(FederatedTable::new_unchecked(Arc::clone(
         &source_table_provider,
     )));
-    let (accelerated_table_provider, accelerated_table_behaviors) = runtime
+    let accelerated_table_provider = runtime
         .accelerator_engine_registry()
         .create_accelerator_table(
             name.clone(),
@@ -145,12 +146,6 @@ pub async fn create_internal_accelerated_table(
         .await
         .context(UnableToCreateAcceleratedTableProviderSnafu)?;
 
-    handle_accelerated_table_behavior(accelerated_table_behaviors, &federated_table, name.table())
-        .boxed()
-        .context(InternalSnafu {
-            code: "IT-CIA-HATB".to_string(), // InternalTable - CreateInternalAcceleratedTable - HandleAcceleratedTableBehavior
-        })?;
-
     let mut builder = AcceleratedTable::builder(
         runtime_status,
         name.clone(),
@@ -158,7 +153,9 @@ pub async fn create_internal_accelerated_table(
         "internal".to_string(),
         accelerated_table_provider,
         refresh,
+        runtime.tokio_io_runtime(),
     );
+    builder.cpu_runtime(runtime.datafusion().refresh_runtime().cloned());
 
     builder.retention(retention);
 

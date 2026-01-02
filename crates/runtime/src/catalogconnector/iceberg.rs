@@ -16,16 +16,27 @@ limitations under the License.
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
 use crate::{
-    Runtime, component::catalog::Catalog, dataconnector::parameters::ConnectorParams,
+    Runtime,
+    component::catalog::Catalog,
+    dataconnector::parameters::{ConnectorParams, aws::initiate_config_with_credentials},
     http::v1::iceberg::namespace::Namespace as HttpNamespace,
 };
 use async_trait::async_trait;
+use aws_sdk_credential_bridge::S3CredentialProvider;
 use data_components::{
     RefreshableCatalogProvider,
-    iceberg::{catalog::RestCatalog, provider::IcebergCatalogProvider},
+    iceberg::{
+        catalog::{
+            hadoop::{HadoopCatalogBuilder, MetadataMode},
+            rest::RestCatalog,
+        },
+        provider::IcebergCatalogProvider,
+    },
 };
-use iceberg::{Namespace, NamespaceIdent};
-use iceberg_catalog_rest::RestCatalogConfig;
+use iceberg::{CatalogBuilder, Namespace, NamespaceIdent, io::CustomAwsCredentialLoader};
+use iceberg_catalog_rest::{
+    REST_CATALOG_PROP_URI, RestCatalog as IcebergRestCatalog, RestCatalogBuilder,
+};
 use ns_lookup::verify_ns_lookup_and_tcp_connect;
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
@@ -35,7 +46,10 @@ use url::Url;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Invalid URL scheme '{}'. Must be http or https", scheme))]
+    #[snafu(display(
+        "Invalid URL scheme '{}'. Must be 'http', 'https', 'file', 's3', or 's3a'.",
+        scheme
+    ))]
     InvalidScheme { scheme: String },
 
     #[snafu(display("URL is missing a host"))]
@@ -56,8 +70,11 @@ pub enum Error {
     #[snafu(display("Failed to parse URL: {}", source))]
     UrlParse { source: url::ParseError },
 
+    #[snafu(display("Failed to parse catalog URL"))]
+    UrlParseNoSource,
+
     #[snafu(display(
-        "Failed to connect to the S3 endpoint at '{url}'.\nVerify the S3 endpoint is accessible and try again."
+        "Failed to connect to the S3 endpoint at '{url}'. Verify the S3 endpoint is accessible and try again."
     ))]
     FailedToConnectS3Endpoint { url: String },
 
@@ -66,6 +83,14 @@ pub enum Error {
 
     #[snafu(display("Unexpected table segment in catalog path: {segment}"))]
     UnexpectedTableSegment { segment: String },
+
+    #[snafu(display("Failed to build catalog: {source}"))]
+    #[snafu(visibility(pub(crate)))]
+    UnableToBuildCatalog { source: iceberg::Error },
+
+    #[snafu(display("Failed to build catalog client: {source}"))]
+    #[snafu(visibility(pub(crate)))]
+    UnableToBuildCatalogClient { source: reqwest::Error },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -82,9 +107,54 @@ impl IcebergCatalog {
             params: params.parameters,
         })
     }
+
+    async fn load_hadoop_catalog(
+        props: HashMap<String, String>,
+        custom_credential_loader: Option<CustomAwsCredentialLoader>,
+        catalog: &Catalog,
+        catalog_id: &str,
+    ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
+        // Not much we can check with this path for Hadoop, because a namespace could be an empty folder, there could be no namespaces, etc.
+        let mut catalog_builder = HadoopCatalogBuilder::default()
+            .with_warehouse_root(catalog_id)
+            .with_metadata_mode(MetadataMode::Infer)
+            .with_properties(props);
+
+        if let Some(loader) = custom_credential_loader {
+            catalog_builder = catalog_builder.with_file_io_extension(loader);
+        }
+
+        let hadoop_catalog =
+            catalog_builder
+                .build()
+                .await
+                .map_err(|e| super::Error::InvalidConfiguration {
+                    connector: "iceberg".into(),
+                    message: format!(
+                        "Failed to create Hadoop Catalog for Iceberg with base URI: {catalog_id}",
+                    ),
+                    connector_component: ConnectorComponent::from(catalog),
+                    source: Box::new(e),
+                })?;
+
+        let catalog_provider = IcebergCatalogProvider::try_new(
+            Arc::new(hadoop_catalog),
+            None,
+            catalog.include.as_ref(),
+        )
+        .await
+        .map_err(|e| super::Error::UnableToGetCatalogProvider {
+            connector: "iceberg".into(),
+            connector_component: ConnectorComponent::from(catalog),
+            source: Box::new(e),
+        })?;
+
+        Ok(Arc::new(catalog_provider) as Arc<dyn RefreshableCatalogProvider>)
+    }
 }
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
+pub const ICEBERG_PARAM_LEN: usize = 17;
+pub const PARAMETERS: [ParameterSpec; ICEBERG_PARAM_LEN] = [
     ParameterSpec::component("token")
         .secret()
         .description("Bearer token value to use for Authorization header."),
@@ -111,6 +181,10 @@ pub(crate) const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("signing_name")
         .description("The name to use when signing the request for SigV4.")
         .default("glue"),
+
+    // Glue like catalog options. Eg: Lakekeeper
+    ParameterSpec::component("warehouse")
+        .description("Name of the Iceberg warehouse."),
 
     // S3 storage options
     ParameterSpec::component("s3_endpoint")
@@ -169,6 +243,7 @@ pub(crate) fn map_param_name_to_iceberg_prop(param_name: &str) -> Option<Vec<Str
             "client.assume-role.arn".to_string(),
             "rest.client.assume-role.arn".to_string(),
         ]),
+        "warehouse" => Some(vec!["warehouse".to_string()]),
         "sigv4_enabled" => Some(vec!["rest.sigv4-enabled".to_string()]),
         "signing_region" => Some(vec!["rest.signing-region".to_string()]),
         "signing_name" => Some(vec!["rest.signing-name".to_string()]),
@@ -191,26 +266,13 @@ impl CatalogConnector for IcebergCatalog {
             return Err(
                 super::Error::InvalidConfigurationNoSource {
                     connector: "iceberg".into(),
-                    message: "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from".into(),
+                    message: "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>. For details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                 },
             );
         };
 
-        let (base_uri, mut props, namespace) = match parse_catalog_url(catalog_id.as_str()) {
-            Ok(result) => result,
-            Err(e) => {
-                return Err(super::Error::InvalidConfiguration {
-                    connector: "iceberg".into(),
-                    message: format!(
-                        "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>.\nFor details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from\n{e}"
-                    ),
-                    connector_component: ConnectorComponent::from(catalog),
-                    source: Box::new(e),
-                });
-            }
-        };
-
+        let mut props = HashMap::new();
         for (key, value) in &self.params {
             if let Some(prop_vec) = map_param_name_to_iceberg_prop(key.as_str()) {
                 for prop in prop_vec {
@@ -219,7 +281,7 @@ impl CatalogConnector for IcebergCatalog {
             }
         }
 
-        if let Some(endpoint) = props.get("s3.endpoint") {
+        let custom_credential_loader = if let Some(endpoint) = props.get("s3.endpoint") {
             verify_s3_endpoint(endpoint)
                 .await
                 .map_err(|e| super::Error::InvalidConfiguration {
@@ -228,15 +290,77 @@ impl CatalogConnector for IcebergCatalog {
                     connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),
                 })?;
+
+            let aws_sdk_config = initiate_config_with_credentials(
+                "IcebergCatalogConnector",
+                "s3_region",
+                "s3_access_key_id",
+                "s3_secret_access_key",
+                "s3_session_token",
+                &self.params,
+            )
+            .await
+            .map_err(|e| super::Error::InvalidConfiguration {
+                connector: "iceberg".into(),
+                message: e.to_string(),
+                connector_component: ConnectorComponent::from(catalog),
+                source: Box::new(e),
+            })?
+            .load()
+            .await;
+
+            Some(
+                S3CredentialProvider::from_config(&aws_sdk_config)
+                    .map_err(|e| super::Error::InvalidConfiguration {
+                        connector: "iceberg".into(),
+                        message: e.to_string(),
+                        connector_component: ConnectorComponent::from(catalog),
+                        source: Box::new(e),
+                    })?
+                    .into_custom_loader(),
+            )
+        } else {
+            None
+        };
+
+        if catalog_id.starts_with("file://")
+            || catalog_id.starts_with("s3://")
+            || catalog_id.starts_with("s3a://")
+        {
+            return IcebergCatalog::load_hadoop_catalog(
+                props,
+                custom_credential_loader,
+                catalog,
+                &catalog_id,
+            )
+            .await;
         }
 
-        let catalog_config = get_rest_catalog_config(base_uri, props);
+        let (base_uri, new_props, namespace) = match parse_catalog_url(catalog_id.as_str()) {
+            Ok(result) => result,
+            Err(e) => {
+                return Err(super::Error::InvalidConfiguration {
+                    connector: "iceberg".into(),
+                    message: format!(
+                        "A Catalog Path is required for Iceberg in the format of: http://<host_and_port>/v1/namespaces/<namespace>. For details, visit: https://spiceai.org/docs/components/catalogs/iceberg#from {e}"
+                    ),
+                    connector_component: ConnectorComponent::from(catalog),
+                    source: Box::new(e),
+                });
+            }
+        };
 
-        let catalog_client = RestCatalog::new(catalog_config);
+        props.extend(new_props);
+        let catalog_config = get_rest_catalog(base_uri, props).await?;
+        let mut catalog_client = RestCatalog::new(catalog_config);
+        if let Some(loader) = custom_credential_loader {
+            catalog_client = catalog_client.with_file_io_extension(loader);
+        }
 
         let catalog_provider = IcebergCatalogProvider::try_new(
             Arc::new(catalog_client),
             namespace.map(|n| n.name().clone()),
+            catalog.include.as_ref(),
         )
         .await
         .map_err(|e| super::Error::UnableToGetCatalogProvider {
@@ -258,7 +382,7 @@ pub(crate) async fn verify_s3_endpoint(endpoint: &str) -> Result<()> {
         } else if url.scheme() == "https" {
             443
         } else {
-            return 0;
+            0
         }
     });
 
@@ -396,17 +520,16 @@ fn parse_iceberg_url(url: &str) -> Result<(String, HashMap<String, String>, Iceb
     }
 
     // Auto-detect AWS Glue URLs and set signing region, name, and SigV4 enabled
-    if let Some(host_str) = parsed.host_str() {
-        if host_str.starts_with("glue.") && host_str.ends_with(".amazonaws.com") {
-            if let Some(region) = host_str
-                .strip_prefix("glue.")
-                .and_then(|s| s.strip_suffix(".amazonaws.com"))
-            {
-                props.insert("rest.signing-region".to_string(), region.to_string());
-                props.insert("rest.signing-name".to_string(), "glue".to_string());
-                props.insert("rest.sigv4-enabled".to_string(), "true".to_string());
-            }
-        }
+    if let Some(host_str) = parsed.host_str()
+        && host_str.starts_with("glue.")
+        && host_str.ends_with(".amazonaws.com")
+        && let Some(region) = host_str
+            .strip_prefix("glue.")
+            .and_then(|s| s.strip_suffix(".amazonaws.com"))
+    {
+        props.insert("rest.signing-region".to_string(), region.to_string());
+        props.insert("rest.signing-name".to_string(), "glue".to_string());
+        props.insert("rest.sigv4-enabled".to_string(), "true".to_string());
     }
 
     // The namespace name is the segment immediately after "namespaces"
@@ -464,58 +587,195 @@ pub fn parse_table_url(url: &str) -> Result<(String, HashMap<String, String>, Na
     }
 }
 
-/// Builds a `RestCatalogConfig` from a base URI and properties.
-///
-/// This function takes a base URI and a map of properties, and builds a `RestCatalogConfig`
-/// with the given properties. If a "warehouse" property is present, it will be used to set the
-/// warehouse for the catalog.
-#[must_use]
-pub fn get_rest_catalog_config(
+/// Builds an `IcebergRestCatalog` from a base URI and properties.
+pub async fn get_rest_catalog(
     base_uri: String,
     mut props: HashMap<String, String, std::hash::RandomState>,
-) -> RestCatalogConfig {
-    if let Some(warehouse) = props.remove("warehouse") {
-        RestCatalogConfig::builder()
-            .uri(base_uri)
-            .props(props)
-            .warehouse(warehouse)
-            .build()
-    } else {
-        RestCatalogConfig::builder()
-            .uri(base_uri)
-            .props(props)
-            .build()
-    }
+) -> Result<IcebergRestCatalog> {
+    props.insert(REST_CATALOG_PROP_URI.to_string(), base_uri);
+    RestCatalogBuilder::default()
+        .load("rest", props)
+        .await
+        .context(UnableToBuildCatalogSnafu)
 }
 
 // Parse out the catalog id from the Glue URL if it exists, i.e.
 // https://glue.us-east-1.amazonaws.com/iceberg/v1/catalogs/211125479522/namespaces/big_datasets/tables/tpch_sf100_lineitem
 // should return "211125479522"
 fn get_warehouse(url: &Url) -> Option<String> {
-    if let Some(host_str) = url.host_str() {
-        if host_str.starts_with("glue.") && host_str.ends_with(".amazonaws.com") {
-            let path_segments: Vec<_> = url
-                .path_segments()
-                .map(Iterator::collect)
-                .unwrap_or_default();
+    if let Some(host_str) = url.host_str()
+        && host_str.starts_with("glue.")
+        && host_str.ends_with(".amazonaws.com")
+    {
+        let path_segments: Vec<_> = url
+            .path_segments()
+            .map(Iterator::collect)
+            .unwrap_or_default();
 
-            if path_segments.len() >= 4
-                && path_segments[0] == "iceberg"
-                && path_segments[1] == "v1"
-                && path_segments[2] == "catalogs"
-                && path_segments[3].len() == 12
-                && path_segments[3].chars().all(|c| c.is_ascii_digit())
-            {
-                return Some(path_segments[3].to_string());
-            }
+        if path_segments.len() >= 4
+            && path_segments[0] == "iceberg"
+            && path_segments[1] == "v1"
+            && path_segments[2] == "catalogs"
+            && path_segments[3].len() == 12
+            && path_segments[3].chars().all(|c| c.is_ascii_digit())
+        {
+            return Some(path_segments[3].to_string());
         }
     }
     None
 }
 
+pub fn parse_hadoop_table_url(
+    url: &str,
+    warehouse_uri: Option<&str>,
+) -> Result<(String, Namespace, String)> {
+    // There's no definite position for a root namespace in Hadoop, so all we can do is validate the URL and return the base URI.
+    // If an optional root is provided, it will be used as the warehouse root.
+    let parsed = Url::parse(url).context(UrlParseSnafu)?;
+
+    match parsed.scheme() {
+        "file" | "s3a" => {} // OK
+        other => {
+            return InvalidSchemeSnafu {
+                scheme: other.to_string(),
+            }
+            .fail();
+        }
+    }
+
+    let count = parsed
+        .path_segments()
+        .map(std::iter::Iterator::count)
+        .context(UrlParseNoSourceSnafu)?;
+
+    let table_name = parsed
+        .path_segments()
+        .and_then(std::iter::Iterator::last)
+        .context(UrlParseNoSourceSnafu)?;
+
+    // Set initial namespace - this falls through if warehouse URI is not provided
+    let namespace_ident = parsed
+        .path_segments()
+        .and_then(|mut segments| {
+            segments
+                .nth(count - 2)
+                .map(|s| NamespaceIdent::new(s.to_string()))
+        })
+        .context(MissingNamespaceSnafu)?;
+
+    let nodes = parsed
+        .path_segments()
+        .map(|segments| segments.take(count - 1).collect::<Vec<_>>())
+        .context(UrlParseNoSourceSnafu)?;
+
+    let warehouse_leaves = nodes
+        .clone()
+        .iter()
+        .map(ToString::to_string)
+        .take(count - 2)
+        .collect::<Vec<_>>()
+        .join("/");
+
+    let mut base_uri = if let Some(host) = parsed.host_str() {
+        format!("{}://{host}/{warehouse_leaves}", parsed.scheme())
+    } else {
+        // nodes includes the inferred namespace, which needs to be excluded from the inferred base URI
+        format!("{}://{warehouse_leaves}", parsed.scheme())
+    };
+
+    let mut namespace = Namespace::new(namespace_ident);
+
+    if let Some(warehouse_uri) = warehouse_uri {
+        base_uri = warehouse_uri.to_string();
+
+        let warehouse_uri = Url::parse(warehouse_uri).context(UrlParseSnafu)?;
+        if warehouse_uri.scheme() != parsed.scheme() {
+            return InvalidSchemeSnafu {
+                scheme: warehouse_uri.scheme().to_string(),
+            }
+            .fail();
+        }
+
+        // inverse union of the nodes with the warehouse URI paths gives any namespace segments
+        let warehouse_segments: Vec<_> = warehouse_uri
+            .path_segments()
+            .map(Iterator::collect::<Vec<_>>)
+            .unwrap_or_default();
+
+        let namespace_segments: Vec<_> = nodes
+            .iter()
+            .filter(|segment| !warehouse_segments.contains(segment))
+            .map(ToString::to_string)
+            .collect();
+
+        if !namespace_segments.is_empty() {
+            let namespace_ident = NamespaceIdent::from_vec(namespace_segments)
+                .map_err(|_| Error::MissingNamespace)?;
+            namespace = Namespace::new(namespace_ident);
+        }
+    }
+
+    Ok((base_uri, namespace, table_name.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_hadoop_table_url() {
+        let url = "s3a://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, Some("s3a://my-bucket/my-prefix/warehouse"))
+                .expect("Failed to parse Hadoop table URL");
+        assert_eq!(base_uri, "s3a://my-bucket/my-prefix/warehouse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "spiceai_sandbox");
+        assert_eq!(table_name, "my_table");
+
+        let url = "file:///my/local/path/to/warehouse/spiceai_sandbox/my_table";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, Some("file:///my/local/path/to/warehouse"))
+                .expect("Failed to parse Hadoop table URL");
+        assert_eq!(base_uri, "file:///my/local/path/to/warehouse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "spiceai_sandbox");
+        assert_eq!(table_name, "my_table");
+
+        // should infer the base URI when no warehouse is provided
+        let url = "s3a://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, None).expect("Failed to parse Hadoop table URL");
+        assert_eq!(base_uri, "s3a://my-bucket/my-prefix/warehouse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "spiceai_sandbox");
+        assert_eq!(table_name, "my_table");
+
+        let url = "file://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, None).expect("Failed to parse Hadoop table URL");
+        assert_eq!(base_uri, "file://my-bucket/my-prefix/warehouse");
+        assert_eq!(namespace.name().to_url_string().as_str(), "spiceai_sandbox");
+        assert_eq!(table_name, "my_table");
+
+        // should support nested namespaces when a warehouse URI is provided
+        let url = "s3a://my-bucket/my-prefix/warehouse/spiceai_sandbox/nested/my_table";
+        let (base_uri, namespace, table_name) =
+            parse_hadoop_table_url(url, Some("s3a://my-bucket/my-prefix/warehouse"))
+                .expect("Failed to parse Hadoop table URL");
+        assert_eq!(base_uri, "s3a://my-bucket/my-prefix/warehouse");
+        assert_eq!(
+            namespace.name().to_string().as_str(),
+            "spiceai_sandbox.nested",
+        );
+        assert_eq!(table_name, "my_table");
+
+        // should deny unknown schemes, or schemes from warehouses that don't match
+        let url = "ftp://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let result = parse_hadoop_table_url(url, Some("ftp://my-bucket/my-prefix/warehouse"));
+        result.expect_err("should error parsing url");
+
+        let url = "s3a://my-bucket/my-prefix/warehouse/spiceai_sandbox/my_table";
+        let result = parse_hadoop_table_url(url, Some("file:///my/local/path/to/warehouse"));
+        result.expect_err("should error parsing url");
+    }
 
     #[test]
     fn test_parse_catalog_url_no_prefix() {
@@ -569,28 +829,27 @@ mod tests {
     fn test_invalid_scheme() {
         let url = "ftp://my.iceberg.com/v1/namespaces/spiceai_sandbox";
         let result = parse_catalog_url(url);
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
     }
 
     #[test]
     fn test_no_host() {
         let url = "https:///v1/namespaces/spiceai_sandbox";
         let result = parse_catalog_url(url);
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
     }
 
     #[test]
     fn test_missing_namespace_segment() {
         let url = "https://my.iceberg.com/v1/";
         let result = parse_catalog_url(url);
-        assert!(result.is_err());
+        result.expect_err("should error parsing url");
     }
 
     #[test]
     fn test_empty_namespace_segment() {
         let url = "https://my.iceberg.com/v1/namespaces";
         let result = parse_catalog_url(url);
-        assert!(result.is_ok());
         assert!(result.expect("Failed to parse catalog URL").2.is_none());
     }
 

@@ -25,9 +25,11 @@ use super::{
 #[cfg(feature = "schemars")]
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct Embeddings {
     pub from: String,
     pub name: String,
@@ -37,7 +39,7 @@ pub struct Embeddings {
     pub files: Vec<ModelFile>,
 
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub params: HashMap<String, String>,
+    pub params: HashMap<String, Value>,
 
     #[serde(rename = "datasets", default, skip_serializing_if = "Vec::is_empty")]
     pub datasets: Vec<String>,
@@ -77,6 +79,11 @@ impl Embeddings {
             depends_on: Vec::default(),
             metrics: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_params(self, params: HashMap<String, Value>) -> Self {
+        Self { params, ..self }
     }
 
     #[must_use]
@@ -139,6 +146,10 @@ impl Embeddings {
                 let from = &self.from;
                 from.strip_prefix("azure:").map(ToString::to_string)
             }
+            Some(EmbeddingPrefix::Google) => {
+                let from = &self.from;
+                from.strip_prefix("google:").map(ToString::to_string)
+            }
             Some(EmbeddingPrefix::File) => {
                 let from = &self.from;
                 from.strip_prefix("file:").map(ToString::to_string)
@@ -151,6 +162,10 @@ impl Embeddings {
                 let from = &self.from;
                 from.strip_prefix("bedrock:").map(ToString::to_string)
             }
+            Some(EmbeddingPrefix::Model2Vec) => {
+                let from = &self.from;
+                from.strip_prefix("model2vec:").map(ToString::to_string)
+            }
             None => None,
         }
     }
@@ -159,10 +174,12 @@ impl Embeddings {
 pub enum EmbeddingPrefix {
     OpenAi,
     Azure,
+    Google,
     HuggingFace,
     File,
     Databricks,
     Bedrock,
+    Model2Vec,
 }
 
 impl TryFrom<&str> for EmbeddingPrefix {
@@ -177,10 +194,14 @@ impl TryFrom<&str> for EmbeddingPrefix {
             Ok(EmbeddingPrefix::OpenAi)
         } else if value.starts_with("azure") {
             Ok(EmbeddingPrefix::Azure)
+        } else if value.starts_with("google") {
+            Ok(EmbeddingPrefix::Google)
         } else if value.starts_with("databricks") {
             Ok(EmbeddingPrefix::Databricks)
         } else if value.starts_with("bedrock") {
             Ok(EmbeddingPrefix::Bedrock)
+        } else if value.starts_with("model2vec") {
+            Ok(EmbeddingPrefix::Model2Vec)
         } else {
             Err("Unknown prefix")
         }
@@ -192,15 +213,17 @@ impl Display for EmbeddingPrefix {
         match self {
             EmbeddingPrefix::OpenAi => write!(f, "openai"),
             EmbeddingPrefix::Azure => write!(f, "azure"),
+            EmbeddingPrefix::Google => write!(f, "google"),
             EmbeddingPrefix::HuggingFace => write!(f, "huggingface"),
             EmbeddingPrefix::File => write!(f, "file"),
             EmbeddingPrefix::Databricks => write!(f, "databricks"),
             EmbeddingPrefix::Bedrock => write!(f, "bedrock"),
+            EmbeddingPrefix::Model2Vec => write!(f, "model2vec"),
         }
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct EmbeddingChunkConfig {
     #[serde(default)]
@@ -214,6 +237,27 @@ pub struct EmbeddingChunkConfig {
 
     #[serde(default)]
     pub trim_whitespace: bool,
+}
+
+impl EmbeddingChunkConfig {
+    #[must_use]
+    pub fn enabled() -> Self {
+        Self {
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[must_use]
+    pub fn target_chunk_size(mut self, size: usize) -> Self {
+        self.target_chunk_size = size;
+        self
+    }
+    #[must_use]
+    pub fn trim_whitespace(mut self, trim_whitespace: bool) -> Self {
+        self.trim_whitespace = trim_whitespace;
+        self
+    }
 }
 
 /// Configuration for if and how a dataset's column should be embedded.
@@ -233,4 +277,7 @@ pub struct ColumnEmbeddingConfig {
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunking: Option<EmbeddingChunkConfig>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vector_size: Option<usize>,
 }

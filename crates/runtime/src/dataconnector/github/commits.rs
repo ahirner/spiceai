@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2025 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -23,7 +23,10 @@ use super::{
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use data_components::{
     github::error_checker,
-    graphql::{ErrorChecker, FilterPushdownResult, GraphQLContext, client::GraphQLQuery},
+    graphql::{
+        ErrorChecker, FilterPushdownResult, GraphQLContext,
+        client::{GraphQLQuery, UnnestBehavior},
+    },
 };
 use datafusion::prelude::Expr;
 use std::sync::Arc;
@@ -55,6 +58,11 @@ impl GraphQLContext for CommitsTableArgs {
 
     fn error_checker(&self) -> Option<ErrorChecker> {
         Some(Arc::new(error_checker))
+    }
+
+    fn query_cost(&self) -> Option<u32> {
+        // https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api#secondary-rate-limits
+        Some(2)
     }
 }
 
@@ -100,7 +108,12 @@ impl GitHubTableArgs for CommitsTableArgs {
             owner = self.owner,
             name = self.repo
         );
-        GitHubTableGraphQLParams::new(query.into(), None, 1, Some(gql_schema()))
+        GitHubTableGraphQLParams::new(
+            query.into(),
+            None,
+            UnnestBehavior::Depth(1),
+            Some(gql_schema()),
+        )
     }
 }
 

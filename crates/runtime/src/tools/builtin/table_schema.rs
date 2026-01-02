@@ -13,31 +13,33 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use app::App;
-use arrow_schema::{Field, Schema};
-use async_openai::{
-    error::OpenAIError,
-    types::{
-        ChatCompletionMessageToolCall, ChatCompletionRequestAssistantMessage,
-        ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestToolMessage,
-        ChatCompletionRequestToolMessageArgs, ChatCompletionRequestToolMessageContent,
-        ChatCompletionToolType, FunctionCall,
-    },
-};
-use async_trait::async_trait;
-use datafusion::sql::TableReference;
-use itertools::Itertools;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use spicepod::semantic::Column;
-use std::{borrow::Cow, sync::Arc};
-
 use crate::{
     Runtime,
     tools::{SpiceModelTool, utils::parameters},
 };
+use app::App;
+use arrow_schema::{Field, Schema};
+use arrow_tools::format::table_schemas_to_markdown_table;
+use async_openai::{
+    error::OpenAIError,
+    types::chat::{
+        ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+        ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageArgs,
+        ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageArgs,
+        ChatCompletionRequestToolMessageContent, FunctionCall,
+    },
+};
+use async_trait::async_trait;
+use datafusion::{error::DataFusionError, sql::TableReference};
+use itertools::Itertools;
+use runtime_datafusion::allowlist::ResolvedTableAwareAllowlist;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use snafu::ResultExt;
+use spicepod::semantic::Column;
+use std::collections::HashMap;
+use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
 /// A tool to retrieve the schema of one or more available SQL tables.
@@ -73,6 +75,8 @@ pub struct TableSchemaTool {
     name: String,
     description: Option<String>,
     rt: Arc<Runtime>,
+
+    table_allowlist: Option<ResolvedTableAwareAllowlist>,
 }
 
 impl TableSchemaTool {
@@ -86,7 +90,14 @@ impl TableSchemaTool {
                     .to_string(),
             ),
             rt,
+            table_allowlist: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_table_allowlist(mut self, allowlist: Option<ResolvedTableAwareAllowlist>) -> Self {
+        self.table_allowlist = allowlist;
+        self
     }
 
     pub async fn get_schema(
@@ -102,86 +113,107 @@ impl TableSchemaTool {
                 .iter()
                 .map(|t| {
                     let tbl = TableReference::parse_str(t);
-                    let cols = Self::column_information_for_table(&tbl, &Arc::clone(&app));
-                    (tbl.clone(), cols)
+                    let cols = Self::table_column_information_for_table(&tbl, &Arc::clone(&app));
+                    (tbl, cols)
                 })
                 .collect_vec(),
             _ => vec![],
         };
 
-        let mut table_schemas: Vec<Value> = Vec::with_capacity(tables.len());
-        for (i, t) in tables.iter().enumerate() {
-            let base_schema = self
-                .rt
-                .datafusion()
-                .get_arrow_schema(t)
-                .instrument(span.clone())
-                .await
-                .boxed()?;
+        let result: Result<Vec<(String, Schema)>, Box<dyn std::error::Error + Send + Sync>> =
+            async {
+                let mut table_schemas: Vec<(String, Schema)> = Vec::with_capacity(tables.len());
 
-            let schema = match output {
-                OutputType::Minimal => base_schema,
-                OutputType::Full => {
-                    let Schema {
-                        mut fields,
-                        metadata,
-                    } = base_schema;
-
-                    if let Some((_tbl, Some(columns))) = column_info.get(i) {
-                        fields = fields
-                            .into_iter()
-                            .map(|f| {
-                                let col = columns.iter().find(|c| c.name == *f.name());
-                                match col {
-                                    Some(c) => Arc::new(
-                                        Field::new(
-                                            f.name(),
-                                            f.data_type().clone(),
-                                            f.is_nullable(),
-                                        )
-                                        .with_metadata(c.metadata().clone()),
-                                    ),
-                                    None => Arc::clone(f),
-                                }
-                            })
-                            .collect();
+                for (i, t) in tables.iter().enumerate() {
+                    if self.table_allowlist.as_ref().is_some_and(|list| {
+                        !list.table_is_allowed(&TableReference::parse_str(t.as_str()))
+                    }) {
+                        return Err(crate::datafusion::Error::UnableToGetTable {
+                            source: DataFusionError::Plan(format!("No table named {t}")),
+                        })
+                        .boxed();
                     }
+                    let base_schema = self
+                        .rt
+                        .datafusion()
+                        .get_arrow_schema(t)
+                        .instrument(span.clone())
+                        .await
+                        .boxed()?;
 
-                    Schema::new_with_metadata(fields, metadata)
+                    let schema = match output {
+                        OutputType::Minimal => base_schema,
+                        OutputType::Full => {
+                            let Schema {
+                                mut fields,
+                                mut metadata,
+                            } = base_schema;
+
+                            if let Some((_tbl, Some((table_info, columns)))) = column_info.get(i) {
+                                fields = fields
+                                    .into_iter()
+                                    .map(|f| {
+                                        let col = columns.iter().find(|c| c.name == *f.name());
+                                        match col {
+                                            Some(c) => Arc::new(
+                                                Field::new(
+                                                    f.name(),
+                                                    f.data_type().clone(),
+                                                    f.is_nullable(),
+                                                )
+                                                .with_metadata(c.metadata()),
+                                            ),
+                                            None => Arc::clone(f),
+                                        }
+                                    })
+                                    .collect();
+
+                                metadata.extend(table_info.clone());
+                            }
+
+                            Schema::new_with_metadata(fields, metadata)
+                        }
+                    };
+
+                    table_schemas.push((t.to_string(), schema));
                 }
-            };
 
-            let schema_value = serde_json::value::to_value(schema).boxed()?;
+                Ok(table_schemas)
+            }
+            .instrument(span.clone())
+            .await;
 
-            let table_schema = serde_json::json!({
-                "table": t,
-                "schema": schema_value
-            });
-
-            table_schemas.push(table_schema);
+        match result {
+            Ok(table_schemas) => {
+                let schemas_as_string = table_schemas_to_markdown_table(table_schemas);
+                tracing::info!(target: "task_history", parent: &span, captured_output = %schemas_as_string);
+                Ok(Value::String(schemas_as_string))
+            }
+            Err(e) => {
+                tracing::error!(target: "task_history", parent: &span, "{e}");
+                Err(e)
+            }
         }
-
-        let captured_output_json = serde_json::to_string(&table_schemas).boxed()?;
-        tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output_json);
-
-        Ok(Value::Array(table_schemas))
     }
 
     /// Retrieve column information for the given table.
-    fn column_information_for_table(tbl: &TableReference, app: &Arc<App>) -> Option<Vec<Column>> {
+    fn table_column_information_for_table(
+        tbl: &TableReference,
+        app: &Arc<App>,
+    ) -> Option<(HashMap<String, String>, Vec<Column>)> {
         if let Some(ds) = app
             .datasets
             .iter()
             .find(|d| tbl.resolved_eq(&TableReference::parse_str(&d.name)))
         {
-            return Some(ds.columns.clone());
+            return Some((ds.metadata(), ds.columns.clone()));
         }
         if let Some(view) = app
             .views
             .iter()
             .find(|v| tbl.resolved_eq(&TableReference::parse_str(&v.name)))
         {
-            return Some(view.columns.clone());
+            return Some((view.metadata(), view.columns.clone()));
         }
         None
     }
@@ -207,16 +239,16 @@ impl TableSchemaTool {
         params: &TableSchemaToolParams,
     ) -> Result<ChatCompletionRequestAssistantMessage, OpenAIError> {
         ChatCompletionRequestAssistantMessageArgs::default()
-            .tool_calls(vec![ChatCompletionMessageToolCall {
-                id: id.to_string(),
-                r#type: ChatCompletionToolType::Function,
-                function: FunctionCall {
-                    name: self.name().to_string(),
-                    arguments: serde_json::to_string(&params)
-                        .map_err(OpenAIError::JSONDeserialize)?
-                        .to_string(),
+            .tool_calls(vec![ChatCompletionMessageToolCalls::Function(
+                ChatCompletionMessageToolCall {
+                    id: id.to_string(),
+                    function: FunctionCall {
+                        name: self.name().to_string(),
+                        arguments: serde_json::to_string(&params)
+                            .map_err(|e| OpenAIError::JSONDeserialize(e, String::new()))?,
+                    },
                 },
-            }])
+            )])
             .build()
     }
 }

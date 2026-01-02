@@ -23,7 +23,6 @@ use crate::component::ComponentInitialization;
 use crate::component::catalog::Catalog;
 use crate::dataconnector::databricks::Databricks as DatabricksDataConnector;
 use crate::dataconnector::parameters::ConnectorParams;
-use crate::get_params_with_secrets;
 use crate::token_providers::databricks::AuthCredentials;
 use async_trait::async_trait;
 use data_components::Read;
@@ -35,6 +34,7 @@ use data_components::unity_catalog::UCTable;
 use data_components::unity_catalog::UnityCatalog as UnityCatalogClient;
 use data_components::unity_catalog::provider::UnityCatalogProvider;
 use datafusion::sql::TableReference;
+use runtime_secrets::get_params_with_secrets;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use std::any::Any;
@@ -54,7 +54,7 @@ impl Databricks {
         let component_initialization =
             match DatabricksDataConnector::build_auth_credentials(&params.parameters) {
                 Ok(AuthCredentials::U2M(_)) => ComponentInitialization::OnTrigger,
-                _ => ComponentInitialization::OnStartup,
+                _ => ComponentInitialization::default(),
             };
 
         Arc::new(Self {
@@ -64,7 +64,7 @@ impl Databricks {
     }
 }
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
+pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("endpoint")
         .required()
         .secret()
@@ -133,7 +133,6 @@ impl CatalogConnector for Databricks {
         self
     }
 
-    #[allow(clippy::too_many_lines)]
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
         runtime: Arc<Runtime>,
@@ -142,7 +141,7 @@ impl CatalogConnector for Databricks {
         let Some(catalog_id) = catalog.catalog_id.clone() else {
             return Err(super::Error::InvalidConfigurationNoSource {
                 connector: "databricks".into(),
-                message: "A Catalog Name is required for the Databricks Unity Catalog.\nFor details, visit: https://spiceai.org/docs/components/catalogs/databricks#from".into(),
+                message: "A Catalog Name is required for the Databricks Unity Catalog. For details, visit: https://spiceai.org/docs/components/catalogs/databricks#from".into(),
                 connector_component: ConnectorComponent::from(catalog)
             });
         };
@@ -150,7 +149,7 @@ impl CatalogConnector for Databricks {
         let endpoint = self.params.get("endpoint").expose().ok_or_else(|p| {
             super::Error::InvalidConfigurationNoSource {
                 connector: "databricks".into(),
-                message: format!("A required parameter was missing: {}.\nFor details, visit: https://spiceai.org/docs/components/catalogs/databricks#params", p.0),
+                message: format!("A required parameter was missing: {}. For details, visit: https://spiceai.org/docs/components/catalogs/databricks#params", p.0),
                 connector_component: ConnectorComponent::from(catalog)
             }
         })?;
@@ -192,7 +191,13 @@ impl CatalogConnector for Databricks {
         };
 
         let unity_catalog =
-            UnityCatalogClient::new(Endpoint(endpoint.to_string()), Some(token_provider));
+            UnityCatalogClient::new(Endpoint(endpoint.to_string()), Some(token_provider)).map_err(
+                |source| super::Error::UnableToGetCatalogProvider {
+                    connector: "databricks".to_string(),
+                    source: source.into(),
+                    connector_component: ConnectorComponent::from(catalog),
+                },
+            )?;
         let client = Arc::new(unity_catalog);
 
         // Copy the catalog params into the dataset params, and allow user to override
@@ -220,23 +225,29 @@ impl CatalogConnector for Databricks {
         })?;
 
         let mode = self.params.get("mode").expose().ok();
-        let (table_creator, table_reference_creator) = if let Some("delta_lake") = mode {
+        let (table_creator, table_reference_creator) = if mode == Some("delta_lake") {
             (
-                Arc::new(DeltaTableFactory::new(params.to_secret_map())) as Arc<dyn Read>,
+                Arc::new(DeltaTableFactory::new(
+                    params.to_secret_map(),
+                    runtime.tokio_io_runtime(),
+                )) as Arc<dyn Read>,
                 table_reference_creator_delta_lake as fn(&UCTable) -> Option<TableReference>,
             )
         } else {
-            let dataset_databricks =
-                match DatabricksDataConnector::new(params, runtime.token_provider_registry())
-                    .await
-                    .map_err(|source| super::Error::UnableToGetCatalogProvider {
-                        connector: "databricks".to_string(),
-                        source: source.into(),
-                        connector_component: ConnectorComponent::from(catalog),
-                    }) {
-                    Ok(dataset_databricks) => dataset_databricks,
-                    Err(e) => return Err(e),
-                };
+            let dataset_databricks = match DatabricksDataConnector::new(
+                params,
+                runtime.tokio_io_runtime(),
+                runtime.token_provider_registry(),
+            )
+            .await
+            .map_err(|source| super::Error::UnableToGetCatalogProvider {
+                connector: "databricks".to_string(),
+                source: source.into(),
+                connector_component: ConnectorComponent::from(catalog),
+            }) {
+                Ok(dataset_databricks) => dataset_databricks,
+                Err(e) => return Err(e),
+            };
 
             (
                 dataset_databricks.read_provider(),
@@ -271,7 +282,7 @@ impl CatalogConnector for Databricks {
     }
 }
 
-#[allow(clippy::unnecessary_wraps)]
+#[expect(clippy::unnecessary_wraps)]
 fn table_reference_creator_spark(uc_table: &UCTable) -> Option<TableReference> {
     let table_reference = TableReference::Full {
         catalog: uc_table.catalog_name.clone().into(),

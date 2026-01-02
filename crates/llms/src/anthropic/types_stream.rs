@@ -17,17 +17,18 @@ limitations under the License.
 use super::types::{MessageRole, StopReason, Usage};
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
+    types::chat::{
         ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, ChatCompletionToolType, CompletionUsage,
-        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role,
+        ChatCompletionStreamResponseDelta, CompletionUsage, CreateChatCompletionStreamResponse,
+        FinishReason, FunctionCallStream, FunctionType, Role,
     },
 };
 use futures::{Stream, StreamExt};
 use reqwest_eventsource::Error as SseError;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::{collections::HashMap, fmt, pin::Pin, sync::Arc, time::SystemTime};
+use std::{collections::HashMap, fmt, pin::Pin, sync::Arc};
+
 use tokio::sync::Mutex;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -92,7 +93,7 @@ impl ContentBlock {
                     tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
                         index: 0,
                         id: Some(id),
-                        r#type: Some(ChatCompletionToolType::Function),
+                        r#type: Some(FunctionType::Function),
                         function: Some(FunctionCallStream {
                             name: Some(name),
                             arguments: None,
@@ -151,7 +152,7 @@ impl Delta {
                 tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
                     index: 0,
                     id: Some(id.clone()),
-                    r#type: Some(ChatCompletionToolType::Function),
+                    r#type: Some(FunctionType::Function),
                     function: Some(FunctionCallStream {
                         name: None, // Intentially leave empty to match OpenAI's format.
                         arguments: Some(partial_json),
@@ -183,6 +184,7 @@ impl Delta {
     }
 }
 
+#[expect(dead_code)]
 #[derive(Debug, Deserialize, Serialize)]
 pub struct AnthropicStreamError {
     #[serde(rename = "type")]
@@ -258,11 +260,8 @@ pub struct MessageDelta {
 ///  | Tool packets have no out of order protection            | Provides numbering for out of order tool packets        |
 ///  +---------------------------------------------------------+---------------------------------------------------------+
 ///
-#[allow(clippy::too_many_lines)]
 pub fn transform_stream(
-    stream: Pin<
-        Box<dyn Stream<Item = Result<MessageCreateStreamResponse, AnthropicStreamError>> + Send>,
-    >,
+    stream: Pin<Box<dyn Stream<Item = Result<MessageCreateStreamResponse, OpenAIError>> + Send>>,
 ) -> ChatCompletionResponseStream {
     // As mentioned above, only first tool packet has tool metadata.
     // Format:
@@ -309,7 +308,7 @@ pub fn transform_stream(
                             completion_tokens_details: None,
                         });
                         state.model = Some(model);
-                        Some(create_stream_response(
+                        Some(create_anthropic_stream_response(
                             &state.id.clone().unwrap_or_default(),
                             &state.model.clone().unwrap_or_default(),
                             None,
@@ -324,7 +323,7 @@ pub fn transform_stream(
                             state.tool_id_to_content_block.insert(index, t.clone());
                             state.tool_id_to_tool_delta_idx.insert(index, 0);
                         }
-                        Some(create_stream_response(
+                        Some(create_anthropic_stream_response(
                             &state.id.clone().unwrap_or_default(),
                             &state.model.clone().unwrap_or_default(),
                             None,
@@ -340,7 +339,7 @@ pub fn transform_stream(
                         let tool_idx = *state.tool_id_to_tool_delta_idx.get(&index).unwrap_or(&0);
                         state.tool_id_to_tool_delta_idx.insert(index, tool_idx + 1);
 
-                        Some(create_stream_response(
+                        Some(create_anthropic_stream_response(
                             &state.id.clone().unwrap_or_default(),
                             &state.model.clone().unwrap_or_default(),
                             None,
@@ -365,7 +364,7 @@ pub fn transform_stream(
                             u.completion_tokens += inner_usage.output_tokens;
                             u.total_tokens += inner_usage.input_tokens + inner_usage.output_tokens;
                         }
-                        Some(create_stream_response(
+                        Some(create_anthropic_stream_response(
                             &state.id.clone().unwrap_or_default(),
                             &state.model.clone().unwrap_or_default(),
                             state.usage.clone(),
@@ -397,12 +396,7 @@ pub fn transform_stream(
                     ) => None,
                     Err(e) => {
                         tracing::debug!("Received an anthropic error stream packet: {:?}", e);
-                        Some(Err(OpenAIError::ApiError(ApiError {
-                            message: e.error.message,
-                            r#type: Some("AnthropicStreamError".to_string()),
-                            param: None,
-                            code: None,
-                        })))
+                        Some(Err(e))
                     }
                 }
             }
@@ -417,8 +411,7 @@ pub fn transform_stream(
 }
 
 /// Easy way to create stream. Reduce boiler plate. [`CreateChatCompletionStreamResponse`] has no builder pattern.
-#[allow(clippy::cast_possible_truncation)]
-fn create_stream_response(
+fn create_anthropic_stream_response(
     id: &str,
     model: &str,
     usage: Option<CompletionUsage>,
@@ -429,19 +422,5 @@ fn create_stream_response(
         None => vec![],
     };
 
-    let created = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?
-        .as_secs() as u32;
-
-    Ok(CreateChatCompletionStreamResponse {
-        id: id.to_string(),
-        created,
-        model: model.to_string(),
-        service_tier: None,
-        system_fingerprint: None,
-        object: "chat.completion.chunk".to_string(),
-        usage,
-        choices,
-    })
+    crate::streaming_utils::create_stream_response(id, model, choices, usage)
 }

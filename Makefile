@@ -16,6 +16,10 @@ build-cli-dev:
 build-runtime:
 	make -C bin/spiced
 
+.PHONY: build-validator
+build-validator:
+	cargo build --release -p spicepod-validator
+
 .PHONY: build
 build: build-cli build-runtime
 
@@ -23,6 +27,14 @@ build: build-cli build-runtime
 build-dev:
 	export DEV=true; make -C bin/spice
 	export DEV=true; make -C bin/spiced
+
+.PHONY: build-testoperator-dev
+build-testoperator-dev:
+	cargo build -p testoperator --all-features
+
+.PHONY: build-testoperator
+build-testoperator:
+	cargo build --release -p testoperator --all-features
 
 .PHONY: ci
 ci:
@@ -43,18 +55,18 @@ endif
 
 .PHONY: nextest
 nextest:
-	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE)
+	@cargo nextest run --all --lib $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG)
 
 # Also update .github/workflows/integration.yml with changes to this target
 .PHONY: test-integration
 test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite -- --nocapture
+	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso -- --nocapture
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite -- --nocapture --skip spiceai_integration_test
+	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso -- --nocapture --skip spiceai_integration_test
 
 .PHONY: test-integration-models
 test-integration-models:
@@ -68,42 +80,102 @@ test-integration-models-without-openai:
 test-bench:
 	@cargo bench -p runtime --features postgres,spark,mysql
 
-PHONY: test-bench-vector-search
-test-bench-vector-search:
-	@cargo bench -p runtime --bench vector_search --features models
-
-PHONY: test-bench-vector-search-with-metal
-test-bench-vector-search-with-metal:
-	@cargo bench -p runtime --bench vector_search --features models,metal
-
 .PHONY: lint lint-go lint-rust
 lint: lint-go lint-rust
 
 lint-rust:
 	cargo fmt --all -- --check
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
+	cargo clippy $(CARGO_PROFILE) --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes \
+		-Aunfulfilled_lint_expectations
 
 lint-rust-fix:
-	cargo fmt --all -- --check
+	cargo fmt --all
 	## All except metal, cuda
-	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --all-targets --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --lib --bins --fix --allow-dirty --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
 		-Dwarnings \
 		-Dclippy::pedantic \
 		-Dclippy::unwrap_used \
 		-Dclippy::expect_used \
 		-Dclippy::clone_on_ref_ptr \
-		-Aclippy::module_name_repetitions
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes
+	cargo clippy $(CARGO_PROFILE) --fix --allow-dirty --tests --features aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp --workspace -- \
+		-Dwarnings \
+		-Dclippy::pedantic \
+		-Dclippy::unwrap_used \
+		-Aclippy::expect_used \
+		-Dclippy::clone_on_ref_ptr \
+		-Aclippy::module_name_repetitions \
+		-Aclippy::large_futures \
+		-Aclippy::too_many_lines \
+		-Dclippy::equatable_if_let \
+		-Dclippy::needless_collect \
+		-Dclippy::redundant_clone \
+		-Dclippy::todo \
+		-Dclippy::assertions_on_result_states \
+		-Dclippy::allow_attributes \
+		-Aunfulfilled_lint_expectations
+
 
 lint-go:
 	go vet ./...
 	golangci-lint run
+
+check-rust-features:
+	cargo check $(CARGO_PROFILE) --no-default-features
+	cargo check $(CARGO_PROFILE) --no-default-features --features duckdb
+	cargo check $(CARGO_PROFILE) --no-default-features --features postgres
+	cargo check $(CARGO_PROFILE) --no-default-features --features sqlite
+	cargo check $(CARGO_PROFILE) --no-default-features --features mysql
+	cargo check $(CARGO_PROFILE) --no-default-features --features keyring-secret-store
+	cargo check $(CARGO_PROFILE) --no-default-features --features flightsql
+	cargo check $(CARGO_PROFILE) --no-default-features --features aws-secrets-manager
+	cargo check $(CARGO_PROFILE) --no-default-features --features databricks
+	cargo check $(CARGO_PROFILE) --no-default-features --features delta_lake
+	cargo check $(CARGO_PROFILE) --no-default-features --features dremio
+	cargo check $(CARGO_PROFILE) --no-default-features --features clickhouse
+	cargo check $(CARGO_PROFILE) --no-default-features --features debezium
+	cargo check $(CARGO_PROFILE) --no-default-features --features runtime/openapi
+	cargo check $(CARGO_PROFILE) --no-default-features --features dynamodb
+	cargo check $(CARGO_PROFILE) --no-default-features --features oracle
+	cargo check $(CARGO_PROFILE) --no-default-features --features mongodb
 
 .PHONY: fmt-toml
 fmt-toml:
@@ -115,12 +187,18 @@ run:
 
 .PHONY: docker
 docker:
-	docker buildx build -t spiceai-rust:local-dev .
+	docker buildx build --build-arg RUST_PROFILE=release -t spiceai-rust:local-dev .
 
 .PHONY: docker-run
 docker-run:
 	docker stop spiceai && docker rm spiceai || true
 	docker run --name spiceai -p 8090:8090 -p 50051:50051 spiceai-rust:local-dev
+
+.PHONY: docker-local
+docker-local:
+	cp ~/.spice/bin/spiced .spiced-local-tmp
+	docker build -f Dockerfile.local -t spiceai.org/spiceai:local .
+	rm .spiced-local-tmp
 
 .PHONY: deps-licenses
 dep-licenses:
@@ -141,6 +219,12 @@ install: build
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spice ~/.spice/bin/spice
 	install -m 755 target/release/spiced ~/.spice/bin/spiced
+
+.PHONY: install-dev
+install-dev: build-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/spice ~/.spice/bin/spice
+	install -m 755 target/debug/spiced ~/.spice/bin/spiced
 
 .PHONY: install-with-models
 install-with-models:
@@ -164,6 +248,16 @@ install-with-models-cuda:
 install-with-odbc:
 	make install SPICED_NON_DEFAULT_FEATURES="odbc"
 
+.PHONY: install-testoperator-dev
+install-testoperator-dev: build-testoperator-dev
+	mkdir -p ~/.spice/bin
+	install -m 755 target/debug/testoperator ~/.spice/bin/testoperator
+
+.PHONY: install-testoperator
+install-testoperator: build-testoperator
+	mkdir -p ~/.spice/bin
+	install -m 755 target/release/testoperator ~/.spice/bin/testoperator
+
 .PHONY: install-cli
 install-cli: build-cli
 	mkdir -p ~/.spice/bin
@@ -173,15 +267,6 @@ install-cli: build-cli
 install-runtime: build-runtime
 	mkdir -p ~/.spice/bin
 	install -m 755 target/release/spiced ~/.spice/bin/spiced
-
-################################################################################
-# Target: install-dev                                                          #
-################################################################################
-.PHONY: install-dev
-install-dev: build-dev
-	mkdir -p ~/.spice/bin
-	install -m 755 target/release/spice ~/.spice/bin/spice
-	install -m 755 target/debug/spiced ~/.spice/bin/spiced
 
 .PHONY: install-cli-dev
 install-cli-dev: build-cli-dev

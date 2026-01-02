@@ -161,7 +161,7 @@ impl DeletionTableProviderAdapter {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 pub fn get_deletion_provider(
     from: Arc<dyn TableProvider>,
 ) -> Option<Arc<dyn DeletionTableProvider>> {
@@ -189,7 +189,7 @@ impl TableProvider for DeletionTableProviderAdapter {
     fn table_type(&self) -> TableType {
         self.source.table_type()
     }
-    fn get_logical_plan(&self) -> Option<Cow<LogicalPlan>> {
+    fn get_logical_plan(&self) -> Option<Cow<'_, LogicalPlan>> {
         self.source.get_logical_plan()
     }
     fn get_column_default(&self, column: &str) -> Option<&Expr> {

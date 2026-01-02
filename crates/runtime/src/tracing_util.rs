@@ -35,14 +35,14 @@ pub fn dataset_registered_trace(
     results_cache_enabled: bool,
 ) -> String {
     let mut info = format!("Dataset {} registered ({})", &ds.name, &ds.from);
-    if let Some(acceleration) = &ds.acceleration {
-        if acceleration.enabled {
-            let _ = write!(
-                info,
-                ", acceleration ({})",
-                acceleration_info(Some(data_connector), acceleration)
-            );
-        }
+    if let Some(acceleration) = &ds.acceleration
+        && acceleration.enabled
+    {
+        let _ = write!(
+            info,
+            ", acceleration ({})",
+            acceleration_info(Some(data_connector), acceleration)
+        );
     }
 
     if results_cache_enabled {
@@ -59,14 +59,14 @@ pub fn view_registered_trace(
     acceleration: Option<&acceleration::Acceleration>,
 ) -> String {
     let mut info = format!("View {table} registered");
-    if let Some(acceleration) = acceleration {
-        if acceleration.enabled {
-            let _ = write!(
-                info,
-                ", acceleration ({})",
-                acceleration_info(None, acceleration)
-            );
-        }
+    if let Some(acceleration) = acceleration
+        && acceleration.enabled
+    {
+        let _ = write!(
+            info,
+            ", acceleration ({})",
+            acceleration_info(None, acceleration)
+        );
     }
 
     info.push('.');
@@ -80,7 +80,7 @@ fn acceleration_info(
 ) -> String {
     let mut info: String = acceleration.engine.to_string();
 
-    if acceleration.mode == Mode::File {
+    if matches!(acceleration.mode, Mode::File | Mode::FileCreate) {
         info.push_str(":file");
     }
 
@@ -98,15 +98,18 @@ fn acceleration_info(
         RefreshMode::Changes => {
             info.push_str(", changes");
         }
+        RefreshMode::Caching => {
+            info.push_str(", caching");
+        }
     }
 
     if let Some(refresh_interval) = &acceleration.refresh_check_interval {
         let _ = write!(info, ", {refresh_interval:#?} refresh");
     }
-    if let Some(retention_check_interval) = &acceleration.retention_check_interval {
-        if acceleration.retention_check_enabled {
-            let _ = write!(info, ", {retention_check_interval} retention");
-        }
+    if let Some(retention_check_interval) = &acceleration.retention_check_interval
+        && acceleration.retention_check_enabled
+    {
+        let _ = write!(info, ", {retention_check_interval} retention");
     }
     if acceleration.on_zero_results == ZeroResultsAction::UseSource {
         info.push_str(", fallback on source on empty result");

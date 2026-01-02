@@ -21,6 +21,7 @@ use super::DataConnectorFactory;
 use super::ParameterSpec;
 use crate::component::dataset::Dataset;
 use crate::dataconnector::DataConnectorError;
+use crate::register_data_connector;
 use async_trait::async_trait;
 use data_components::ReadWrite;
 use data_components::flight::FlightFactory;
@@ -43,12 +44,12 @@ use std::sync::Arc;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/dremio#configuration"
+        "Missing required parameter: {parameter}. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/dremio#configuration"
     ))]
     MissingParameter { parameter: String },
 
     #[snafu(display(
-        "Failed to connect to endpoint '{endpoint}'.\nVerify the endpoint is valid/online, and try again.\n{source}"
+        "Failed to connect to endpoint '{endpoint}'. Verify the endpoint is valid/online, and try again. {source}"
     ))]
     UnableToVerifyEndpointConnection {
         source: ns_lookup::Error,
@@ -56,7 +57,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to connect to Dremio over Flight.\nVerify your connection configuration, and try again.\n{source}"
+        "Failed to connect to Dremio over Flight. Verify your connection configuration, and try again. {source}"
     ))]
     UnableToCreateFlightClient { source: flight_client::Error },
 }
@@ -204,9 +205,7 @@ impl DataConnector for Dremio {
                 });
             }
         };
-        match FlightFactory::table_provider(&self.flight_factory, table_reference, dataset.schema())
-            .await
-        {
+        match FlightFactory::table_provider(&self.flight_factory, table_reference).await {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(data_components::flight::Error::UnableToGetSchema {
@@ -235,17 +234,16 @@ impl DataConnector for Dremio {
         &self,
         dataset: &Dataset,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
-        let read_write_result = ReadWrite::table_provider(
-            &self.flight_factory,
-            dataset.path().into(),
-            dataset.schema(),
-        )
-        .await
-        .context(super::UnableToGetReadWriteProviderSnafu {
-            dataconnector: "dremio",
-            connector_component: ConnectorComponent::from(dataset),
-        });
+        let read_write_result =
+            ReadWrite::table_provider(&self.flight_factory, dataset.path().into())
+                .await
+                .context(super::UnableToGetReadWriteProviderSnafu {
+                    dataconnector: "dremio",
+                    connector_component: ConnectorComponent::from(dataset),
+                });
 
         Some(read_write_result)
     }
 }
+
+register_data_connector!("dremio", DremioFactory);

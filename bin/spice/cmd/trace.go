@@ -19,6 +19,7 @@ package cmd
 import (
 	"fmt"
 	"log/slog"
+	"slices"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -26,6 +27,14 @@ import (
 	"github.com/spiceai/spiceai/bin/spice/pkg/taskhistory"
 	"github.com/spiceai/spiceai/bin/spice/pkg/util"
 )
+
+// quoteSQLString escapes single quotes in a string and wraps it in single quotes
+// This follows PostgreSQL string literal syntax
+func quoteSQLString(s string) string {
+	// Escape single quotes by doubling them (SQL standard)
+	escaped := strings.ReplaceAll(s, "'", "''")
+	return fmt.Sprintf("'%s'", escaped)
+}
 
 var (
 	// The id of the trace to provide
@@ -42,22 +51,20 @@ var (
 
 	// The truncation length
 	truncateLength int
+
+	// The output format flag: table (default), sql, csv (future)
+	outputFormat string
 )
 
 var supported_trace_tasks = []string{
-	"ai_chat", "accelerated_refresh", "ai_completion", "eval_run", "nsql", "sql_query",
-	"tool_use::document_similarity", "tool_use::list_datasets", "tool_use::load_memory",
+	"ai", "ai_chat", "accelerated_refresh", "ai_completion", "eval_run", "nsql", "sql_query",
+	"tool_use::search", "tool_use::list_datasets", "tool_use::load_memory",
 	"tool_use::sample_data", "tool_use::sql", "tool_use::store_memory",
-	"tool_use::table_schema", "vector_search", "scheduled_worker",
+	"tool_use::table_schema", "search", "scheduled_worker", "text_embed",
 }
 
 func isValidTraceTask(task string) bool {
-	for _, supported_task := range supported_trace_tasks {
-		if task == supported_task {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(supported_trace_tasks, task)
 }
 
 var traceCmd = &cobra.Command{
@@ -76,6 +83,9 @@ $ spice trace ai_chat --id chatcmpl-At6ZmDE8iAYRPeuQLA0FLlWxGKNnM
 
 Include the input and truncate to 120 characters (default is 80).
 $ spice trace ai_chat --include-input --truncate=120
+
+# returns the SQL query for the trace
+$ spice trace ai_chat --output=sql
 `,
 	Args: cobra.MinimumNArgs(1),
 	Run: func(cmd *cobra.Command, args []string) {
@@ -97,8 +107,25 @@ $ spice trace ai_chat --include-input --truncate=120
 			return
 		}
 
-		traces, err := taskhistory.SqlRequestToTraces(rtcontext, fmt.Sprintf("SELECT * FROM runtime.task_history WHERE %s ORDER BY start_time asc", filter))
+		sqlQuery := fmt.Sprintf("SELECT * FROM runtime.task_history WHERE %s ORDER BY start_time asc", filter)
+		switch outputFormat {
+		case "sql":
+			cmd.Println(sqlQuery)
+			return
+		case "table":
+			// default behavior
+		default:
+			cmd.PrintErrln("Unknown output format: " + outputFormat)
+			return
+		}
+
+		traces, err := taskhistory.SqlRequestToTraces(rtcontext, sqlQuery)
 		if err != nil {
+			// Special case when task_history is disabled.
+			if strings.Contains(err.Error(), "table 'spice.runtime.task_history' not found") {
+				cmd.PrintErrln("Trace functionality requires task history, which is disabled. Set `runtime.task_history: true` in the Spicepod YAML file and retry. Details: https://spiceai.org/docs/reference/spicepod/runtime#runtimetask_history")
+				return
+			}
 			slog.Error("SQL query to 'task_history' failed", "error", err)
 			cmd.PrintErrln("Error: failed to retrieve events from runtime.")
 			return
@@ -199,15 +226,18 @@ func init() {
 	traceCmd.Flags().BoolVar(&include_output, "include-output", false, "Include output data in the trace")
 	traceCmd.Flags().IntVar(&truncateLength, "truncate", 0, "Truncates the input/output data to 80 when set, or to the given length")
 	traceCmd.Flags().Lookup("truncate").NoOptDefVal = "80"
+	traceCmd.Flags().StringVar(&outputFormat, "output", "table", "Output format: table (default), sql (return the SQL query)")
 }
 
 func getTraceFilter(task string, id string, trace_id string) (string, error) {
+	// Use proper SQL string escaping to prevent SQL injection
+	// This follows PostgreSQL string literal syntax by escaping single quotes
 	if id != "" {
-		return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where labels.id='%s')", id), nil
+		return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where labels.id=%s)", quoteSQLString(id)), nil
 	}
 	if trace_id != "" {
-		return fmt.Sprintf("trace_id='%s'", trace_id), nil
+		return fmt.Sprintf("trace_id=%s", quoteSQLString(trace_id)), nil
 	}
 	// use last by default
-	return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where task='%s' order by start_time desc limit 1)", task), nil
+	return fmt.Sprintf("trace_id=(SELECT trace_id from runtime.task_history where task=%s order by start_time desc limit 1)", quoteSQLString(task)), nil
 }

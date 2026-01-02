@@ -44,7 +44,7 @@ pub fn get_s3_dataset(s3_uri: &str, name: &str) -> Dataset {
     dataset
 }
 
-const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 /// Test that the `shutdown_timeout` parameter is correctly applied:
 /// 1. The runtime shutdown waits for 5 seconds for a long-running HTTP operation to complete.
@@ -59,17 +59,15 @@ async fn runtime_shutdown_timeout_force() -> Result<(), anyhow::Error> {
             let mut rng = rand::rng();
             let http_port: u16 = rng.random_range(50000..60000);
             let flight_port: u16 = http_port + 1;
-            let otel_port: u16 = http_port + 2;
-            let metrics_port: u16 = http_port + 3;
+            let metrics_port: u16 = http_port + 2;
 
             tracing::debug!(
-                "Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
+                "Ports: http: {http_port}, flight: {flight_port}, metrics: {metrics_port}"
             );
 
             let api_config = runtime::config::Config::new()
                 .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
-                .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
-                .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
+                .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
 
             let app = AppBuilder::new("lineitem")
                 .with_dataset(get_s3_dataset(
@@ -79,8 +77,8 @@ async fn runtime_shutdown_timeout_force() -> Result<(), anyhow::Error> {
                 .with_shutdown_timeout("5s")
                 .build();
 
+            configure_test_datafusion();
             let rt =  Arc::new(Runtime::builder()
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .with_app(app)
                 .build()
                 .await);
@@ -149,17 +147,15 @@ async fn runtime_shutdown_timeout_grace() -> Result<(), anyhow::Error> {
             let mut rng = rand::rng();
             let http_port: u16 = rng.random_range(50000..60000);
             let flight_port: u16 = http_port + 1;
-            let otel_port: u16 = http_port + 2;
-            let metrics_port: u16 = http_port + 3;
+            let metrics_port: u16 = http_port + 2;
 
             tracing::debug!(
-                "Ports: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
+                "Ports: http: {http_port}, flight: {flight_port}, metrics: {metrics_port}"
             );
 
             let api_config = runtime::config::Config::new()
                 .with_http_bind_address(SocketAddr::new(LOCALHOST, http_port))
-                .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port))
-                .with_open_telemetry_bind_address(SocketAddr::new(LOCALHOST, otel_port));
+                .with_flight_bind_address(SocketAddr::new(LOCALHOST, flight_port));
 
             let app = AppBuilder::new("lineitem")
                 .with_dataset(get_s3_dataset(
@@ -169,8 +165,8 @@ async fn runtime_shutdown_timeout_grace() -> Result<(), anyhow::Error> {
                 .with_shutdown_timeout("20s")
                 .build();
 
+            configure_test_datafusion();
             let rt =  Arc::new(Runtime::builder()
-                .with_datafusion_configuration_fn(configure_test_datafusion)
                 .with_app(app)
                 .build()
                 .await);

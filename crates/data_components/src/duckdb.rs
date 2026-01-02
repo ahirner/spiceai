@@ -18,7 +18,6 @@ use crate::{
     Read, ReadWrite,
     delete::{DeletionExec, DeletionSink, DeletionTableProvider},
 };
-use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session, datasource::TableProvider, logical_expr::Expr, physical_plan::ExecutionPlan,
@@ -27,9 +26,9 @@ use datafusion::{
 use datafusion_table_providers::{
     duckdb::{DuckDB, DuckDBTableFactory, TableDefinition, write::DuckDBTableWriter},
     sql::{
-        db_connection_pool::duckdbpool::DuckDbConnectionPool, sql_provider_datafusion::expr::Engine,
+        db_connection_pool::duckdbpool::DuckDbConnectionPool,
+        sql_provider_datafusion::expr::{self, Engine},
     },
-    util,
 };
 use duckdb::Transaction;
 use snafu::prelude::*;
@@ -50,7 +49,7 @@ pub enum Error {
     UnableToBeginTransaction { source: duckdb::Error },
 
     #[snafu(display(
-        "Unable to delete data from the duckdb table.\nAn internal table and base table exist for the same table.\nManually migrate the table by deleting '{internal_table}' or {table_name}', and try again."
+        "Unable to delete data from the duckdb table. An internal table and base table exist for the same table. Manually migrate the table by deleting '{internal_table}' or {table_name}', and try again."
     ))]
     UnableToDeleteDataInternalTable {
         internal_table: String,
@@ -102,32 +101,60 @@ impl DuckDBDeletionSink {
 impl DeletionSink for DuckDBDeletionSink {
     async fn delete_from(&self) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
-        let mut db_conn = pool.connect_sync()?;
-        let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)?;
-        let tx = duckdb_conn
-            .conn
-            .transaction()
-            .context(UnableToBeginTransactionSnafu)?;
-        let has_table = self.table_definition.has_table(&tx)?;
-        let mut internal_tables = self.table_definition.list_internal_tables(&tx)?;
-        let table_name = match (internal_tables.pop(), has_table) {
-            (Some((table_name, _)), true) => {
-                return Err(Box::new(Error::UnableToDeleteDataInternalTable {
-                    internal_table: table_name.to_string(),
-                    table_name: self.table_definition.name().to_string(),
-                }));
-            }
-            (Some((table_name, _)), false) => table_name,
-            (None, true) => self.table_definition.name().clone(),
-            (None, false) => {
-                return Ok(0);
-            }
-        };
+        let table_definition = Arc::clone(&self.table_definition);
+        let filters = self.filters.clone();
 
-        let sql = util::filters_to_sql(&self.filters, Some(Engine::DuckDB))?;
-        let count = delete_from(&table_name.to_string(), tx, &sql)?;
+        tokio::task::spawn_blocking(
+            move || -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+                let mut db_conn = pool.connect_sync()?;
+                let duckdb_conn = DuckDB::duckdb_conn(&mut db_conn)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let tx = duckdb_conn
+                    .conn
+                    .transaction()
+                    .context(UnableToBeginTransactionSnafu)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let has_table = table_definition
+                    .has_table(&tx)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let mut internal_tables = table_definition
+                    .list_internal_tables(&tx)
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+                let table_name = match (internal_tables.pop(), has_table) {
+                    (Some((table_name, _)), true) => {
+                        return Err(Box::new(Error::UnableToDeleteDataInternalTable {
+                            internal_table: table_name.to_string(),
+                            table_name: table_definition.name().to_string(),
+                        }));
+                    }
+                    (Some((table_name, _)), false) => table_name,
+                    (None, true) => table_definition.name().clone(),
+                    (None, false) => {
+                        return Ok(0);
+                    }
+                };
 
-        Ok(count)
+                // When filters is empty, return 0 to prevent accidental full table deletion.
+                // This is intentional - callers must provide explicit filters for deletion.
+                let count = if filters.is_empty() {
+                    0
+                } else {
+                    let sql_filters: Result<Vec<String>, _> = filters
+                        .iter()
+                        .map(|f| expr::to_sql_with_engine(f, Some(Engine::DuckDB)))
+                        .collect();
+                    let sql = sql_filters
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                        .join(" AND ");
+                    delete_from(&table_name.to_string(), tx, &sql)
+                        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                };
+
+                Ok(count)
+            },
+        )
+        .await
+        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
     }
 }
 
@@ -136,7 +163,6 @@ impl Read for DuckDBTableFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         self.table_provider(table_reference).await
     }
@@ -147,7 +173,6 @@ impl ReadWrite for DuckDBTableFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         self.read_write_table_provider(table_reference).await
     }
