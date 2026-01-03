@@ -254,6 +254,7 @@ iceberg-write = []
 imap = ["data_components/imap", "dep:imap"]
 kafka = ["data_components/kafka"]
 keyring-secret-store = ["runtime-secrets/keyring-secret-store"]
+local_embed = ["llms/local_embed"]
 mcp = ["dep:rmcp", "tools/mcp"]
 metal = ["llms/metal"]
 models = [

@@ -35,6 +35,7 @@ use llms::embeddings::{
     Embed, Error as EmbedError,
     candle::{download_hf_file, tei::TeiEmbed},
 };
+#[cfg(feature = "local_embed")]
 use llms::model2vec::Model2Vec;
 use llms::openai::embed::OpenaiEmbed;
 use llms::openai::{DEFAULT_EMBEDDING_MODEL, UsageTier};
@@ -132,10 +133,16 @@ pub async fn try_to_embedding(
         EmbeddingPrefix::Bedrock => Err(EmbedError::UnknownModelSource {
             from: "bedrock".to_string(),
         }),
+        #[cfg(feature = "local_embed")]
         EmbeddingPrefix::Model2Vec => model2vec(model_id, &params, embeddings_cache.clone()),
+        #[cfg(not(feature = "local_embed"))]
+        EmbeddingPrefix::Model2Vec => Err(EmbedError::UnknownModelSource {
+            from: "local_embed/Model2Vec".to_string(),
+        }),
     }
 }
 
+#[cfg(feature = "local_embed")]
 fn model2vec(
     model_id: Option<String>,
     params: &HashMap<String, SecretString>,
