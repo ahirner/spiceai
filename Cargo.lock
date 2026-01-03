@@ -4789,7 +4789,7 @@ dependencies = [
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-expr-common",
- "datafusion-macros 50.3.0 (git+https://github.com/spiceai/datafusion.git?rev=10b5cc5da1a4796eedefde3f079dd14768e483cc)",
+ "datafusion-macros",
  "hex",
  "itertools 0.14.0",
  "log",
@@ -4813,7 +4813,7 @@ dependencies = [
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-functions-aggregate-common",
- "datafusion-macros 50.3.0 (git+https://github.com/spiceai/datafusion.git?rev=10b5cc5da1a4796eedefde3f079dd14768e483cc)",
+ "datafusion-macros",
  "datafusion-physical-expr",
  "datafusion-physical-expr-common",
  "half",
@@ -4859,7 +4859,7 @@ dependencies = [
  "datafusion-functions",
  "datafusion-functions-aggregate",
  "datafusion-functions-aggregate-common",
- "datafusion-macros 50.3.0 (git+https://github.com/spiceai/datafusion.git?rev=10b5cc5da1a4796eedefde3f079dd14768e483cc)",
+ "datafusion-macros",
  "datafusion-physical-expr-common",
  "itertools 0.14.0",
  "log",
@@ -4891,7 +4891,7 @@ dependencies = [
  "datafusion-doc",
  "datafusion-expr",
  "datafusion-functions-window-common",
- "datafusion-macros 50.3.0 (git+https://github.com/spiceai/datafusion.git?rev=10b5cc5da1a4796eedefde3f079dd14768e483cc)",
+ "datafusion-macros",
  "datafusion-physical-expr",
  "datafusion-physical-expr-common",
  "log",
@@ -4905,17 +4905,6 @@ source = "git+https://github.com/spiceai/datafusion.git?rev=10b5cc5da1a4796eedef
 dependencies = [
  "datafusion-common",
  "datafusion-physical-expr-common",
-]
-
-[[package]]
-name = "datafusion-macros"
-version = "50.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec6f637bce95efac05cdfb9b6c19579ed4aa5f6b94d951cfa5bb054b7bb4f730"
-dependencies = [
- "datafusion-expr",
- "quote",
- "syn 2.0.111",
 ]
 
 [[package]]
@@ -5145,8 +5134,7 @@ dependencies = [
 [[package]]
 name = "datafusion-spark"
 version = "50.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "613efb6666a7d42fcb922b90cd0daa2b25ea486d141350e5d3e86e46df28309a"
+source = "git+https://github.com/spiceai/datafusion.git?rev=10b5cc5da1a4796eedefde3f079dd14768e483cc#10b5cc5da1a4796eedefde3f079dd14768e483cc"
 dependencies = [
  "arrow",
  "chrono",
@@ -5156,7 +5144,7 @@ dependencies = [
  "datafusion-execution",
  "datafusion-expr",
  "datafusion-functions",
- "datafusion-macros 50.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "datafusion-macros",
  "log",
  "sha1 0.10.6",
  "url",
