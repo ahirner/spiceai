@@ -14,6 +14,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | Delta Lake                       | ✅            | @Sevenannn      |
 | Dremio                           | ✅            | @Sevenannn      |
 | DuckDB                           | ✅            | @peasee         |
+| DynamoDB                         | ✅            | @krinart        |
 | File                             | ✅            | @peasee         |
 | FlightSQL                        | ➖            |                 |
 | FTP/SFTP                         | ➖            |                 |
@@ -23,10 +24,12 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | HTTP/HTTPS                       | ➖            |                 |
 | IMAP                             | ✅            | @peasee         |
 | Iceberg                          | ✅            | @phillipleblanc |
+| Kafka                            | ✅            | @sgrebnov       |
 | Localpod                         | ➖            |                 |
 | MS SQL                           | ✅            | @peasee         |
 | MySQL                            | ✅            | @peasee         |
 | ODBC                             | ➖            |                 |
+| Oracle                           | ✅            | @sgrebnov       |
 | PostgreSQL                       | ✅            | @Sevenannn      |
 | Sharepoint                       | ➖            |                 |
 | Snowflake                        | ✅            | @phillipleblanc |

@@ -21,6 +21,7 @@ use secrecy::SecretString;
 use snafu::prelude::*;
 use std::collections::HashMap;
 use std::fmt;
+use std::path::{Component, Path};
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -40,42 +41,52 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Unable to load the model.\n{source}\nVerify that the model is available and accessible."
+        "Unable to load the model. {source} Verify that the model is available and accessible."
     ))]
     UnableToFetchModel { source: reqwest::Error },
 
     #[snafu(display(
-        "Unable to download model file.\nVerify that the model is available and accessible."
+        "Unable to download model file. Verify that the model is available and accessible."
     ))]
     UnableToDownloadModelFile {},
 
     #[snafu(display(
-        "Unable to parse metadata.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Unable to parse metadata. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToParseMetadata {},
 
     #[snafu(display(
-        "Unable to find home directory.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Unable to find home directory. Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToFindHomeDir {},
 
     #[snafu(display(
-        "Unable to create model path.\n{source}\nVerify you have the necessary permissions to access the model path."
+        "Unable to create model path. {source} Verify you have the necessary permissions to access the model path."
     ))]
     UnableToCreateModelPath { source: std::io::Error },
 
     #[snafu(display(
-        "Unable to load the configuration.\n{reason}\nVerify the configuration is valid, and try again."
+        "Invalid model name '{name}'. Model names must not be absolute paths or contain parent directory segments."
+    ))]
+    InvalidModelName { name: String },
+
+    #[snafu(display(
+        "Invalid model file path '{path}'. File paths must stay within the model directory."
+    ))]
+    InvalidModelFilePath { path: String },
+
+    #[snafu(display(
+        "Unable to load the configuration. {reason} Verify the configuration is valid, and try again."
     ))]
     UnableToLoadConfig { reason: String },
 
     #[snafu(display(
-        "An unsupported model source was specified in the 'from' parameter: '{from}'.\nSpecify a valid source, like 'openai', and try again.\nFor details, visit: https://spiceai.org/docs/components/models"
+        "An unsupported model source was specified in the 'from' parameter: '{from}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/models"
     ))]
     UnknownModelSource { from: String },
 
     #[snafu(display(
-        "The specified model format, '{model_format}', is not supported.\nSpecify a supported model format and try again.\nFor details, visit: https://spiceai.org/docs/components/models"
+        "The specified model format, '{model_format}', is not supported. Specify a supported model format and try again. For details, visit: https://spiceai.org/docs/components/models"
     ))]
     UnsupportedModelFormat { model_format: ModelFormat },
 }
@@ -141,9 +152,27 @@ impl FromStr for ModelSourceType {
 }
 
 pub fn ensure_model_path(name: &str) -> Result<String> {
-    let mut model_path = dirs::home_dir().context(UnableToFindHomeDirSnafu)?;
-    model_path.push(".spice/models");
-    model_path.push(name);
+    let mut base_path = dirs::home_dir().context(UnableToFindHomeDirSnafu)?;
+    base_path.push(".spice/models");
+
+    let candidate = Path::new(name);
+    ensure!(
+        !candidate.is_absolute()
+            && candidate
+                .components()
+                .all(|component| matches!(component, Component::Normal(_))),
+        InvalidModelNameSnafu {
+            name: name.to_string(),
+        }
+    );
+
+    let model_path = base_path.join(candidate);
+    ensure!(
+        model_path.starts_with(&base_path),
+        InvalidModelNameSnafu {
+            name: name.to_string(),
+        }
+    );
 
     if !model_path.exists() {
         std::fs::create_dir_all(&model_path).context(UnableToCreateModelPathSnafu)?;
@@ -159,7 +188,6 @@ pub fn ensure_model_path(name: &str) -> Result<String> {
 }
 
 impl From<ModelSourceType> for Option<Box<dyn ModelSource>> {
-    #[allow(unused_variables)]
     fn from(source: ModelSourceType) -> Self {
         #[cfg(feature = "full")]
         if source == ModelSourceType::Local {

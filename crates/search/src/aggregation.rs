@@ -19,8 +19,8 @@ use std::collections::HashMap;
 
 use arrow::{array::RecordBatch, datatypes::SchemaRef};
 use async_trait::async_trait;
-use datafusion::execution::SendableRecordBatchStream;
-use serde_json::Value;
+use datafusion::{common::Column, execution::SendableRecordBatchStream};
+use serde_json::{Value, json};
 use snafu::{ResultExt, Snafu};
 
 use crate::{SEARCH_SCORE_COLUMN_NAME, SEARCH_VALUE_COLUMN_NAME, VectorSearchGenerationResult};
@@ -53,7 +53,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "The resulting aggregation result is inconsistent, which is an unexpected error.\n{source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "The resulting aggregation result is inconsistent, which is an unexpected error. {source}"
     ))]
     InconsistentAggregationResult {
         source: Box<dyn std::error::Error + Send + Sync>,
@@ -75,10 +75,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[async_trait]
 pub trait CandidateAggregation: Sync + Send {
     /// Consumes `generation_results` and decides how to order the underlying [`SendableRecordBatchStream`] data into a single [`SendableRecordBatchStream`].
+    ///
+    /// Expect `data` to be non empty, and one [`VectorSearchGenerationResult::data`] to be non-empty.
     async fn aggregate(
         &self,
         mut data: Vec<VectorSearchGenerationResult>,
-        primary_keys: Vec<String>,
+        primary_keys: Vec<Column>,
         limit: usize,
     ) -> Result<AggregationResult>;
 }
@@ -97,7 +99,7 @@ pub struct AggregationResult {
     /// to all the columns in `data` that derived from it.
     ///
     /// Example
-    /// ```
+    /// ```json
     /// {
     ///   "body": ["body_fts", "body_similarity"]
     /// }
@@ -119,20 +121,19 @@ impl std::fmt::Debug for AggregationResult {
 
 fn from_single_input(
     input: VectorSearchGenerationResult,
-    primary_key: Vec<String>,
+    primary_key: Vec<Column>,
 ) -> AggregationResult {
     let VectorSearchGenerationResult {
         data,
         derived_from: derived_column,
     } = input;
 
+    let primary_key: Vec<_> = primary_key.into_iter().map(|c| c.flat_name()).collect();
+
     // Results from [`super::generation::CandidateGeneration::search`] outputs the matches as the
     // `SEARCH_VALUE_COLUMN_NAME` column, so we directly know the mapping.
     let mut matches = HashMap::new();
-    matches.insert(
-        derived_column.to_string(),
-        vec![SEARCH_VALUE_COLUMN_NAME.to_string()],
-    );
+    matches.insert(derived_column, vec![SEARCH_VALUE_COLUMN_NAME.to_string()]);
 
     // All remaining columns in the data are considered additional columns.
     let data_columns: Vec<_> = data
@@ -218,6 +219,16 @@ impl AggregationResult {
         serde_json::from_str(&str)
             .boxed()
             .context(InconsistentAggregationResultSnafu)
+    }
+
+    /// Provides a user-friendly representation of the result.
+    #[must_use]
+    pub fn display_json(&self) -> Value {
+        json!({
+            "primary_key_columns": self.primary_key,
+            "additional_columns": self.data_columns,
+            "queried_columns": self.matches.keys().collect::<Vec<_>>()
+        })
     }
 }
 

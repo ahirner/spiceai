@@ -26,6 +26,7 @@ use runtime::{Runtime, component::dataset::builder::DatasetBuilder};
 use spicepod::acceleration::Mode;
 use spicepod::acceleration::{Acceleration, RefreshMode};
 use spicepod::component::dataset::Dataset;
+use spicepod::param::Params;
 use std::sync::Arc;
 
 use crate::acceleration::get_params;
@@ -53,18 +54,16 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
                 refresh_sql: Some("SELECT * FROM decimal".to_string()),
                 ..Acceleration::default()
             });
+            dataset.params = Some(Params::from_string_map(
+                [("file_format".to_string(), "parquet".to_string())].into(),
+            ));
 
             let app = AppBuilder::new("test_acceleration_sqlite_checkpoint")
                 .with_dataset(dataset)
                 .build();
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
-                    .build()
-                    .await,
-            );
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             let app_ref = rt.app();
             let app_lock = app_ref.read().await;
@@ -80,13 +79,13 @@ async fn test_acceleration_sqlite_checkpoint() -> Result<(), anyhow::Error> {
                 .map(DatasetBuilder::try_from)
                 .map(move |ds_builder| {
                     ds_builder
-                        .map_err(|e| anyhow!("Failed to create dataset builder: {}", e))
+                        .map_err(|e| anyhow!("Failed to create dataset builder: {e}"))
                         .and_then(|ds_builder| {
                             ds_builder
                                 .with_app(Arc::clone(app))
                                 .with_runtime(Arc::clone(&cloned_rt))
                                 .build()
-                                .map_err(|e| anyhow!("Failed to build dataset: {}", e))
+                                .map_err(|e| anyhow!("Failed to build dataset: {e}"))
                         })
                 })
                 .collect::<Result<Vec<_>, _>>()?;

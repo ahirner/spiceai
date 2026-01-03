@@ -14,13 +14,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use crate::schema::to_source_native_type_name;
 use arrow::array::{Array, ArrayRef, FixedSizeListArray, ListArray, RecordBatch, StructArray};
 use arrow::buffer::OffsetBuffer;
 use arrow::compute::concat;
 use arrow_cast::display::{ArrayFormatter, FormatOptions};
-use arrow_schema::{ArrowError, DataType, Field};
+use arrow_schema::{ArrowError, DataType, Field, Schema};
+use std::collections::HashMap;
 use std::io::Write;
 use std::sync::Arc;
+
+static MARKDOWN_TABLE_SEPARATOR_ROW: [&str; 5] = ["---"; 5];
 
 /// Operations to apply to [`ArrayRef`] or [`RecordBatch`] data so as to prepare it for display.
 ///
@@ -34,7 +38,6 @@ pub enum FormatOperation {
     TruncateListLength(usize),
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) fn format_column_data(
     column: ArrayRef,
     field: &Arc<Field>,
@@ -179,7 +182,7 @@ fn trancate_str(str: Option<&str>, max_characters: usize) -> Option<&str> {
     }
 }
 
-#[allow(
+#[expect(
     clippy::cast_sign_loss,
     clippy::cast_possible_truncation,
     clippy::cast_possible_wrap
@@ -213,11 +216,7 @@ fn truncate_fixed_size_list_array(
     )
 }
 
-#[allow(
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap
-)]
+#[expect(clippy::cast_sign_loss)]
 fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArray, ArrowError> {
     let child_array = list_array.values();
     let offsets = list_array.value_offsets();
@@ -243,14 +242,10 @@ fn truncate_list_array(list_array: &ListArray, max_len: usize) -> Result<ListArr
     let nulls = new_child_array.nulls().cloned();
 
     ListArray::try_new(
-        Arc::new(Field::new_list(
+        Arc::new(Field::new(
             "item",
-            Field::new(
-                "item",
-                child_array.data_type().clone(),
-                child_array.is_nullable(),
-            ),
-            list_array.is_nullable(),
+            child_array.data_type().clone(),
+            child_array.is_nullable(),
         )),
         OffsetBuffer::from_lengths(new_lengths),
         new_child_array,
@@ -331,13 +326,175 @@ fn column_indices(batch: &RecordBatch, column_names: &[String]) -> Result<Vec<us
         .collect()
 }
 
+fn hashmap_to_string(map: &HashMap<String, String>, separator: &str) -> String {
+    let mut keys: Vec<_> = map.keys().collect();
+    keys.sort(); // To make this function reproducible
+    keys.iter()
+        .map(|k| format!("* {}: {}", k, map[*k]))
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+#[expect(clippy::doc_lazy_continuation)]
+/// Creates a markdown representation of tables' schemas in the following format:
+///
+/// **Table: users**
+/// Metadata:
+/// * owner: admin
+/// * description: All the users of the world
+/// | Column | Sql Type | Arrow Type | Nullable | Metadata |
+/// | --- | --- | --- | --- | --- |
+/// | id | BIGINT | Int64 | false | * comment: autoincrement<br>* description: user id |
+/// | name | VARCHAR | Utf8 | true |  |
+#[must_use]
+pub fn table_schemas_to_markdown_table(table_schemas: Vec<(String, Schema)>) -> String {
+    let mut table_schemas_formatted = Vec::with_capacity(table_schemas.len());
+
+    for (table_name, table_schema) in table_schemas {
+        // Header row and separator for markdown
+        let header = ["Column", "Sql Type", "Arrow Type", "Nullable", "Metadata"];
+
+        let mut md_table = vec![
+            format!("| {} |", header.join(" | ")),
+            format!("| {} |", MARKDOWN_TABLE_SEPARATOR_ROW.join(" | ")),
+        ];
+
+        for field in table_schema.fields() {
+            md_table.push(format!(
+                "| {} | {} | {} | {} | {} |",
+                field.name(),
+                to_source_native_type_name(field.data_type()),
+                field.data_type(),
+                field.is_nullable(),
+                hashmap_to_string(field.metadata(), "<br>"),
+            ));
+        }
+
+        let mut sections = vec![format!("**Table: {table_name}**")];
+        if !table_schema.metadata().is_empty() {
+            sections.push(format!(
+                "Metadata:\n{}",
+                hashmap_to_string(table_schema.metadata(), "\n")
+            ));
+        }
+        sections.push(md_table.join("\n"));
+        table_schemas_formatted.push(sections.join("\n"));
+    }
+
+    table_schemas_formatted.join("\n\n")
+}
+
+/// Pretty prints an Arrow Schema in a format similar to Python's pyarrow output.
+///
+/// Example format:
+/// col1: string
+/// col2: int64
+/// col3: list<item: float32>
+///
+/// # Errors
+///
+/// Returns a `std::fmt::Error` if writing to the output fails.
+pub fn pretty_print_schema(
+    schema: &Arc<Schema>,
+    output: &mut impl std::fmt::Write,
+) -> std::fmt::Result {
+    // Helper function to recursively format complex types directly to a writer
+    fn write_data_type(data_type: &DataType, w: &mut impl std::fmt::Write) -> std::fmt::Result {
+        match data_type {
+            DataType::List(field) => {
+                w.write_str("list<item: ")?;
+                write_data_type(field.data_type(), w)?;
+                w.write_char('>')
+            }
+            DataType::LargeList(field) => {
+                w.write_str("large_list<item: ")?;
+                write_data_type(field.data_type(), w)?;
+                w.write_char('>')
+            }
+            DataType::Struct(fields) => {
+                w.write_str("struct<")?;
+                for (i, f) in fields.iter().enumerate() {
+                    if i > 0 {
+                        w.write_str(", ")?;
+                    }
+                    w.write_str(f.name())?;
+                    w.write_char(' ')?;
+                    write_data_type(f.data_type(), w)?;
+                }
+                w.write_char('>')
+            }
+            // For all other simple types (Int32, Utf8, Timestamp, etc.)
+            _ => {
+                // Write Debug format in lowercase without allocating
+                write!(w, "{data_type:?}")?;
+                Ok(())
+            }
+        }
+    }
+
+    // Write Debug format of DataType in lowercase
+    fn write_data_type_lowercase(
+        data_type: &DataType,
+        w: &mut impl std::fmt::Write,
+    ) -> std::fmt::Result {
+        struct LowercaseWriter<'a, W: std::fmt::Write>(&'a mut W);
+
+        impl<W: std::fmt::Write> std::fmt::Write for LowercaseWriter<'_, W> {
+            fn write_str(&mut self, s: &str) -> std::fmt::Result {
+                for c in s.chars() {
+                    self.0.write_char(c.to_ascii_lowercase())?;
+                }
+                Ok(())
+            }
+        }
+
+        write_data_type(data_type, &mut LowercaseWriter(w))
+    }
+
+    for field in schema.fields() {
+        output.write_char(' ')?;
+        output.write_str(field.name())?;
+        output.write_str(": ")?;
+        write_data_type_lowercase(field.data_type(), output)?;
+        if field.is_nullable() {
+            output.write_str(" (nullable)")?;
+        }
+        output.write_char('\n')?;
+    }
+
+    Ok(())
+}
+
+/// A wrapper that implements `Display` for pretty-printing an Arrow schema.
+///
+/// This allows zero-allocation schema formatting when used with `tracing` macros
+/// or any other context that accepts `Display` types.
+///
+/// # Example
+/// ```ignore
+/// use arrow_tools::format::SchemaDisplay;
+/// tracing::debug!("Schema: {}", SchemaDisplay(&schema));
+/// ```
+pub struct SchemaDisplay<'a>(pub &'a Arc<Schema>);
+
+impl std::fmt::Display for SchemaDisplay<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        pretty_print_schema(self.0, f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use arrow::array::{Float32Array, RecordBatch, StringArray};
+    use arrow::{
+        array::{ArrayRef, FixedSizeListArray, Float32Array, ListArray, RecordBatch, StringArray},
+        datatypes::Int32Type,
+    };
     use arrow_schema::{DataType, Field, Schema};
+    use snafu::ResultExt;
+    use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::format::to_markdown_documents;
+    use super::*;
 
     #[test]
     fn test_pretty_format_markdown() -> Result<(), Box<dyn std::error::Error>> {
@@ -351,12 +508,12 @@ mod tests {
             Some(
                 "Lorem ipsum dolor sit amet, consectetur adipiscing elit.
 
-Sed do eiusmod tempor aliqua. 
+Sed do eiusmod tempor aliqua.
 
 reprehenderit nulla pariatur.",
             ),
             Some(
-                "Lorem ipsum dolor adipiscing elit. 
+                "Lorem ipsum dolor adipiscing elit.
 Cras venenatis euismod malesuada.",
             ),
         ]);
@@ -374,13 +531,12 @@ Cras venenatis euismod malesuada.",
         )?;
 
         let formatted = to_markdown_documents(
-            &[batch.clone()],
+            std::slice::from_ref(&batch),
             "content_chunk",
             None,
             &["location".to_string(), "dist".to_string()],
         )
-        .expect("format record batch")
-        .to_string();
+        .expect("format record batch");
 
         insta::assert_snapshot!(formatted);
 
@@ -390,11 +546,169 @@ Cras venenatis euismod malesuada.",
             Some("content"),
             &["location".to_string(), "dist".to_string()],
         )
-        .expect("format record batch")
-        .to_string();
+        .expect("format record batch");
 
         insta::assert_snapshot!("with_alias", formatted);
 
         Ok(())
+    }
+
+    #[test]
+    fn test_truncate_list_array() {
+        let test_cases: Vec<(&str, usize, ListArray)> = vec![
+            (
+                "truncate_list_array_basic",
+                2,
+                ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                    Some(vec![Some(0), Some(1), Some(2)]),
+                    Some(vec![Some(3), Some(4), Some(5)]),
+                    Some(vec![Some(6), Some(7)]),
+                ]),
+            ),
+            (
+                "truncate_list_array_unchanged",
+                5,
+                ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                    Some(vec![Some(0), Some(1), Some(2)]),
+                    Some(vec![Some(3), Some(4), Some(5)]),
+                    Some(vec![Some(6), Some(7)]),
+                ]),
+            ),
+            (
+                "truncate_list_array_split",
+                3,
+                ListArray::from_iter_primitive::<Int32Type, _, _>(vec![
+                    Some(vec![Some(0), Some(1), Some(2), Some(3)]),
+                    Some(vec![Some(3), Some(4), Some(5), Some(6)]),
+                    Some(vec![Some(6), Some(7)]),
+                ]),
+            ),
+        ];
+        for (test_name, max_len, input) in test_cases {
+            let output: ArrayRef =
+                Arc::new(truncate_list_array(&input, max_len).expect("truncate_list_array failed"));
+            insta::assert_json_snapshot!(
+                test_name,
+                write_to_json_value(output).expect("could not write ListArray to JSON")
+            );
+        }
+    }
+
+    #[test]
+    fn test_truncate_fixed_size_list_array() {
+        let test_cases: Vec<(&str, usize, FixedSizeListArray)> = vec![
+            (
+                "truncate_fixed_size_list_array_basic",
+                2,
+                FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(
+                    vec![
+                        Some(vec![Some(0), Some(1), Some(2)]),
+                        Some(vec![Some(3), Some(4), Some(5)]),
+                        Some(vec![Some(6), Some(7), Some(8)]),
+                    ],
+                    3,
+                ),
+            ),
+            (
+                "truncate_fixed_size_list_array_unchanged",
+                5,
+                FixedSizeListArray::from_iter_primitive::<Int32Type, _, _>(
+                    vec![
+                        Some(vec![Some(0), Some(1), Some(2)]),
+                        Some(vec![Some(3), Some(4), Some(5)]),
+                        Some(vec![Some(6), Some(7), Some(8)]),
+                    ],
+                    3,
+                ),
+            ),
+        ];
+        for (test_name, max_len, input) in test_cases {
+            let output: ArrayRef = Arc::new(
+                truncate_fixed_size_list_array(&input, max_len)
+                    .expect("truncate_fixed_size_list_array failed"),
+            );
+            insta::assert_json_snapshot!(
+                test_name,
+                write_to_json_value(output).expect("could not write FixedSizeListArray to JSON")
+            );
+        }
+    }
+
+    pub fn write_to_json_value(
+        data: ArrayRef,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let rb = RecordBatch::try_new(
+            Schema::new(vec![Field::new(
+                "col",
+                data.data_type().clone(),
+                data.is_nullable(),
+            )])
+            .into(),
+            vec![data],
+        )
+        .boxed()?;
+        let buf = Vec::new();
+        let mut writer = arrow_json::ArrayWriter::new(buf);
+
+        writer.write_batches([rb].iter().collect::<Vec<&RecordBatch>>().as_slice())?;
+        writer.finish()?;
+        serde_json::from_reader::<_, serde_json::Value>(writer.into_inner().as_slice()).boxed()
+    }
+
+    #[test]
+    fn test_table_schemas_to_markdown_table() {
+        let mut field_metadata = HashMap::new();
+        field_metadata.insert("comment".to_string(), "autoincrement".to_string());
+        field_metadata.insert("description".to_string(), "user id".to_string());
+
+        let mut schema_metadata = HashMap::new();
+        schema_metadata.insert("owner".to_string(), "admin".to_string());
+        schema_metadata.insert(
+            "description".to_string(),
+            "All the users of the world".to_string(),
+        );
+
+        let fields = vec![
+            Field::new("id", DataType::Int64, false).with_metadata(field_metadata.clone()),
+            Field::new("name", DataType::Utf8, true),
+        ];
+
+        let schema = Schema::new(fields).with_metadata(schema_metadata.clone());
+        let output = table_schemas_to_markdown_table(vec![("users".to_string(), schema)]);
+
+        insta::assert_snapshot!(output);
+    }
+
+    #[test]
+    fn test_pretty_print_schema() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new(
+                "scores",
+                DataType::List(Arc::new(Field::new("item", DataType::Float32, true))),
+                true,
+            ),
+            Field::new(
+                "metadata",
+                DataType::Struct(
+                    vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", DataType::Utf8, true),
+                    ]
+                    .into(),
+                ),
+                true,
+            ),
+        ]));
+
+        let mut pretty_output = String::new();
+        pretty_print_schema(&schema, &mut pretty_output).expect("write schema");
+        insta::assert_snapshot!(pretty_output, @r"
+        id: int64
+        name: utf8 (nullable)
+        scores: list<item: float32> (nullable)
+        metadata: struct<key utf8, value utf8> (nullable)
+        ");
     }
 }

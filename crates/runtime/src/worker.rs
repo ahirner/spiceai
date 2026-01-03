@@ -58,6 +58,7 @@ impl std::fmt::Display for WorkerType {
     }
 }
 
+#[expect(clippy::result_large_err)]
 fn infer_worker_type(worker: &WorkerComponent) -> Result<WorkerType> {
     match (worker.load_balance.as_ref(), worker.sql.as_ref()) {
         (Some(_), None) => Ok(WorkerType::LoadBalance),
@@ -68,6 +69,7 @@ fn infer_worker_type(worker: &WorkerComponent) -> Result<WorkerType> {
     }
 }
 
+#[expect(clippy::result_large_err)]
 pub fn try_construct_worker(worker: &WorkerComponent, rt: &Runtime) -> Result<Arc<dyn Worker>> {
     let worker_type = infer_worker_type(worker)?;
 
@@ -117,7 +119,7 @@ pub fn try_construct_worker(worker: &WorkerComponent, rt: &Runtime) -> Result<Ar
             let model = RouterModel::new(
                 worker.name.clone(),
                 load_balance.routing.as_slice(),
-                Arc::clone(&rt.llms),
+                Arc::clone(&rt.completion_llms),
             );
             Ok(Arc::new(LoadBalanceWorker::new(
                 Arc::new(model),

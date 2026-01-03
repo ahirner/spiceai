@@ -14,11 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches};
 use opentelemetry::global;
 use rustls::crypto::{self, CryptoProvider};
 use telemetry::noop::NoopMeterProvider;
 use tokio::runtime::Runtime;
+use util::in_tracing_context;
 
 #[cfg(feature = "alloc-jemalloc")]
 #[global_allocator]
@@ -55,7 +57,11 @@ const fn get_allocator_name() -> Option<&'static str> {
 }
 
 fn main() {
-    let args = spiced::Args::parse();
+    let matches = spiced::Args::command().get_matches();
+    let open_telemetry_deprecated =
+        matches.value_source("open_telemetry_bind_address") == Some(ValueSource::CommandLine);
+    let mut args = spiced::Args::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
+    args.open_telemetry_deprecated = open_telemetry_deprecated;
 
     if args.version {
         println!("{}", get_version_string());
@@ -81,19 +87,18 @@ fn main() {
     }
 
     if let Err(err) = tokio_runtime.block_on(start_runtime(args)) {
-        runtime::in_tracing_context(|| {
+        in_tracing_context(|| {
             tracing::error!("{err}");
         });
     }
 
-    global::shutdown_tracer_provider();
     // There is no global::shutdown_meter_provider, so we replace currently used meter provider with a noop one to clean up resources
     global::set_meter_provider(NoopMeterProvider::new());
     tracing::info!("Goodbye!");
 }
 
 async fn start_runtime(args: spiced::Args) -> Result<(), Box<dyn std::error::Error>> {
-    runtime::in_tracing_context(|| {
+    in_tracing_context(|| {
         if let Some(allocator_name) = get_allocator_name() {
             tracing::info!(
                 "Starting runtime {version} (allocator: {allocator_name})",

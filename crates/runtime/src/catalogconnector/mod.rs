@@ -24,7 +24,7 @@ use std::{
 use crate::{
     Runtime,
     component::{ComponentInitialization, catalog::Catalog},
-    dataconnector::{ConnectorComponent, parameters::ConnectorParams, s3},
+    dataconnector::{ConnectorComponent, parameters::ConnectorParams},
     parameters::{ParameterSpec, Parameters},
 };
 use async_trait::async_trait;
@@ -36,7 +36,7 @@ use tokio::{sync::Mutex, task::JoinHandle};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to setup the {connector_component} ({connector}).\n{source}"))]
+    #[snafu(display("Failed to setup the {connector_component} ({connector}). {source}"))]
     UnableToGetCatalogProvider {
         connector: String,
         connector_component: ConnectorComponent,
@@ -44,7 +44,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Cannot setup the {connector_component} ({connector}) with an invalid configuration.\n{message}"
+        "Cannot setup the {connector_component} ({connector}) with an invalid configuration. {message}"
     ))]
     InvalidConfiguration {
         connector: String,
@@ -54,7 +54,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Cannot setup the {connector_component} ({connector}) with an invalid configuration.\n{message}"
+        "Cannot setup the {connector_component} ({connector}) with an invalid configuration. {message}"
     ))]
     InvalidConfigurationNoSource {
         connector: String,
@@ -63,7 +63,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to load the {connector_component} ({connector}).\nAn unknown Catalog Connector Error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to load the {connector_component} ({connector}). An unknown Catalog Connector Error occurred: {source}"
     ))]
     InternalWithSource {
         connector: String,
@@ -72,9 +72,15 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to initiate catalog, app reference cannot be obtained from the runtime\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to initiate catalog, app reference cannot be obtained from the runtime."
     ))]
     FailedToGetAppFromRuntime {},
+
+    #[snafu(transparent)]
+    IcebergSnafu { source: iceberg::Error },
+
+    #[snafu(display("Failed to start a catalog refresh task. The task is already running."))]
+    RefreshTaskAlreadyStarted {},
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -138,7 +144,7 @@ pub async fn register_all() {
         CatalogConnectorFactory::new(
             iceberg::IcebergCatalog::new_connector,
             "iceberg",
-            iceberg::PARAMETERS,
+            &iceberg::PARAMETERS,
         ),
     );
 
@@ -147,7 +153,7 @@ pub async fn register_all() {
         CatalogConnectorFactory::new(
             glue::GlueCatalog::new_connector,
             glue::PREFIX,
-            &s3::PARAMETERS,
+            &super::dataconnector::glue::PARAMETERS,
         ),
     );
 
@@ -198,13 +204,13 @@ impl CatalogConnectorFactory {
     }
 }
 
-/// A `CatalogConnector` knows how to connect to a remote catalog and create a DataFusion `CatalogProvider`.
+/// A `CatalogConnector` knows how to connect to a remote catalog and create a `DataFusion` `CatalogProvider`.
 #[async_trait]
 pub trait CatalogConnector: Send + Sync {
     fn as_any(&self) -> &dyn Any;
 
-    /// Returns a DataFusion `CatalogProvider` which can automatically populate tables from a remote catalog.
-    /// The returned provider must implement RefreshableCatalogProvider which will be used to refresh the catalog.
+    /// Returns a `DataFusion` `CatalogProvider` which can automatically populate tables from a remote catalog.
+    /// The returned provider must implement `RefreshableCatalogProvider` which will be used to refresh the catalog.
     async fn refreshable_catalog_provider(
         self: Arc<Self>,
         _runtime: Arc<Runtime>,
@@ -213,7 +219,7 @@ pub trait CatalogConnector: Send + Sync {
 
     /// Returns whether the catalog connector should be initialized on startup or on trigger.
     fn initialization(&self) -> ComponentInitialization {
-        ComponentInitialization::OnStartup
+        ComponentInitialization::default()
     }
 }
 
@@ -236,7 +242,7 @@ pub async fn get_catalog_provider(
             .refreshable_catalog_provider(runtime, catalog)
             .await?,
     )
-    .start_refresh(refresh_interval);
+    .start_refresh(refresh_interval)?;
     Ok(Arc::new(provider))
 }
 
@@ -248,13 +254,6 @@ pub struct RefreshingCatalogProvider {
 }
 
 impl RefreshingCatalogProvider {
-    pub fn new_with_refresh(
-        inner: Arc<dyn RefreshableCatalogProvider>,
-        refresh_interval: Duration,
-    ) -> Self {
-        Self::new(inner).start_refresh(Some(refresh_interval))
-    }
-
     fn new(inner: Arc<dyn RefreshableCatalogProvider>) -> Self {
         Self {
             inner,
@@ -262,8 +261,11 @@ impl RefreshingCatalogProvider {
         }
     }
 
-    fn start_refresh(mut self, interval: Option<Duration>) -> Self {
-        assert!(self.refresh_task.is_none(), "Refresh task already running");
+    fn start_refresh(mut self, interval: Option<Duration>) -> Result<Self> {
+        if self.refresh_task.is_some() {
+            return Err(Error::RefreshTaskAlreadyStarted {});
+        }
+
         let interval = interval.unwrap_or(Duration::from_secs(60));
         let inner = Arc::clone(&self.inner);
         self.refresh_task = Some(tokio::spawn(async move {
@@ -277,7 +279,7 @@ impl RefreshingCatalogProvider {
                 }
             }
         }));
-        self
+        Ok(self)
     }
 }
 

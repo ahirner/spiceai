@@ -14,7 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use async_openai::{error::OpenAIError, types::ChatCompletionTool};
+use async_openai::{
+    error::OpenAIError,
+    types::chat::{ChatCompletionTool, ChatCompletionTools},
+};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -103,14 +106,6 @@ pub enum ContentBlock {
 pub enum ResponseContentBlock {
     Text(TextBlockParam),
     ToolUse(ToolUseBlockParam),
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct BetaRawContentBlockStartEvent {
-    pub content_block: ContentBlock,
-    pub index: i32,
-    #[serde(rename = "type")]
-    pub event_type: String, // Always "content_block_start"
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -276,18 +271,12 @@ impl From<&ChatCompletionTool> for ToolParam {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ToolChoiceAutoParam {
-    #[serde(rename = "type")]
-    pub choice_type: String, // Always "auto"
-    pub disable_parallel_tool_use: bool,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct ToolChoiceAnyParam {
-    #[serde(rename = "type")]
-    pub choice_type: String, // Always "any"
-    pub disable_parallel_tool_use: bool,
+/// Converts a `ChatCompletionTools` enum to a `ToolParam`, returning `None` for custom tools.
+pub fn tool_from_completion_tools(val: &ChatCompletionTools) -> Option<ToolParam> {
+    match val {
+        ChatCompletionTools::Function(tool) => Some(ToolParam::from(tool)),
+        ChatCompletionTools::Custom(_) => None,
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -297,15 +286,17 @@ pub struct MetadataParam {
 }
 
 // Combined pattern that matches all three formats:
-// 1. Anthropic API: claude-3-5-sonnet-20241022 or claude-3-5-sonnet-latest
+// 1. Anthropic API: claude-3-5-sonnet-20241022, claude-3-5-sonnet-latest or claude-opus-4-1
 // 2. AWS Bedrock: anthropic.claude-3-5-sonnet-20241022-v2:0
 // 3. GCP Vertex AI: claude-3-5-sonnet-v2@20241022
+// Based on available models from https://docs.claude.com/en/docs/about-claude/models/overview, as of 2025-09-28.
 pub(crate) static ANTHROPIC_REGEX: &str = r"(?x) # Enable verbose mode
     (?:anthropic\.)?                              # Optional 'anthropic.' prefix for AWS
     claude-                                       # Required 'claude-' prefix
     (?:instant-)?                                 # Optional 'instant-' for legacy
-    (?:\d+(?:\.\d+)?)-?                           # Version number (e.g., 3 or 3.5)
+    (?:\d+(?:[-.]\d+)*-)?                         # Optional leading version segment (e.g. 3-, 3-5-, 3.5-)
     (?:opus|sonnet|haiku)?                        # Optional model type
+    (?:-\d+(?:[-.]\d+)*)?                         # Optional trailing version segment (e.g. -4, -4-1)
     (?:
         -(?:latest|\d{8})                         # Anthropic format: -latest or -YYYYMMDD
         |
@@ -373,4 +364,55 @@ pub struct Usage {
     pub input_tokens: u32,
     #[serde(default)]
     pub output_tokens: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_model_variant;
+
+    // Current Anthropic model names to validate.
+    // Based on the models list from https://docs.claude.com/en/docs/about-claude/models/overview, as of 2025-09-28.
+    const VALID_MODELS: &[&str] = &[
+        "claude-opus-4-1",
+        "claude-opus-4-1-latest",
+        "claude-opus-4-1-20250805",
+        "claude-opus-4-20250514",
+        "claude-opus-4-0",
+        "claude-sonnet-4-0",
+        "claude-3-7-sonnet-latest",
+        "claude-3-5-haiku-latest",
+        "claude-sonnet-4-20250514",
+        "claude-3-7-sonnet-20250219",
+        "claude-3-5-haiku-20241022",
+        "anthropic.claude-opus-4-1-20250805-v1:0",
+        "anthropic.claude-opus-4-20250514-v1:0",
+        "anthropic.claude-sonnet-4-20250514-v1:0",
+        "anthropic.claude-3-7-sonnet-20250219-v1:0",
+        "anthropic.claude-3-5-haiku-20241022-v1:0",
+        "anthropic.claude-3-haiku-20240307-v1:0",
+        "claude-opus-4-1@20250805",
+        "claude-opus-4@20250514",
+        "claude-sonnet-4@20250514",
+        "claude-3-7-sonnet@20250219",
+        "claude-3-5-haiku@20241022",
+        "claude-3-haiku@20240307",
+    ];
+
+    #[test]
+    fn validates_known_models() {
+        for m in VALID_MODELS {
+            let res = validate_model_variant(m);
+            assert!(res.is_ok(), "model {m} should be valid: {:?}", res.err());
+        }
+    }
+
+    const INVALID_MODELS: &[&str] = &["anthropic.claude", "gpt-4o"];
+
+    #[test]
+    fn invalid_models_rejected() {
+        for m in INVALID_MODELS {
+            let res = validate_model_variant(m);
+            assert!(res.is_err(), "model {m} should be invalid");
+        }
+    }
 }

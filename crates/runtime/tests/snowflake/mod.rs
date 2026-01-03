@@ -32,7 +32,7 @@ fn make_dataset(path: &str, name: &str) -> Dataset {
     dataset
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 fn get_params() -> Params {
     // Verify that the environment variables are set
     let warehouse =
@@ -81,10 +81,10 @@ async fn snowflake_integration_test() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
+            configure_test_datafusion();
             let mut rt =
                 Runtime::builder()
                     .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
                     .build()
                     .await;
 

@@ -24,7 +24,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
-    common::{TableReference, project_schema},
+    common::{TableReference, project_schema, utils::quote_identifier},
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -56,20 +56,20 @@ pub mod write;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Query execution failed.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
+        "Query execution failed. {source} Report a bug to request support: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToGenerateSQL { source: expr::Error },
 
-    #[snafu(display("Failed to query Arrow Flight.\n{source}"))]
+    #[snafu(display("Failed to query Arrow Flight. {source}"))]
     Flight { source: flight_client::Error },
 
-    #[snafu(display("Failed to get schema from Arrow Flight for table {table}.\n{source}"))]
+    #[snafu(display("Failed to get schema from Arrow Flight for table {table}. {source}"))]
     UnableToGetSchema {
         source: flight_client::Error,
         table: String,
     },
 
-    #[snafu(display("Query execution failed.\n{source}\nVerify the configuration and try again."))]
+    #[snafu(display("Query execution failed. {source} Verify the configuration and try again."))]
     ArrowFlight {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
@@ -126,28 +126,17 @@ impl FlightFactory {
     pub async fn table_provider(
         &self,
         table_reference: impl Into<MultiPartTableReference>,
-        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        let table_provider = match schema {
-            Some(schema) => Arc::new(FlightTable::create_with_schema(
+        let table_provider = Arc::new(
+            FlightTable::create(
                 self.name,
                 self.client.clone(),
                 table_reference,
-                schema,
                 Arc::clone(&self.dialect),
                 self.extra_compute_context.as_ref().map(Arc::clone),
-            )),
-            None => Arc::new(
-                FlightTable::create(
-                    self.name,
-                    self.client.clone(),
-                    table_reference,
-                    Arc::clone(&self.dialect),
-                    self.extra_compute_context.as_ref().map(Arc::clone),
-                )
-                .await?,
-            ),
-        };
+            )
+            .await?,
+        );
 
         let table_provider = Arc::new(table_provider.create_federated_table_provider());
 
@@ -160,9 +149,8 @@ impl Read for FlightFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        FlightFactory::table_provider(self, table_reference, schema).await
+        FlightFactory::table_provider(self, table_reference).await
     }
 }
 
@@ -171,9 +159,8 @@ impl ReadWrite for FlightFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        let read_provider = Read::table_provider(self, table_reference.clone(), schema).await?;
+        let read_provider = Read::table_provider(self, table_reference.clone()).await?;
 
         Ok(FlightTableWriter::create(
             read_provider,
@@ -204,7 +191,6 @@ impl std::fmt::Debug for FlightTable {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 impl FlightTable {
     pub async fn create(
         name: &'static str,
@@ -222,11 +208,11 @@ impl FlightTable {
 
         Ok(Self {
             name,
+            join_push_down_context,
             client: client.clone(),
             schema,
-            table_reference,
             dialect,
-            join_push_down_context,
+            table_reference,
         })
     }
 
@@ -247,11 +233,11 @@ impl FlightTable {
 
         Self {
             name,
-            client: client.clone(),
-            schema,
-            table_reference,
-            dialect,
             join_push_down_context,
+            client,
+            schema,
+            dialect,
+            table_reference,
         }
     }
 
@@ -428,7 +414,7 @@ impl FlightExec {
             .projected_schema
             .fields()
             .iter()
-            .map(|f| format!("\"{}\"", f.name()))
+            .map(|f| quote_identifier(f.name()))
             .collect::<Vec<_>>()
             .join(", ");
 
@@ -512,7 +498,6 @@ impl ExecutionPlan for FlightExec {
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn query_to_stream(
     client: FlightClient,
     sql: String,
@@ -534,7 +519,6 @@ fn query_to_stream(
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn to_execution_error(e: Error) -> DataFusionError {
     match e {
         Error::Flight { source } => match source {

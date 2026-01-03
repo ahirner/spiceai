@@ -46,9 +46,7 @@ pub enum Error {
     #[snafu(display("{source}"))]
     UnableToRunModel { source: ModelRuntimeError },
 
-    #[snafu(display(
-        "Unable to load required secrets.\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
-    ))]
+    #[snafu(display("Unable to load required secrets."))]
     UnableToLoadRequiredSecrets {},
 }
 
@@ -71,7 +69,7 @@ impl Model {
         params.insert("from".to_string(), SecretString::from(path(&model.from)));
         params.insert(
             "files".to_string(),
-            SecretString::from(model.get_all_file_paths().join(",").to_string()),
+            SecretString::from(model.get_all_file_paths().join(",")),
         );
 
         let model_source: Option<Box<dyn ModelSource>> = source.into();

@@ -21,6 +21,7 @@ pub mod embeddings;
 pub mod eval;
 pub mod iceberg;
 pub mod inference;
+pub mod responses;
 
 pub mod models;
 pub mod nsql;
@@ -50,13 +51,19 @@ use cache::result::CacheStatus;
 use csv::Writer;
 use datafusion::common::ParamValues;
 use headers_accept::Accept;
-use http::{HeaderValue, header::CONTENT_TYPE};
+use http::{
+    HeaderValue,
+    header::{CACHE_CONTROL, CONTENT_TYPE},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use snafu::ResultExt;
 
 use futures::TryStreamExt;
 
+use runtime_request_context::{AsyncMarker, RequestContext};
+
+use crate::datafusion::request_context_extension::DataFusionContextExtension;
 #[cfg(feature = "openapi")]
 use utoipa::{
     openapi::{
@@ -93,7 +100,7 @@ impl utoipa::IntoParams for Format {
     }
 }
 
-#[derive(Default, Debug, Serialize, Deserialize)]
+#[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 /// The various formats that the Arrow data can be converted and returned from HTTP requests.
 pub enum ResponseMimeType {
@@ -129,13 +136,13 @@ pub(crate) fn accept_header_types(accept: &TypedHeader<Accept>) -> Vec<String> {
 }
 
 impl ResponseMimeType {
-    pub fn to_accept_header(&self) -> Option<http::HeaderValue> {
+    pub fn to_accept_header(self) -> Option<http::HeaderValue> {
         let media_type = match self {
-            ResponseMimeType::Json => "application/json",
-            ResponseMimeType::Csv => "text/csv",
-            ResponseMimeType::Plain => "text/plain",
-            ResponseMimeType::VndNsqlJsonV1 => "application/vnd.spiceai.nsql.v1+json",
-            ResponseMimeType::VndSqlJsonV1 => "application/vnd.spiceai.sql.v1+json",
+            Self::Json => "application/json",
+            Self::Csv => "text/csv",
+            Self::Plain => "text/plain",
+            Self::VndNsqlJsonV1 => "application/vnd.spiceai.nsql.v1+json",
+            Self::VndSqlJsonV1 => "application/vnd.spiceai.sql.v1+json",
         };
         HeaderValue::from_str(media_type).ok()
     }
@@ -167,6 +174,14 @@ fn convert_entry_to_csv<T: Serialize>(entries: &[T]) -> Result<String, Box<dyn s
 }
 
 fn dataset_status(df: &DataFusion, ds: &Dataset) -> ComponentStatus {
+    // First check the runtime status which tracks the actual component state
+    // (Initializing, Refreshing, Ready, Error, etc.)
+    let dataset_statuses = df.runtime_status().get_dataset_statuses();
+    if let Some(status) = dataset_statuses.get(&ds.name) {
+        return *status;
+    }
+
+    // Fallback: if not in runtime status, check if table exists
     if df.table_exists(ds.name.clone()) {
         ComponentStatus::Ready
     } else {
@@ -196,6 +211,7 @@ pub async fn sql_to_http_response(
         ResponseMetadata::empty(),
     )
     .await
+    .into_response()
 }
 
 // Runs query and returns the results as a vector of `RecordBatch`.
@@ -204,13 +220,12 @@ pub async fn run_sql(
     sql: &str,
     parameters: Option<ParamValues>,
 ) -> Result<(Vec<RecordBatch>, CacheStatus), Box<dyn std::error::Error + Send + Sync>> {
-    let builder = QueryBuilder::new(sql, df);
-    let builder = if let Some(parameters) = parameters {
-        builder.parameters(parameters)
-    } else {
-        builder
-    };
-    let query_res = builder.build().run().await?;
+    let query_res = QueryBuilder::new(sql, df)
+        .parameters(parameters)
+        .build()
+        .run()
+        .await?;
+
     Ok((
         query_res.data.try_collect::<Vec<RecordBatch>>().await?,
         query_res.cache_status,
@@ -223,7 +238,9 @@ pub async fn to_http_response(
     cache_status: CacheStatus,
     format: ResponseMimeType,
     meta: ResponseMetadata,
-) -> Response {
+) -> (StatusCode, HeaderMap, String) {
+    let mut headers = HeaderMap::new();
+
     let res = match format {
         ResponseMimeType::Json => arrow_to_json(&data),
         ResponseMimeType::Csv => arrow_to_csv(&data),
@@ -236,22 +253,32 @@ pub async fn to_http_response(
     let body = match res {
         Ok(body) => body,
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, headers, e.to_string());
         }
     };
 
-    let mut headers = HeaderMap::new();
+    let request_context = RequestContext::current(AsyncMarker::new().await);
 
     if let Some(header_value) = format.to_accept_header() {
         headers.insert(CONTENT_TYPE, header_value);
     }
 
-    attach_cache_headers(&mut headers, cache_status);
+    attach_cache_headers(
+        &mut headers,
+        cache_status,
+        request_context.client_supplied_cache_key().is_some(),
+        &request_context,
+    );
 
-    (StatusCode::OK, headers, body).into_response()
+    (StatusCode::OK, headers, body)
 }
 
-fn attach_cache_headers(headers: &mut HeaderMap, results_cache_status: CacheStatus) {
+fn attach_cache_headers(
+    headers: &mut HeaderMap,
+    results_cache_status: CacheStatus,
+    user_key_specified: bool,
+    request_context: &RequestContext,
+) {
     if let Some(val) = status_to_x_cache_value(results_cache_status) {
         headers.insert("X-Cache", val);
     }
@@ -262,12 +289,46 @@ fn attach_cache_headers(headers: &mut HeaderMap, results_cache_status: CacheStat
     {
         headers.insert("Results-Cache-Status", val);
     }
+
+    // Tell CDN entry is unique per user cache key
+    if user_key_specified {
+        headers.insert("Vary", HeaderValue::from_static("Spice-Cache-Key"));
+    }
+
+    // Add Cache-Control response header with stale-while-revalidate if configured
+    // Access the DataFusion instance to get the pre-parsed cache configuration
+    if let Some(df_ext) = request_context.extension::<DataFusionContextExtension>() {
+        let df = df_ext.datafusion();
+        if let Some(cache_provider) = df.results_cache_provider()
+            && let Some(stale_duration) = cache_provider.stale_while_revalidate_ttl()
+        {
+            // When serving stale content, set max-age=0 to indicate the response is not fresh
+            // The Results-Cache-Status header will indicate STALE
+            let max_age = if results_cache_status == CacheStatus::CacheStaleWhileRevalidate {
+                0
+            } else {
+                cache_provider.ttl().as_secs()
+            };
+
+            let cache_control_value = format!(
+                "max-age={}, stale-while-revalidate={}",
+                max_age,
+                stale_duration.as_secs()
+            );
+
+            if let Ok(header_value) = HeaderValue::from_str(&cache_control_value) {
+                headers.insert(CACHE_CONTROL, header_value);
+            }
+        }
+    }
 }
 
 /// This is the legacy cache header, preserved for backwards compatibility.
 fn status_to_x_cache_value(results_cache_status: CacheStatus) -> Option<HeaderValue> {
     match results_cache_status {
-        CacheStatus::CacheHit => "Hit from spiceai".parse().ok(),
+        CacheStatus::CacheHit | CacheStatus::CacheStaleWhileRevalidate => {
+            "Hit from spiceai".parse().ok()
+        }
         CacheStatus::CacheMiss => "Miss from spiceai".parse().ok(),
         CacheStatus::CacheDisabled | CacheStatus::CacheBypass => None,
     }
@@ -367,7 +428,7 @@ mod tests {
 
         // Test conversion without SQL
         let result_without_sql =
-            arrow_to_vnd_sql_json_v1(&[batch.clone()], ResponseMetadata::empty())
+            arrow_to_vnd_sql_json_v1(std::slice::from_ref(&batch), ResponseMetadata::empty())
                 .expect("to convert");
         insta::assert_json_snapshot!(
             "vnd_json_v1_without_sql",

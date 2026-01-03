@@ -5,60 +5,59 @@ on:
     branches:
       - trunk
     paths:
-      - "crates/llms/Cargo.toml"
+      - 'crates/llms/Cargo.toml'
   push:
     tags:
       - v*
     paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "README.md"
-      - "Makefile"
-      - "CONTRIBUTING.md"
-      - "SECURITY.md"
-      - "LICENSE"
-      - ".github/**"
-      - "version.txt"
-      - ".schema/**"
-      - ".vscode/**"
-      - "deploy/**"
-      - "install/**"
-      - "media/**"
-      - "monitoring/**"
-      - "acknowledgements.md"
-      - "Dockerfile*"
+      - '**/*.md'
+      - 'docs/**'
+      - 'README.md'
+      - 'Makefile'
+      - 'CONTRIBUTING.md'
+      - 'SECURITY.md'
+      - 'LICENSE'
+      - '.github/**'
+      - 'version.txt'
+      - '.schema/**'
+      - '.vscode/**'
+      - 'deploy/**'
+      - 'install/**'
+      - 'media/**'
+      - 'monitoring/**'
+      - 'acknowledgements.md'
+      - 'Dockerfile*'
 
   workflow_dispatch:
     inputs:
       platform_option:
-        description: "Which platform do you want to run on? (Default is ALL)"
+        description: 'Which platform do you want to run on? (Default is ALL)'
         required: false
         type: choice
         options:
-          - "all"
-          - "Linux x64"
-          - "Windows x64"
-        default: "all"
+          - 'all'
+          - 'Linux x64'
+        default: 'all'
       compute_cap:
-        description: "Which CUDA compute capability to build for? (Default is ALL)"
+        description: 'Which CUDA compute capability to build for? (Default is ALL)'
         required: false
         type: choice
         options:
-          - "all"
-          - "80"
-          - "86"
-          - "87"
-          - "89"
-          - "90"
-        default: "all"
+          - 'all'
+          - '80'
+          - '86'
+          - '87'
+          - '89'
+          - '90'
+        default: 'all'
       profile_option:
-        description: "Which Rust build profile to use? (Default is release)"
+        description: 'Which Rust build profile to use? (Default is release)'
         required: false
         type: choice
         options:
-          - "release"
-          - "release-lto"
-        default: "release"
+          - 'release'
+          - 'release-lto'
+        default: 'release'
 
 jobs:
   setup-matrix:
@@ -69,7 +68,7 @@ jobs:
 
     steps:
       - name: Set up matrix
-        uses: actions/github-script@v7
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         id: setup-matrix
         with:
           script: |
@@ -103,36 +102,6 @@ jobs:
                 runner: "spiceai-large-runners",
                 target_os: "linux",
                 target_arch: "x86_64"
-              },
-              {
-                compute_cap: "80",
-                runner: "windows-latest",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "86",
-                runner: "windows-latest",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "87",
-                runner: "windows-latest",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "89",
-                runner: "windows-latest",
-                target_os: "windows",
-                target_arch: "x86_64"
-              },
-              {
-                compute_cap: "90",
-                runner: "windows-latest",
-                target_os: "windows",
-                target_arch: "x86_64"
               }
             ];
 
@@ -144,8 +113,7 @@ jobs:
 
               // Filter by platform if specified
               if (platform_option !== 'all') {
-                const target_os = platform_option === 'Linux x64' ? 'linux' : 'windows';
-                filtered = filtered.filter(m => m.target_os === target_os);
+                filtered = filtered.filter(m => m.target_os === 'linux');
               }
 
               // Filter by compute capability if specified
@@ -169,20 +137,19 @@ jobs:
     needs: setup-matrix
     env:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
+      CARGO_TERM_COLOR: always
+      CARGO_INCREMENTAL: 0
+      CARGO_NET_GIT_FETCH_WITH_CLI: true
     strategy:
       fail-fast: false
       matrix:
         target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Set REL_VERSION from version.txt
         run: python3 ./.github/scripts/get_release_version.py
-
-      - name: Install Visual Studio Build Tools
-        if: matrix.target.target_os == 'windows'
-        uses: ./.github/actions/install-vs-buildtools
 
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
@@ -206,7 +173,7 @@ jobs:
       - name: Run Spiced CUDA Build
         uses: ./.github/actions/spiced-cuda-build
         with:
-          cuda-version: "12.4.1"
+          cuda-version: '12.4.1'
           cuda-compute-capability: ${{ matrix.target.compute_cap }}
           artifact-tag: ${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
           target_os: ${{ matrix.target.target_os }}
@@ -214,7 +181,7 @@ jobs:
 
   publish-minio:
     name: Publish linux-x86_64 CUDA binaries to Minio
-    runs-on: spiceai-runners
+    runs-on: spiceai-dev-runners
     needs: build
     env:
       ARTIFACT_DIR: ./release
@@ -225,14 +192,14 @@ jobs:
       RUST_PROFILE: ${{ github.event.inputs.profile_option || 'release' }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}
 
       # Download all Linux CUDA artifacts
       - name: Download Linux CUDA artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         continue-on-error: true
         with:
           pattern: spiced_models_cuda_*_linux_x86_64
@@ -265,7 +232,7 @@ jobs:
 
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Create artifact directory
         run: mkdir -p ${{ env.ARTIFACT_DIR }}
@@ -275,7 +242,7 @@ jobs:
 
       # Download all CUDA artifacts for this platform
       - name: Download CUDA artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v6
         continue-on-error: true
         with:
           path: ${{ env.ARTIFACT_DIR }}

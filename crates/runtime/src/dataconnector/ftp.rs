@@ -14,8 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::component::dataset::Dataset;
-use crate::dataconnector::listing::LISTING_TABLE_PARAMETERS;
+use crate::{
+    component::dataset::Dataset, dataconnector::listing::LISTING_TABLE_PARAMETERS,
+    register_data_connector,
+};
 use snafu::prelude::*;
 use std::any::Any;
 use std::future::Future;
@@ -102,6 +104,10 @@ impl ListingTableConnector for FTP {
         &self.params
     }
 
+    fn get_tokio_io_runtime(&self) -> tokio::runtime::Handle {
+        tokio::runtime::Handle::current()
+    }
+
     fn get_object_store_url(
         &self,
         dataset: &Dataset,
@@ -113,7 +119,7 @@ impl ListingTableConnector for FTP {
                 .boxed()
                 .context(super::InvalidConfigurationSnafu {
                     dataconnector: format!("{self}"),
-                    message: format!("{url} is not a valid URL. Ensure the URL is valid and try again.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/ftp"),
+                    message: format!("{url} is not a valid URL. Ensure the URL is valid and try again. For details, visit: https://spiceai.org/docs/components/data-connectors/ftp"),
                     connector_component: ConnectorComponent::from(dataset),
                 })?;
 
@@ -125,3 +131,5 @@ impl ListingTableConnector for FTP {
         Ok(ftp_url)
     }
 }
+
+register_data_connector!("ftp", FTPFactory);

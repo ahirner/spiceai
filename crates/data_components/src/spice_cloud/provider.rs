@@ -31,12 +31,12 @@ use snafu::prelude::*;
 
 use crate::{Read, RefreshableCatalogProvider};
 
-use crate::iceberg::catalog::RestCatalog;
+use crate::iceberg::catalog::rest::RestCatalog;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to load the Spice.ai table '{table}'.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to load the Spice.ai table '{table}'. {source} Report an issue on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     TableProviderCreation {
         table: String,
@@ -44,17 +44,17 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to list namespaces for the Spice Cloud Catalog.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to list namespaces for the Spice Cloud Catalog. {source} Report an issue on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     ListNamespaces { source: iceberg::Error },
 
     #[snafu(display(
-        "Failed to list tables for the Spice Cloud Catalog.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to list tables for the Spice Cloud Catalog. {source} Report an issue on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     ListTables { source: iceberg::Error },
 
     #[snafu(display(
-        "Failed to load the table '{table}'.\n{source}\nReport an issue on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to load the table '{table}'. {source} Report an issue on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     LoadTable {
         source: iceberg::Error,
@@ -62,7 +62,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to find a schema for the table '{table}'.\nVerify the table exists in Spice Cloud, and try again."
+        "Failed to find a schema for the table '{table}'. Verify the table exists in Spice Cloud, and try again."
     ))]
     NoSchemaFound { table: String },
 }
@@ -103,32 +103,27 @@ impl SpiceCloudPlatformCatalogProvider {
 
         let include = include.map(Arc::new);
 
-        let providers = try_join_all(
-            schema_names
-                .iter()
-                .map(|name| {
-                    let mut child_namespace_vec = root_namespace.clone().inner();
-                    let name_inner = name.clone().inner();
-                    let Some(last_name) = name_inner.last() else {
-                        unreachable!("The namespace should have at least one element");
-                    };
-                    child_namespace_vec.push(last_name.to_string());
-                    let Ok(child_namespace) = NamespaceIdent::from_vec(child_namespace_vec) else {
-                        unreachable!("This only panics if the vec is empty");
-                    };
-                    tracing::debug!(
-                        "Creating Spice.ai schema provider for namespace: {:?}",
-                        child_namespace
-                    );
-                    SpiceCloudPlatformSchemaProvider::try_new(
-                        Arc::clone(&client),
-                        child_namespace,
-                        Arc::clone(&connector),
-                        include.clone(),
-                    )
-                })
-                .collect::<Vec<_>>(),
-        )
+        let providers = try_join_all(schema_names.iter().map(|name| {
+            let mut child_namespace_vec = root_namespace.clone().inner();
+            let name_inner = name.clone().inner();
+            let Some(last_name) = name_inner.last() else {
+                unreachable!("The namespace should have at least one element");
+            };
+            child_namespace_vec.push(last_name.to_string());
+            let Ok(child_namespace) = NamespaceIdent::from_vec(child_namespace_vec) else {
+                unreachable!("This only panics if the vec is empty");
+            };
+            tracing::debug!(
+                "Creating Spice.ai schema provider for namespace: {:?}",
+                child_namespace
+            );
+            SpiceCloudPlatformSchemaProvider::try_new(
+                Arc::clone(&client),
+                child_namespace,
+                Arc::clone(&connector),
+                include.clone(),
+            )
+        }))
         .await?;
 
         let schemas: HashMap<String, Arc<dyn SchemaProvider>> = schema_names
@@ -232,33 +227,28 @@ impl SpiceCloudPlatformSchemaProvider {
                             table_name.name().to_string(),
                         ),
                     };
-                if let Some(include) = &include {
-                    if !include.is_match(schema_and_table) {
-                        tracing::debug!("Table {} is not included", table_reference);
-                        return None;
-                    }
+                if let Some(include) = &include
+                    && !include.is_match(schema_and_table)
+                {
+                    tracing::debug!("Table {} is not included", table_reference);
+                    return None;
                 }
                 Some(table_reference)
             })
             .collect::<Vec<_>>();
 
-        let table_providers = try_join_all(
-            included_table_names
-                .iter()
-                .map(|name| {
-                    let connector = Arc::clone(&connector);
-                    async move {
-                        match connector.table_provider(name.clone(), None).await {
-                            Ok(provider) => Ok(provider),
-                            Err(e) => Err(Error::TableProviderCreation {
-                                table: name.to_string(),
-                                source: e,
-                            }),
-                        }
-                    }
-                })
-                .collect::<Vec<_>>(),
-        )
+        let table_providers = try_join_all(included_table_names.iter().map(|name| {
+            let connector = Arc::clone(&connector);
+            async move {
+                match connector.table_provider(name.clone()).await {
+                    Ok(provider) => Ok(provider),
+                    Err(e) => Err(Error::TableProviderCreation {
+                        table: name.to_string(),
+                        source: e,
+                    }),
+                }
+            }
+        }))
         .await?;
 
         let tables: HashMap<String, Arc<dyn TableProvider>> = included_table_names

@@ -14,14 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::hash::Hash;
 use std::sync::Arc;
 
 use arrow::datatypes::DataType;
+use arrow_schema::FieldRef;
+use datafusion::logical_expr::ReturnFieldArgs;
 use datafusion::{
     common::{ExprSchema, Result as DataFusionResult},
     logical_expr::{
-        ColumnarValue, Documentation, ReturnInfo, ReturnTypeArgs, ScalarFunctionArgs,
-        ScalarUDFImpl, Signature,
+        ColumnarValue, Documentation, ScalarFunctionArgs, ScalarUDFImpl, Signature,
         interval_arithmetic::Interval,
         simplify::{ExprSimplifyResult, SimplifyInfo},
         sort_properties::{ExprProperties, SortProperties},
@@ -30,20 +32,20 @@ use datafusion::{
 };
 
 /// Aliases an existing Scalar UDF to a new name.
-#[derive(Debug)]
-pub struct ScalarUDFAlias {
-    scalar_udf: Arc<dyn ScalarUDFImpl>,
+#[derive(Debug, Hash, Eq, PartialEq)]
+pub struct ScalarUDFAlias<T: ScalarUDFImpl + PartialEq + Eq + Hash + 'static> {
+    scalar_udf: Arc<T>,
     alias: &'static str,
 }
 
-impl ScalarUDFAlias {
+impl<T: ScalarUDFImpl + PartialEq + Eq + Hash + 'static> ScalarUDFAlias<T> {
     #[must_use]
-    pub fn new(scalar_udf: Arc<dyn ScalarUDFImpl>, alias: &'static str) -> Self {
+    pub fn new(scalar_udf: Arc<T>, alias: &'static str) -> Self {
         Self { scalar_udf, alias }
     }
 }
 
-impl ScalarUDFImpl for ScalarUDFAlias {
+impl<T: ScalarUDFImpl + PartialEq + Eq + Hash + 'static> ScalarUDFImpl for ScalarUDFAlias<T> {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -64,8 +66,8 @@ impl ScalarUDFImpl for ScalarUDFAlias {
         Ok(self.alias.to_string())
     }
 
-    fn return_type_from_args(&self, args: ReturnTypeArgs) -> DataFusionResult<ReturnInfo> {
-        self.scalar_udf.return_type_from_args(args)
+    fn return_field_from_args(&self, args: ReturnFieldArgs) -> DataFusionResult<FieldRef> {
+        self.scalar_udf.return_field_from_args(args)
     }
 
     #[expect(deprecated)]

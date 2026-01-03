@@ -17,7 +17,6 @@ limitations under the License.
 use crate::Read;
 use crate::unity_catalog::UnityCatalog;
 use crate::{delta_lake::DeltaTable, unity_catalog::Endpoint};
-use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::datasource::TableProvider;
 use datafusion::sql::TableReference;
@@ -25,22 +24,24 @@ use secrecy::SecretString;
 use snafu::prelude::*;
 use std::{collections::HashMap, sync::Arc};
 use token_provider::TokenProvider;
+use tokio::runtime::Handle;
 
 #[derive(Clone)]
 pub struct DatabricksDelta {
     endpoint: Endpoint,
     token_provider: Arc<dyn TokenProvider>,
     storage_options: HashMap<String, SecretString>,
+    io_runtime: Handle,
 }
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "A storage location for the Databricks table '{table_reference}' must be provided.\nSpecify a storage location, and try again."
+        "A storage location for the Databricks table '{table_reference}' must be provided. Specify a storage location, and try again."
     ))]
     TableDoesNotHaveStorageLocation { table_reference: TableReference },
     #[snafu(display(
-        "Failed to find the Databricks table '{table_reference}'.\nVerify the table exists, and try again."
+        "Failed to find the Databricks table '{table_reference}'. Verify the table exists, and try again."
     ))]
     TableDoesNotExist { table_reference: TableReference },
 }
@@ -50,11 +51,13 @@ impl DatabricksDelta {
         endpoint: Endpoint,
         storage_options: HashMap<String, SecretString>,
         token_provider: Arc<dyn TokenProvider>,
+        io_runtime: Handle,
     ) -> Self {
         Self {
             endpoint,
             token_provider,
             storage_options,
+            io_runtime,
         }
     }
 
@@ -77,12 +80,11 @@ impl DatabricksDelta {
             }
         }
 
-        let delta_table = DeltaTable::from(table_uri, storage_options)?;
+        let delta_table = DeltaTable::from(table_uri, storage_options, &self.io_runtime).boxed()?;
 
         Ok(Arc::new(delta_table) as Arc<dyn TableProvider>)
     }
 
-    #[allow(clippy::implicit_hasher)]
     pub async fn resolve_table_uri(
         &self,
         table_reference: TableReference,
@@ -90,7 +92,8 @@ impl DatabricksDelta {
         let uc_client = UnityCatalog::new(
             self.endpoint.clone(),
             Some(Arc::clone(&self.token_provider)),
-        );
+        )
+        .boxed()?;
 
         let table_opt = uc_client.get_table(&table_reference).await.boxed()?;
 
@@ -111,7 +114,6 @@ impl Read for DatabricksDelta {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         self.get_delta_table(table_reference).await
     }

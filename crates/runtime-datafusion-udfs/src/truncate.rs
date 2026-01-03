@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::num::TryFromIntError;
+use std::ops::{Add, Rem, Sub};
 use std::sync::Arc;
 
 use arrow::array::{
@@ -30,7 +31,6 @@ use datafusion::logical_expr::{
 };
 use datafusion::scalar::ScalarValue;
 use snafu::{ResultExt, Snafu, ensure};
-use tract_core::num_traits::Num;
 
 // Maximum truncation width or length, chosen to prevent overflow or excessive memory usage.
 const MAX_TRUNCATE_WIDTH: i64 = i64::MAX / 2;
@@ -62,8 +62,9 @@ impl From<TruncateError> for DataFusionError {
         DataFusionError::External(val.to_string().into())
     }
 }
+pub static TRUNCATE_SCALAR_UDF_NAME: &str = "truncate";
 
-#[derive(Debug)]
+#[derive(Debug, Hash, Eq, PartialEq)]
 pub struct Truncate {
     signature: Signature,
 }
@@ -114,7 +115,7 @@ impl ScalarUDFImpl for Truncate {
     }
 
     fn name(&self) -> &'static str {
-        "truncate"
+        TRUNCATE_SCALAR_UDF_NAME
     }
 
     fn signature(&self) -> &Signature {
@@ -238,7 +239,11 @@ fn compute_truncate_scalar(
 
 fn truncate_numeric<V, W>(v: V, w: W) -> Result<V, TruncateError>
 where
-    V: Num + Copy + TryFrom<W, Error = TryFromIntError>,
+    V: Rem<Output = V>
+        + Add<Output = V>
+        + Sub<Output = V>
+        + Copy
+        + TryFrom<W, Error = TryFromIntError>,
 {
     let w = V::try_from(w).context(WidthCastingFailedSnafu)?;
     Ok(v - (((v % w) + w) % w))
@@ -318,7 +323,8 @@ mod tests {
         Array as _, BinaryArray, Decimal128Array, Int8Array, Int16Array, Int32Array, Int64Array,
         StringArray, UInt8Array, UInt16Array, UInt32Array, UInt64Array,
     };
-    use datafusion::arrow::datatypes::DataType;
+    use arrow_schema::Field;
+    use datafusion::{arrow::datatypes::DataType, config::ConfigOptions};
 
     #[test]
     fn test_truncate_int8_array() {
@@ -329,7 +335,9 @@ mod tests {
                 ColumnarValue::Array(Arc::new(Int8Array::from(vec![101, -1, 0]))),
             ],
             number_rows: 3,
-            return_type: &DataType::Int8,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Int8, false)),
+            config_options: Arc::new(ConfigOptions::new()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -355,7 +363,9 @@ mod tests {
                 ColumnarValue::Array(Arc::new(Int16Array::from(vec![1234, -567, 99]))),
             ],
             number_rows: 3,
-            return_type: &DataType::Int16,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Int16, false)),
+            config_options: Arc::new(ConfigOptions::new()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -389,7 +399,9 @@ mod tests {
                 ColumnarValue::Array(Arc::new(Int32Array::from(vec![101, -1, 0]))),
             ],
             number_rows: 3,
-            return_type: &DataType::Int32,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
+            config_options: Arc::new(ConfigOptions::new()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -415,7 +427,9 @@ mod tests {
                 ColumnarValue::Array(Arc::new(Int64Array::from(vec![1234, -5678, 999]))),
             ],
             number_rows: 3,
-            return_type: &DataType::Int64,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Int64, false)),
+            config_options: Arc::new(ConfigOptions::new()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -449,7 +463,9 @@ mod tests {
                 ColumnarValue::Array(Arc::new(UInt8Array::from(vec![101, 1, 0]))),
             ],
             number_rows: 3,
-            return_type: &DataType::UInt8,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::UInt8, false)),
+            config_options: Arc::new(ConfigOptions::new()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -475,7 +491,9 @@ mod tests {
                 ColumnarValue::Array(Arc::new(UInt16Array::from(vec![1234, 567, 99]))),
             ],
             number_rows: 3,
-            return_type: &DataType::UInt16,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::UInt16, false)),
+            config_options: Arc::new(ConfigOptions::new()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -505,7 +523,9 @@ mod tests {
                 ColumnarValue::Array(Arc::new(UInt32Array::from(vec![1234, 5678, 999]))),
             ],
             number_rows: 3,
-            return_type: &DataType::UInt32,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::UInt32, false)),
+            config_options: Arc::new(ConfigOptions::new()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -539,7 +559,9 @@ mod tests {
                 ColumnarValue::Array(Arc::new(UInt64Array::from(vec![1234, 5678, 999]))),
             ],
             number_rows: 3,
-            return_type: &DataType::UInt64,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::UInt64, false)),
+            config_options: Arc::new(ConfigOptions::new()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -575,7 +597,13 @@ mod tests {
                 ]))),
             ],
             number_rows: 2,
-            return_type: &DataType::Decimal128(10, 2),
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new(
+                "ignored_name",
+                DataType::Decimal128(10, 2),
+                false,
+            )),
+            config_options: Arc::new(ConfigOptions::new()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -608,7 +636,9 @@ mod tests {
                 ColumnarValue::Array(Arc::new(StringArray::from(vec!["iceberg", "spark"]))),
             ],
             number_rows: 2,
-            return_type: &DataType::Utf8,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Utf8, false)),
+            config_options: Arc::new(ConfigOptions::new()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -644,7 +674,9 @@ mod tests {
                 ]))),
             ],
             number_rows: 2,
-            return_type: &DataType::Binary,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Binary, false)),
+            config_options: Arc::new(ConfigOptions::new()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -677,7 +709,9 @@ mod tests {
                 ColumnarValue::Array(Arc::new(Int64Array::from(vec![None, Some(101), None]))),
             ],
             number_rows: 3,
-            return_type: &DataType::Int64,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Int64, false)),
+            config_options: Arc::new(ConfigOptions::new()),
         };
         let result = udf.invoke_with_args(args).expect("invoke UDF");
         if let ColumnarValue::Array(array) = result {
@@ -705,7 +739,9 @@ mod tests {
                 ]))),
             ],
             number_rows: 2,
-            return_type: &DataType::Int64,
+            arg_fields: vec![],
+            return_field: Arc::new(Field::new("ignored_name", DataType::Int64, false)),
+            config_options: Arc::new(ConfigOptions::new()),
         };
         let result = udf.invoke_with_args(args);
         assert!(

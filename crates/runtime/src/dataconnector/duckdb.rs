@@ -14,7 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::{component::dataset::Dataset, datafusion::dialect::new_duckdb_dialect};
+use crate::{
+    component::dataset::Dataset, datafusion::dialect::new_duckdb_dialect, register_data_connector,
+};
 use async_trait::async_trait;
 use data_components::Read;
 use datafusion::datasource::TableProvider;
@@ -38,7 +40,7 @@ use super::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: open\nSpecify a DuckDB file with the `open` parameter"
+        "Missing required parameter: open. Specify a DuckDB file with the `open` parameter"
     ))]
     MissingDuckDBFile,
 }
@@ -167,13 +169,13 @@ impl DataConnector for DuckDB {
             });
         }
 
-        Ok(
-            Read::table_provider(&self.duckdb_factory, path, dataset.schema())
-                .await
-                .context(super::UnableToGetReadProviderSnafu {
-                    dataconnector: "duckdb",
-                    connector_component: ConnectorComponent::from(dataset),
-                })?,
-        )
+        Ok(Read::table_provider(&self.duckdb_factory, path)
+            .await
+            .context(super::UnableToGetReadProviderSnafu {
+                dataconnector: "duckdb",
+                connector_component: ConnectorComponent::from(dataset),
+            })?)
     }
 }
+
+register_data_connector!("duckdb", DuckDBFactory);

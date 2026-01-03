@@ -17,16 +17,22 @@ limitations under the License.
 use std::{collections::HashMap, sync::Arc};
 
 use super::{
-    Dataset, Error, Mode, ReadyState, Result, TimeFormat, UnsupportedTypeAction, acceleration,
-    replication, validate_identifier,
+    CheckAvailability, Dataset, Error, ReadyState, Result, TimeFormat, UnsupportedTypeAction,
+    acceleration, replication, validate_identifier,
 };
-use crate::{Runtime, component::dataset::acceleration::Engine};
+use crate::Runtime;
+use crate::component::access::AccessMode;
 use app::App;
 use datafusion::sql::TableReference;
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde_json::Value;
 use snafu::prelude::*;
 use spicepod::{
-    component::{dataset as spicepod_dataset, embeddings::ColumnEmbeddingConfig},
+    acceleration as spicepod_acceleration,
+    component::{
+        dataset::{self as spicepod_dataset},
+        embeddings::ColumnEmbeddingConfig,
+    },
     metric::Metrics,
     param::Params,
     semantic::Column,
@@ -36,7 +42,7 @@ use spicepod::{
 pub struct DatasetBuilder {
     pub from: String,
     pub name: TableReference,
-    pub mode: Mode,
+    pub access: AccessMode,
     pub params: HashMap<String, String>,
     pub metadata: HashMap<String, String>,
     pub columns: Vec<Column>,
@@ -47,6 +53,7 @@ pub struct DatasetBuilder {
     pub time_partition_column: Option<String>,
     pub time_partition_format: Option<TimeFormat>,
     pub acceleration: Option<acceleration::Acceleration>,
+    pub acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior,
     pub embeddings: Vec<ColumnEmbeddingConfig>,
     pub app: Option<Arc<App>>,
     pub unsupported_type_action: Option<UnsupportedTypeAction>,
@@ -54,13 +61,14 @@ pub struct DatasetBuilder {
     pub metrics: Metrics,
     pub runtime: Option<Arc<Runtime>>,
     pub vectors: Option<VectorStore>,
+    pub check_availability: CheckAvailability,
 }
 
 impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
     type Error = crate::Error;
 
     fn try_from(dataset: spicepod_dataset::Dataset) -> std::result::Result<Self, Self::Error> {
-        #[allow(deprecated)]
+        #[expect(deprecated)]
         let ready_state = match dataset.acceleration.as_ref().map(|a| a.ready_state) {
             Some(Some(ready_state)) => {
                 tracing::warn!(
@@ -72,7 +80,14 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             _ => ReadyState::from(dataset.ready_state),
         };
 
-        let mut acceleration = dataset
+        let acceleration_snapshot_behavior = dataset
+            .acceleration
+            .as_ref()
+            .map_or(spicepod_acceleration::SnapshotBehavior::Disabled, |a| {
+                a.snapshots
+            });
+
+        let acceleration = dataset
             .acceleration
             .map(acceleration::Acceleration::try_from)
             .transpose()?;
@@ -83,24 +98,19 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
 
         // If the dataset is enabled for a vector engine, use this instead of JIT.
         if let Some(vector_engine) = &dataset.vectors {
-            // We have a vector engine configured with no explicit acceleration, add the void acceleration to force indexing.
-            tracing::debug!(
-                "Dataset {} configured for vector engine and no explicit acceleration, adding void acceleration for indexing.",
-                dataset.name
-            );
+            // We have a vector engine configured with no explicit acceleration - no indexing will happen.
             if vector_engine.enabled && acceleration.is_none() {
-                acceleration = Some(acceleration::Acceleration {
-                    enabled: true,
-                    engine: Engine::Void,
-                    ..Default::default()
-                });
+                tracing::warn!(
+                    "Dataset {} configured with 'vector_engine: enabled' but acceleration is disabled. Vector indexing will not occur. Enable acceleration with `acceleration.enabled: true` to use vector search.",
+                    dataset.name
+                );
             }
         }
 
         Ok(DatasetBuilder {
             from: dataset.from,
             name: table_reference,
-            mode: Mode::from(dataset.mode),
+            access: AccessMode::from(dataset.access),
             params: dataset
                 .params
                 .as_ref()
@@ -122,6 +132,7 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             time_partition_format: dataset.time_partition_format.map(TimeFormat::from),
             embeddings: dataset.embeddings,
             acceleration,
+            acceleration_snapshot_behavior,
             app: None,
             unsupported_type_action: dataset
                 .unsupported_type_action
@@ -130,16 +141,18 @@ impl TryFrom<spicepod_dataset::Dataset> for DatasetBuilder {
             metrics: dataset.metrics.unwrap_or_default(),
             runtime: None,
             vectors: dataset.vectors,
+            check_availability: CheckAvailability::from(dataset.check_availability),
         })
     }
 }
 
 impl DatasetBuilder {
+    #[expect(clippy::result_large_err)]
     pub fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
         Ok(DatasetBuilder {
             from,
             name: Self::parse_table_reference(name)?,
-            mode: Mode::default(),
+            access: AccessMode::default(),
             params: HashMap::default(),
             metadata: HashMap::default(),
             columns: Vec::default(),
@@ -150,6 +163,7 @@ impl DatasetBuilder {
             time_partition_column: None,
             time_partition_format: None,
             acceleration: None,
+            acceleration_snapshot_behavior: spicepod_acceleration::SnapshotBehavior::Disabled,
             embeddings: Vec::default(),
             app: None,
             unsupported_type_action: None,
@@ -157,9 +171,11 @@ impl DatasetBuilder {
             metrics: Metrics::default(),
             runtime: None,
             vectors: None,
+            check_availability: CheckAvailability::default(),
         })
     }
 
+    #[expect(clippy::result_large_err)]
     pub(crate) fn parse_table_reference(
         name: &str,
     ) -> std::result::Result<TableReference, crate::Error> {
@@ -211,7 +227,7 @@ impl DatasetBuilder {
         self
     }
 
-    pub fn build(self) -> Result<Dataset> {
+    pub fn build(mut self) -> Result<Dataset> {
         let app = self.app.ok_or(Error::UnableToBuildDataset {
             dataset: self.name.to_string(),
             missing_component: "app".to_string(),
@@ -221,10 +237,19 @@ impl DatasetBuilder {
             missing_component: "runtime".to_string(),
         })?;
 
+        if let Some(acceleration) = self.acceleration.as_mut() {
+            acceleration.snapshot_behavior = SnapshotBehavior::from(
+                app.snapshots.clone(),
+                self.acceleration_snapshot_behavior,
+                runtime.secrets_weak(),
+                runtime.tokio_io_runtime(),
+            );
+        }
+
         let dataset = Dataset {
             from: self.from,
             name: self.name,
-            mode: self.mode,
+            access: self.access,
             params: self.params,
             metadata: self.metadata,
             columns: self.columns,
@@ -237,12 +262,12 @@ impl DatasetBuilder {
             acceleration: self.acceleration,
             embeddings: self.embeddings,
             app,
-            schema: None,
             unsupported_type_action: self.unsupported_type_action,
             ready_state: self.ready_state,
             metrics: self.metrics,
             runtime,
             vectors: self.vectors,
+            check_availability: self.check_availability,
         };
 
         Ok(dataset)

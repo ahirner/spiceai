@@ -16,36 +16,42 @@ limitations under the License.
 
 use crate::rate_limit::RateLimiter;
 
-use super::{Result, client::GraphQLClient};
+use super::{Result, client::GraphQLClient, client::UnnestBehavior};
 use arrow::datatypes::SchemaRef;
+use runtime_rate_control::RateController;
 use std::sync::Arc;
 use token_provider::TokenProvider;
+use tokio::sync::Semaphore;
 
 use url::Url;
 
 pub struct GraphQLClientBuilder {
     endpoint: Url,
     json_pointer: Option<Arc<str>>,
-    unnest_depth: usize,
+    unnest_behavior: UnnestBehavior,
     token_provider: Option<Arc<dyn TokenProvider>>,
     user: Option<String>,
     pass: Option<String>,
     schema: Option<SchemaRef>,
     rate_limiter: Option<Arc<dyn RateLimiter>>,
+    rate_controller: Option<Arc<RateController>>,
+    semaphore: Option<Arc<Semaphore>>,
 }
 
 impl GraphQLClientBuilder {
     #[must_use]
-    pub fn new(endpoint: Url, unnest_depth: usize) -> Self {
+    pub fn new(endpoint: Url, unnest_behavior: UnnestBehavior) -> Self {
         Self {
             endpoint,
-            unnest_depth,
+            unnest_behavior,
             json_pointer: None,
             token_provider: None,
             user: None,
             pass: None,
             schema: None,
             rate_limiter: None,
+            rate_controller: None,
+            semaphore: None,
         }
     }
 
@@ -85,6 +91,18 @@ impl GraphQLClientBuilder {
         self
     }
 
+    #[must_use]
+    pub fn with_rate_controller(mut self, rate_controller: Option<Arc<RateController>>) -> Self {
+        self.rate_controller = rate_controller;
+        self
+    }
+
+    #[must_use]
+    pub fn with_semaphore(mut self, semaphore: Option<Arc<Semaphore>>) -> Self {
+        self.semaphore = semaphore;
+        self
+    }
+
     pub fn build(self, client: reqwest::Client) -> Result<GraphQLClient> {
         GraphQLClient::new(
             client,
@@ -93,9 +111,11 @@ impl GraphQLClientBuilder {
             self.token_provider,
             self.user,
             self.pass,
-            self.unnest_depth,
+            self.unnest_behavior,
             self.schema,
             self.rate_limiter,
+            self.rate_controller,
+            self.semaphore,
         )
     }
 }

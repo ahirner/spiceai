@@ -23,10 +23,10 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use arrow_sql_gen::clickhouse::block_to_arrow;
 use async_stream::stream;
 use clickhouse_rs::{Block, ClientHandle, Pool};
-use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
     self, AsyncDbConnection, DbConnection,
 };
@@ -68,7 +68,7 @@ impl ClickhouseConnection {
     }
 }
 
-impl<'a> DbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
+impl<'a> DbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -77,7 +77,7 @@ impl<'a> DbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
         self
     }
 
-    fn as_async(&self) -> Option<&dyn AsyncDbConnection<ClientHandle, &'a (dyn Sync)>> {
+    fn as_async(&self) -> Option<&dyn AsyncDbConnection<ClientHandle, &'a dyn Sync>> {
         Some(self)
     }
 }
@@ -86,10 +86,62 @@ impl<'a> DbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
 // Looks like we don't actually pass any params to query_arrow.
 // But keep it in mind.
 #[async_trait::async_trait]
-impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnection {
+impl<'a> AsyncDbConnection<ClientHandle, &'a dyn Sync> for ClickhouseConnection {
     // Required by trait, but not used.
     fn new(_: ClientHandle) -> Self {
         unreachable!()
+    }
+
+    async fn tables(&self, schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        let mut conn = self.conn.lock().await;
+        let conn = &mut *conn;
+
+        // Escape single quotes by doubling them to prevent SQL injection
+        let escaped_schema = schema.replace('\'', "''");
+        let query = format!("SELECT name FROM system.tables WHERE database = '{escaped_schema}'");
+
+        let block = conn
+            .query(&query)
+            .fetch_all()
+            .await
+            .boxed()
+            .map_err(|e| dbconnection::Error::UnableToGetTables { source: e })?;
+
+        block
+            .rows()
+            .map(|row| {
+                let name: String = row
+                    .get("name")
+                    .boxed()
+                    .map_err(|e| dbconnection::Error::UnableToGetTables { source: e })?;
+                Ok(name)
+            })
+            .collect()
+    }
+
+    async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
+        let mut conn = self.conn.lock().await;
+        let conn = &mut *conn;
+
+        let query = "SELECT name FROM system.databases WHERE name NOT IN ('system', 'information_schema', 'INFORMATION_SCHEMA')";
+
+        let block = conn
+            .query(query)
+            .fetch_all()
+            .await
+            .boxed()
+            .map_err(|e| dbconnection::Error::UnableToGetSchemas { source: e })?;
+
+        block
+            .rows()
+            .map(|row| {
+                let name: String = row
+                    .get("name")
+                    .boxed()
+                    .map_err(|e| dbconnection::Error::UnableToGetSchemas { source: e })?;
+                Ok(name)
+            })
+            .collect()
     }
 
     async fn get_schema(
@@ -101,12 +153,15 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
 
         let (database, table) = match table_reference {
             TableReference::Full { schema, table, .. }
-            | TableReference::Partial { schema, table } => (schema, table),
-            TableReference::Bare { table } => (&self.db, table),
+            | TableReference::Partial { schema, table } => (schema.as_ref(), table.as_ref()),
+            TableReference::Bare { table } => (self.db.as_ref(), table.as_ref()),
         };
 
+        // Escape single quotes by doubling them to prevent SQL injection
+        let escaped_database = database.replace('\'', "''");
+        let escaped_table = table.replace('\'', "''");
         let query = format!(
-            "SELECT name, type FROM system.columns WHERE database = '{database}' AND table = '{table}'",
+            "SELECT name, type FROM system.columns WHERE database = '{escaped_database}' AND table = '{escaped_table}'",
         );
 
         let block = conn
@@ -134,7 +189,7 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
     async fn query_arrow(
         &self,
         sql: &str,
-        _: &[&'a (dyn Sync)],
+        _: &[&'a dyn Sync],
         _projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         let conn = self.pool.get_handle().await.context(ConnectionPoolSnafu)?;
@@ -161,7 +216,7 @@ impl<'a> AsyncDbConnection<ClientHandle, &'a (dyn Sync)> for ClickhouseConnectio
     async fn execute(
         &self,
         query: &str,
-        _: &[&'a (dyn Sync)],
+        _: &[&'a dyn Sync],
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut conn = self.conn.lock().await;
         let conn = &mut *conn;

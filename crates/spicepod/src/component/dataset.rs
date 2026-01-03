@@ -23,19 +23,11 @@ use serde_json::Value;
 
 use super::{Nameable, WithDependsOn, embeddings::ColumnEmbeddingConfig, is_default};
 use crate::acceleration::Acceleration;
+use crate::component::access::AccessMode;
 use crate::metric::Metrics;
 use crate::param::Params;
 use crate::semantic::Column;
 use crate::vector::VectorStore;
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
-#[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "snake_case")]
-pub enum Mode {
-    #[default]
-    Read,
-    ReadWrite,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -80,6 +72,18 @@ pub enum ReadyState {
     OnRegistration,
 }
 
+/// Controls whether the federated table periodically has its availability checked.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum CheckAvailability {
+    /// The dataset is checked for availability if it isn't accelerated.
+    #[default]
+    Auto,
+    /// The dataset is not checked for availability.
+    Disabled,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -99,8 +103,8 @@ pub struct Dataset {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub columns: Vec<Column>,
 
-    #[serde(default, skip_serializing_if = "is_default")]
-    pub mode: Mode,
+    #[serde(default, skip_serializing_if = "is_default", alias = "mode")]
+    pub access: AccessMode,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub params: Option<Params>,
@@ -143,6 +147,12 @@ pub struct Dataset {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vectors: Option<VectorStore>,
+
+    /// Configures whether the dataset availability monitor is enabled for this dataset.
+    /// When enabled, the runtime will periodically check dataset availability
+    /// and report metrics. Dataset availability is only checked if the dataset is not accelerated.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub check_availability: CheckAvailability,
 }
 
 impl Nameable for Dataset {
@@ -160,7 +170,7 @@ impl Dataset {
             description: None,
             metadata: HashMap::default(),
             columns: Vec::default(),
-            mode: Mode::default(),
+            access: AccessMode::default(),
             params: None,
             has_metadata_table: None,
             replication: None,
@@ -175,6 +185,15 @@ impl Dataset {
             ready_state: ReadyState::default(),
             metrics: None,
             vectors: None,
+            check_availability: CheckAvailability::default(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_params(self, params: Params) -> Self {
+        Self {
+            params: Some(params),
+            ..self
         }
     }
 
@@ -217,6 +236,18 @@ impl Dataset {
 
         Some(primary_keys)
     }
+
+    #[must_use]
+    pub fn metadata(&self) -> HashMap<String, String> {
+        let mut metadata = HashMap::new();
+        if let Some(d) = self.description.as_ref() {
+            metadata.insert("description".to_string(), d.to_string());
+        }
+        for (k, v) in &self.metadata {
+            metadata.insert(k.to_string(), v.to_string());
+        }
+        metadata
+    }
 }
 
 impl WithDependsOn<Dataset> for Dataset {
@@ -227,7 +258,7 @@ impl WithDependsOn<Dataset> for Dataset {
             description: self.description.clone(),
             metadata: self.metadata.clone(),
             columns: self.columns.clone(),
-            mode: self.mode.clone(),
+            access: self.access.clone(),
             params: self.params.clone(),
             has_metadata_table: self.has_metadata_table,
             replication: self.replication.clone(),
@@ -242,6 +273,7 @@ impl WithDependsOn<Dataset> for Dataset {
             ready_state: self.ready_state,
             metrics: self.metrics.clone(),
             vectors: self.vectors.clone(),
+            check_availability: self.check_availability,
         }
     }
 }
@@ -270,6 +302,7 @@ pub enum InvalidTypeAction {
 }
 
 /// Helper struct for deserializing Dataset with custom logic for handling `InvalidTypeAction` migration
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DatasetDeserializer {
@@ -282,8 +315,8 @@ struct DatasetDeserializer {
     metadata: HashMap<String, Value>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     columns: Vec<Column>,
-    #[serde(default, skip_serializing_if = "is_default")]
-    mode: Mode,
+    #[serde(default, skip_serializing_if = "is_default", alias = "mode")]
+    access: AccessMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     params: Option<Params>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -316,9 +349,11 @@ struct DatasetDeserializer {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     vectors: Option<VectorStore>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    check_availability: CheckAvailability,
 }
 
-#[allow(deprecated)]
+#[expect(deprecated)]
 impl TryFrom<DatasetDeserializer> for Dataset {
     type Error = String;
 
@@ -351,7 +386,7 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             description: deserializer.description,
             metadata: deserializer.metadata,
             columns: deserializer.columns,
-            mode: deserializer.mode,
+            access: deserializer.access,
             params: deserializer.params,
             has_metadata_table: deserializer.has_metadata_table,
             replication: deserializer.replication,
@@ -366,12 +401,50 @@ impl TryFrom<DatasetDeserializer> for Dataset {
             ready_state: deserializer.ready_state,
             metrics: deserializer.metrics,
             vectors: deserializer.vectors,
+            check_availability: deserializer.check_availability,
         })
     }
 }
 
 #[cfg(test)]
-#[allow(deprecated)]
+mod check_availability_tests {
+    use super::*;
+    use serde_yaml;
+
+    #[test]
+    fn test_check_availability_enabled_by_default() {
+        let yaml = r"
+            name: test
+            from: file://test.csv
+        ";
+        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.check_availability, CheckAvailability::Auto);
+    }
+
+    #[test]
+    fn test_check_availability_disabled_via_config() {
+        let yaml = r"
+            name: test
+            from: file://test.csv
+            check_availability: disabled
+        ";
+        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.check_availability, CheckAvailability::Disabled);
+    }
+
+    #[test]
+    fn test_check_availability_enabled_via_config() {
+        let yaml = r"
+            name: test
+            from: file://test.csv
+            check_availability: auto
+        ";
+        let dataset: Dataset = serde_yaml::from_str(yaml).expect("Failed to parse Dataset");
+        assert_eq!(dataset.check_availability, CheckAvailability::Auto);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use serde_yaml;

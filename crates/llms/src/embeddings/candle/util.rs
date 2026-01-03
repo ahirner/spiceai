@@ -18,7 +18,7 @@ use crate::embeddings::{
     Error, FailedToInstantiateEmbeddingModelSnafu, FailedWithHFApiSnafu, Result,
     candle::ModelConfig,
 };
-use async_openai::types::EmbeddingInput;
+use async_openai::types::embeddings::EmbeddingInput;
 use hf_hub::{
     Repo, RepoType,
     api::tokio::{ApiBuilder, ApiRepo},
@@ -32,7 +32,7 @@ use std::{
 };
 use tei_backend::{Pool, download_safetensors};
 use tei_core::{
-    download::{ST_CONFIG_NAMES, download_artifacts, download_st_config},
+    download::{ST_CONFIG_NAMES, download_artifacts},
     tokenization::EncodingInput,
 };
 
@@ -99,9 +99,24 @@ pub(crate) fn inputs_from_openai(input: &EmbeddingInput) -> Vec<EncodingInput> {
 }
 
 fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<&str>) -> Result<ApiRepo> {
-    let api = ApiBuilder::new()
+    let mut builder = ApiBuilder::new()
         .with_progress(false)
-        .with_token(hf_token.map(ToString::to_string))
+        .with_token(hf_token.map(ToString::to_string));
+
+    if let Ok(cache_dir) = std::env::var("HF_HUB_CACHE") {
+        let cache_path: PathBuf = cache_dir.into();
+        if cache_path.exists() {
+            tracing::debug!("Using HF_HUB_CACHE directory {:?}", cache_path);
+            builder = builder.with_cache_dir(cache_path);
+        } else {
+            tracing::debug!(
+                "HF_HUB_CACHE directory {:?} does not exist, ignoring.",
+                cache_path
+            );
+        }
+    }
+
+    let api = builder
         .build()
         .boxed()
         .context(FailedToInstantiateEmbeddingModelSnafu)?;
@@ -111,7 +126,7 @@ fn get_api(model_id: &str, revision: Option<&str>, hf_token: Option<&str>) -> Re
     } else {
         Repo::new(model_id.to_string(), RepoType::Model)
     };
-    let api_repo = api.repo(repo.clone());
+    let api_repo = api.repo(repo);
 
     Ok(api_repo)
 }
@@ -161,10 +176,6 @@ pub(crate) async fn download_hf_artifacts(
         .await
         .context(FailedWithHFApiSnafu)?;
 
-    tracing::trace!("Downloading sentence transformer config for {repo_url}");
-    let _ = download_st_config(&api_repo)
-        .await
-        .context(FailedWithHFApiSnafu)?;
     Ok(root_dir)
 }
 
@@ -206,7 +217,7 @@ pub(crate) fn max_seq_length_from_st_config(
 ///
 /// ```
 ///
-#[allow(clippy::implicit_hasher)]
+#[expect(clippy::implicit_hasher)]
 pub fn link_files_into_tmp_dir(files: HashMap<String, PathBuf>) -> Result<PathBuf> {
     let temp_dir = tempdir()
         .boxed()

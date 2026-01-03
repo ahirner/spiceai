@@ -14,19 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use arrow::util::pretty::pretty_format_batches;
+use futures::StreamExt;
 use std::collections::HashMap;
 use std::fmt;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+use tracing::Instrument;
 
-use futures::future::BoxFuture;
-use opentelemetry::trace::{SpanId, TraceError};
-use opentelemetry_sdk::export::trace::{ExportResult, SpanData, SpanExporter};
-use spicepod::component::runtime::TaskHistoryCapturedOutput;
+use opentelemetry::trace::SpanId;
+use opentelemetry_sdk::{
+    error::{OTelSdkError, OTelSdkResult},
+    trace::{SpanData, SpanExporter},
+};
+use spicepod::component::runtime::{TaskHistoryCapturedOutput, TaskHistoryCapturedPlan};
 
 use crate::datafusion::DataFusion;
 
 use super::TaskSpan;
+
+/// Label key used to identify plan capture spans in OpenTelemetry traces.
+/// This is used to override the default behavior of `captured_output` processing to ensure that
+/// plan capture spans always retain their output.
+const PLAN_CAPTURE_LABEL: &str = "plan_capture";
 
 macro_rules! extract_attr {
     ($span:expr, $key:expr) => {
@@ -44,6 +54,9 @@ macro_rules! extract_attr {
 pub struct TaskHistoryExporter {
     df: Arc<DataFusion>,
     captured_output: TaskHistoryCapturedOutput,
+    min_sql_duration_ms: Option<f64>,
+    captured_plan: TaskHistoryCapturedPlan,
+    min_plan_duration_ms: Option<f64>,
 }
 
 impl Debug for TaskHistoryExporter {
@@ -53,14 +66,27 @@ impl Debug for TaskHistoryExporter {
 }
 
 impl TaskHistoryExporter {
-    pub fn new(df: Arc<DataFusion>, captured_output: TaskHistoryCapturedOutput) -> Self {
+    pub fn new(
+        df: Arc<DataFusion>,
+        captured_output: TaskHistoryCapturedOutput,
+        min_sql_duration_ms: Option<f64>,
+        captured_plan: TaskHistoryCapturedPlan,
+        min_plan_duration_ms: Option<f64>,
+    ) -> Self {
         Self {
             df,
             captured_output,
+            min_sql_duration_ms,
+            captured_plan,
+            min_plan_duration_ms,
         }
     }
 
-    fn process_output(&self, output: Arc<str>) -> Arc<str> {
+    fn process_output(&self, output: Arc<str>, force_capture: bool) -> Arc<str> {
+        if force_capture {
+            return output;
+        }
+
         match self.captured_output {
             TaskHistoryCapturedOutput::None => "".into(),
             TaskHistoryCapturedOutput::Truncated => output,
@@ -73,6 +99,90 @@ impl TaskHistoryExporter {
 
     fn is_valid_traceid(trace_id: &Arc<str>) -> bool {
         trace_id.len() == 32 && trace_id.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    /// Asynchronously captures query plans for spans that meet the threshold.
+    /// This runs on a separate tokio task to avoid blocking the original query.
+    /// The spans passed to this method have already been filtered by the caller.
+    ///
+    /// For each span, this runs an EXPLAIN query which will create a new `task_history` entry
+    /// with `task="sql_query"` and the original query's `span_id` as `parent_span_id`.
+    /// The output is always captured in full regardless of the global `captured_output` setting.
+    async fn capture_plans_async(
+        df: Arc<DataFusion>,
+        spans: Vec<TaskSpan>,
+        captured_plan: TaskHistoryCapturedPlan,
+        _min_plan_duration_ms: Option<f64>,
+    ) {
+        for span in spans {
+            let explain_query = match captured_plan {
+                TaskHistoryCapturedPlan::None => continue,
+                TaskHistoryCapturedPlan::Explain => {
+                    format!("EXPLAIN {}", span.input.as_ref())
+                }
+                TaskHistoryCapturedPlan::ExplainAnalyze => {
+                    format!("EXPLAIN ANALYZE {}", span.input.as_ref())
+                }
+            };
+
+            // Create a tracing span for the plan capture with "plan" task override
+            // This will create a task_history entry as a child of the original query
+            let plan_span = tracing::span!(
+                target: "task_history",
+                tracing::Level::INFO,
+                "plan",
+                input = %explain_query,
+                runtime_query = true,
+                plan_capture = true
+            );
+            plan_span.record("parent_id", span.span_id.as_ref());
+
+            // Run EXPLAIN query within the span context so it appears as a child task
+            async {
+                match df.query_builder(&explain_query).build().run().await {
+                    Ok(mut result) => {
+                        // Collect all record batches from the result stream
+                        let mut batches = Vec::new();
+                        while let Some(batch) = result.data.next().await {
+                            match batch {
+                                Ok(b) => batches.push(b),
+                                Err(e) => {
+                                    tracing::debug!(
+                                        "Failed to read EXPLAIN result batch for span_id {}: {}",
+                                        span.span_id,
+                                        e
+                                    );
+                                    return;
+                                }
+                            }
+                        }
+
+                        match pretty_format_batches(&batches) {
+                            Ok(formatted) => {
+                                let output = formatted.to_string();
+                                tracing::info!(target: "task_history", captured_output = %output);
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "Failed to format EXPLAIN output for span_id {}: {}",
+                                    span.span_id,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            "Failed to run EXPLAIN query for span_id {}: {}",
+                            span.span_id,
+                            e
+                        );
+                    }
+                }
+            }
+            .instrument(plan_span)
+            .await;
+        }
     }
 
     fn span_to_task_span(&self, span: SpanData) -> TaskSpan {
@@ -108,9 +218,6 @@ impl TaskHistoryExporter {
                 tracing::warn!("User provided 'parent_id'='{}' is a invalid span id. Must be a 32 character hex string.", Arc::clone(&trace_id));
                 None
             });
-
-        let captured_output: Option<Arc<str>> =
-            extract_attr!(span, "captured_output").map(|output| self.process_output(output));
 
         let start_time = span.start_time;
         let end_time = span.end_time;
@@ -157,6 +264,17 @@ impl TaskHistoryExporter {
             labels.insert("runtime_query".into(), "true".into());
         }
 
+        let plan_capture = span.attributes.iter().any(|kv| {
+            kv.key.as_str() == PLAN_CAPTURE_LABEL
+                && matches!(kv.value, opentelemetry::Value::Bool(true))
+        });
+        if plan_capture {
+            labels.insert(PLAN_CAPTURE_LABEL.into(), "true".into());
+        }
+
+        let captured_output: Option<Arc<str>> = extract_attr!(span, "captured_output")
+            .map(|output| self.process_output(output, plan_capture));
+
         // Remove trace_id and parent_id from `labels`, if they exist (no issue if they don't).
         labels.remove(&Into::<Arc<str>>::into("trace_id"));
         labels.remove(&Into::<Arc<str>>::into("parent_id"));
@@ -180,28 +298,99 @@ impl TaskHistoryExporter {
 }
 
 impl SpanExporter for TaskHistoryExporter {
-    fn export(&mut self, batch: Vec<SpanData>) -> BoxFuture<'static, ExportResult> {
+    fn export(
+        &self,
+        batch: Vec<SpanData>,
+    ) -> impl std::future::Future<Output = OTelSdkResult> + Send {
+        let min_sql_duration_ms = self.min_sql_duration_ms;
+        let captured_plan = self.captured_plan.clone();
+        let min_plan_duration_ms = self.min_plan_duration_ms;
+        let df = Arc::clone(&self.df);
+
+        let should_include = |task_span: &TaskSpan| {
+            // Always include plan capture spans regardless of duration since they are already
+            // filtered by min_plan_duration when created.
+            if task_span.labels.contains_key(PLAN_CAPTURE_LABEL) {
+                return true;
+            }
+            min_sql_duration_ms.is_none_or(|min| task_span.execution_duration_ms >= min)
+        };
         let spans: Vec<TaskSpan> = batch
             .into_iter()
             .map(|span| self.span_to_task_span(span))
+            .filter(should_include)
             .collect();
 
-        let df = Arc::clone(&self.df);
-        Box::pin(async move {
-            TaskSpan::write(df, spans)
+        async move {
+            // Separate logic: if plan capture is disabled, write all spans directly
+            if matches!(captured_plan, TaskHistoryCapturedPlan::None) {
+                return TaskSpan::write(Arc::clone(&df), spans)
+                    .await
+                    .map_err(|e| OTelSdkError::InternalFailure(e.to_string()));
+            }
+
+            // Filter spans that need plan capture before cloning
+            let should_capture_plan = |span: &TaskSpan| {
+                // Check min_plan_duration threshold
+                if !min_plan_duration_ms
+                    .is_none_or(|min_duration| span.execution_duration_ms >= min_duration)
+                {
+                    return false;
+                }
+
+                // Only capture plans for sql_query tasks with non-empty input
+                if span.task.as_ref() != "sql_query" || span.input.is_empty() {
+                    return false;
+                }
+
+                // Don't capture plans for queries that are already EXPLAIN queries
+                let input_trimmed = span.input.trim_start();
+                !(input_trimmed.len() >= 7 && input_trimmed[..7].eq_ignore_ascii_case("explain"))
+            };
+
+            // Clone only the spans that need plan capture
+            let spans_for_plan: Vec<TaskSpan> = spans
+                .iter()
+                .filter(|s| should_capture_plan(s))
+                .cloned()
+                .collect();
+
+            // Write all spans first
+            TaskSpan::write(Arc::clone(&df), spans)
                 .await
-                .map_err(|e| TraceError::Other(Box::new(e)))
-        })
+                .map_err(|e| OTelSdkError::InternalFailure(e.to_string()))?;
+
+            // Spawn async task to capture plans for filtered spans
+            // The task runs in the background without blocking the export operation
+            if !spans_for_plan.is_empty() {
+                let df_clone = Arc::clone(&df);
+                let num_spans = spans_for_plan.len();
+                tokio::spawn(async move {
+                    Self::capture_plans_async(
+                        df_clone,
+                        spans_for_plan,
+                        captured_plan,
+                        min_plan_duration_ms,
+                    )
+                    .await;
+
+                    tracing::trace!("Plan capture completed successfully for {num_spans} queries");
+                });
+            }
+
+            Ok(())
+        }
     }
 }
 
-const AUTOGENERATED_LABELS: [&str; 11] = [
+const AUTOGENERATED_LABELS: [&str; 12] = [
     "thread.id",
     "code.namespace",
     "code.lineno",
     "idle_ns",
     "busy_ns",
     "runtime_query",
+    "plan_capture",
     "target",
     "code.filepath",
     "level",

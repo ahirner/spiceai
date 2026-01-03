@@ -20,7 +20,7 @@ use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
 use crate::chat::nsql::{SqlGeneration, json::JsonSchemaSqlGeneration};
 use async_openai::config::Config;
 use async_openai::error::OpenAIError;
-use async_openai::types::{
+use async_openai::types::chat::{
     ChatCompletionRequestMessage, ChatCompletionRequestUserMessage,
     ChatCompletionRequestUserMessageContent, ChatCompletionResponseStream,
     CreateChatCompletionRequest, CreateChatCompletionResponse,
@@ -32,7 +32,7 @@ use tracing_futures::Instrument;
 use super::Openai;
 
 #[async_trait]
-impl<C: Config + Send + Sync> Chat for Openai<C> {
+impl<C: Config + Send + Sync + Clone> Chat for Openai<C> {
     fn as_sql(&self) -> Option<&dyn SqlGeneration> {
         // Only use structured output schema for OpenAI, not openai compatible.
         if self.supports_structured_output() {
@@ -49,7 +49,17 @@ impl<C: Config + Send + Sync> Chat for Openai<C> {
         let outer_model = req.model.clone();
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
+
+        let permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+
         let stream = self.client.chat().create_stream(inner_req).await?;
+
+        drop(permit); // drop the permit after acquiring the stream, instead of after receiving the response
+        // semaphore permits aren't `Copy`, so we can't move it into the closure in `.map_ok`
 
         Ok(Box::pin(stream.map_ok(move |mut s| {
             s.model.clone_from(&outer_model);
@@ -58,7 +68,7 @@ impl<C: Config + Send + Sync> Chat for Openai<C> {
     }
 
     // Custom healthcheck for OpenAI because Azure dosn't support `max_completion_tokens`.
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     async fn health(&self) -> Result<(), crate::chat::Error> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
 
@@ -67,19 +77,26 @@ impl<C: Config + Send + Sync> Chat for Openai<C> {
                 ChatCompletionRequestUserMessage {
                     name: None,
                     content: ChatCompletionRequestUserMessageContent::Text(
-                        "Respond with the single letter 'A'. This is a healthcheck.".to_string(),
+                        "Respond with 'ok'".to_string(),
                     ),
                 },
             )],
             ..Default::default()
         };
-        if self.supports_max_completion_tokens() {
-            req.max_completion_tokens = Some(150);
-        } else {
-            req.max_tokens = Some(150);
+
+        if self.supports_reasoning_effort() {
+            req.reasoning_effort = Some(async_openai::types::chat::ReasoningEffort::Low);
         }
 
-        if let Err(e) = self.chat_request(req).instrument(span.clone()).await {
+        if self.supports_max_completion_tokens() {
+            req.max_completion_tokens = Some(300);
+        } else {
+            req.max_tokens = Some(300);
+        }
+
+        let result = self.chat_request(req).instrument(span.clone()).await;
+        tracing::debug!("{} model health check response: {:?}", self.model, result);
+        if let Err(e) = result {
             tracing::error!(target: "task_history", parent: &span, "{e}");
             return Err(crate::chat::Error::HealthCheckError {
                 source: Box::new(e),
@@ -95,7 +112,16 @@ impl<C: Config + Send + Sync> Chat for Openai<C> {
         let outer_model = req.model.clone();
         let mut inner_req = req.clone();
         inner_req.model.clone_from(&self.model);
+
+        let permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+
         let mut resp = self.client.chat().create(inner_req).await?;
+
+        drop(permit);
 
         resp.model = outer_model;
         Ok(resp)

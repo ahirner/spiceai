@@ -16,22 +16,19 @@ limitations under the License.
 use std::{any::Any, sync::Arc};
 
 use crate::s3_vectors::{
-    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME, vector_table::S3VectorsTable,
+    S3_VECTOR_EMBEDDING_NAME, S3_VECTOR_PRIMARY_KEY_NAME,
+    vector_table::{S3VectorsTable, loosen_vector_schema, send_vector_data},
 };
 
 /// Num of segments to use for parallel `ListVectors` API calls.
 const LIST_S3_VECTORS_NUM_READ_SEGMENTS: usize = 10;
 
 use super::S3VectorIdentifier;
-use arrow::{
-    array::RecordBatch,
-    datatypes::{Schema, SchemaRef},
-    json::ReaderBuilder,
-};
+use arrow::{array::RecordBatch, datatypes::SchemaRef, json::ReaderBuilder};
 use async_trait::async_trait;
 use datafusion::{
     catalog::{Session, TableProvider},
-    common::Constraints,
+    common::{Constraints, project_schema},
     datasource::TableType,
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -57,9 +54,10 @@ use tokio::sync::mpsc::Sender;
 #[derive(Debug, Clone)]
 pub struct S3VectorsListTable(S3VectorsTable);
 
-impl From<S3VectorsTable> for S3VectorsListTable {
-    fn from(tbl: S3VectorsTable) -> Self {
-        Self(tbl)
+impl S3VectorsListTable {
+    #[must_use]
+    pub fn new(table: S3VectorsTable) -> Self {
+        Self(table)
     }
 }
 
@@ -70,7 +68,7 @@ impl TableProvider for S3VectorsListTable {
     }
 
     fn schema(&self) -> SchemaRef {
-        Arc::clone(&self.as_ref().schema)
+        Arc::clone(&self.0.schema)
     }
 
     fn table_type(&self) -> TableType {
@@ -78,10 +76,10 @@ impl TableProvider for S3VectorsListTable {
     }
 
     fn constraints(&self) -> Option<&Constraints> {
-        Some(&self.as_ref().constraints)
+        Some(&self.0.constraints)
     }
 
-    /// S3 vectors ListVectors API operation does not support filtering.
+    /// S3 vectors `ListVectors` API operation does not support filtering.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
@@ -99,7 +97,7 @@ impl TableProvider for S3VectorsListTable {
         _filters: &[Expr],
         limit: Option<usize>,
     ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(S3VectorsListExec::new(self, projection, limit)) as Arc<dyn ExecutionPlan>)
+        Ok(Arc::new(S3VectorsListExec::new(&self.0, projection, limit)) as Arc<dyn ExecutionPlan>)
     }
 }
 
@@ -109,14 +107,8 @@ impl std::fmt::Debug for S3VectorsListExec {
     }
 }
 
-impl AsRef<S3VectorsTable> for S3VectorsListTable {
-    fn as_ref(&self) -> &S3VectorsTable {
-        &self.0
-    }
-}
-
-struct S3VectorsListExec {
-    idx: S3VectorIdentifier,
+pub(super) struct S3VectorsListExec {
+    idx: Arc<S3VectorIdentifier>,
     client: Arc<dyn S3Vectors + Send + Sync>,
     plan_properties: PlanProperties,
     limit: Option<usize>,
@@ -124,26 +116,18 @@ struct S3VectorsListExec {
 
 impl DisplayAs for S3VectorsListExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "S3VectorsListExec")
+        write!(f, "S3VectorsListExec ({}): ", self.idx)
     }
 }
 
 impl S3VectorsListExec {
     pub fn new(
-        table: &S3VectorsListTable,
+        table: &S3VectorsTable,
         projection: Option<&Vec<usize>>,
         limit: Option<usize>,
     ) -> Self {
-        let projected_schema = match projection {
-            Some(proj) => {
-                let fields = proj
-                    .iter()
-                    .map(|&i| table.schema().field(i).clone())
-                    .collect::<Vec<_>>();
-                Arc::new(Schema::new(fields))
-            }
-            None => table.schema(),
-        };
+        let projected_schema =
+            project_schema(&table.schema, projection).unwrap_or_else(|_| Arc::clone(&table.schema));
         let properties = PlanProperties::new(
             EquivalenceProperties::new(projected_schema),
             Partitioning::UnknownPartitioning(1),
@@ -152,8 +136,8 @@ impl S3VectorsListExec {
         );
 
         Self {
-            idx: table.as_ref().idx.clone(),
-            client: Arc::clone(&table.as_ref().client),
+            idx: Arc::clone(&table.idx),
+            client: Arc::clone(&table.client),
             plan_properties: properties,
             limit,
         }
@@ -194,7 +178,7 @@ impl ExecutionPlan for S3VectorsListExec {
         let tx: Sender<DataFusionResult<RecordBatch, DataFusionError>> = builder.tx();
 
         let client = Arc::clone(&self.client);
-        let idx = self.idx.clone();
+        let idx = Arc::clone(&self.idx);
         let limit = self.limit.unwrap_or(usize::MAX);
 
         builder.spawn(async move {
@@ -217,10 +201,9 @@ impl ExecutionPlan for S3VectorsListExec {
 ///
 /// Results are sent to the provided channel as soon as they are available and may arrive out of order
 /// as they read in parallel using multiple segments.
-#[allow(clippy::cast_possible_wrap)]
 async fn list_vector_stream(
     client: Arc<dyn S3Vectors + Send + Sync>,
-    idx: S3VectorIdentifier,
+    idx: Arc<S3VectorIdentifier>,
     schema: SchemaRef,
     limit: usize,
     tx: Sender<DataFusionResult<RecordBatch, DataFusionError>>,
@@ -246,7 +229,7 @@ async fn list_vector_stream(
 
         let task = list_vector_segment(
             Arc::clone(&client),
-            idx.clone(),
+            Arc::clone(&idx),
             Arc::clone(&schema),
             segment_limit,
             segment_idx,
@@ -278,7 +261,7 @@ async fn list_vector_stream(
 
 async fn list_vector_segment(
     client: Arc<dyn S3Vectors + Send + Sync>,
-    idx: S3VectorIdentifier,
+    idx: Arc<S3VectorIdentifier>,
     schema: SchemaRef,
     limit: usize,
     segment_index: usize,
@@ -288,7 +271,8 @@ async fn list_vector_segment(
     let start_segment = std::time::Instant::now();
 
     let (arn, bucket_name, index_name) = idx.index_identifier_variables();
-    let mut decoder = ReaderBuilder::new(Arc::clone(&schema)).build_decoder()?;
+    let (json_schema, vector_sizes) = loosen_vector_schema(&schema);
+    let mut decoder = ReaderBuilder::new(Arc::clone(&json_schema)).build_decoder()?;
 
     let mut remaining_limit = limit;
     let mut next_token = None;
@@ -330,7 +314,7 @@ async fn list_vector_segment(
         let rows: Vec<_> = vectors.into_iter().map(to_flat_value).collect();
         decoder.serialize(rows.as_slice()).map_err(|e| {
             DataFusionError::ArrowError(
-                e,
+                Box::new(e),
                 Some(
                     "could not convert ListVectors JSON response into expected Arrow format"
                         .to_string(),
@@ -339,14 +323,12 @@ async fn list_vector_segment(
         })?;
 
         match decoder.flush() {
-            Ok(Some(rb)) => {
-                let _ = tx.send(Ok(rb)).await;
-            }
+            Ok(Some(rb)) => send_vector_data(&tx, rb, &vector_sizes).await,
             Ok(None) => {}
             Err(e) => {
                 let _ = tx
                     .send(Err(DataFusionError::ArrowError(
-                        e,
+                        Box::new(e),
                         Some("Received only partial JSON payload from ListVectors".to_string()),
                     )))
                     .await;
@@ -375,7 +357,7 @@ fn to_flat_value(output: ListOutputVector) -> serde_json::Value {
         key,
         ..
     } = output;
-    let mut result = document_to_json_map(metadata.unwrap_or_default());
+    let mut result = document_to_json_map(metadata.unwrap_or_default()).unwrap_or_default();
     if let Some(VectorData::Float32(vec)) = data {
         result.insert(
             S3_VECTOR_EMBEDDING_NAME.into(),

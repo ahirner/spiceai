@@ -76,7 +76,7 @@ pub struct SnowflakeConnection {
     pub api: Arc<SnowflakeApi>,
 }
 
-impl<'a> DbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConnection {
+impl<'a> DbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnection {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -85,15 +85,55 @@ impl<'a> DbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConnection
         self
     }
 
-    fn as_async(&self) -> Option<&dyn AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)>> {
+    fn as_async(&self) -> Option<&dyn AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync>> {
         Some(self)
     }
 }
 
 #[async_trait]
-impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConnection {
+impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a dyn Sync> for SnowflakeConnection {
     fn new(api: Arc<SnowflakeApi>) -> Self {
         SnowflakeConnection { api }
+    }
+
+    async fn tables(&self, _schema: &str) -> Result<Vec<String>, dbconnection::Error> {
+        Err(dbconnection::Error::UnableToGetTables {
+            source: "Snowflake tables() not implemented".into(),
+        })
+    }
+
+    async fn schemas(&self) -> Result<Vec<String>, dbconnection::Error> {
+        let query = "SHOW SCHEMAS";
+
+        let res =
+            self.api
+                .exec(query)
+                .await
+                .map_err(|e| dbconnection::Error::UnableToGetSchemas {
+                    source: e.to_string().into(),
+                })?;
+
+        match res {
+            snowflake_api::QueryResult::Arrow(batches) => {
+                let mut schemas = Vec::new();
+                for batch in batches {
+                    if let Some(name_column) = batch.column_by_name("name")
+                        && let Some(array) = name_column
+                            .as_any()
+                            .downcast_ref::<arrow::array::StringArray>()
+                    {
+                        for value in array.iter().flatten() {
+                            schemas.push(value.to_string());
+                        }
+                    }
+                }
+                Ok(schemas)
+            }
+            snowflake_api::QueryResult::Json(_) => Err(dbconnection::Error::UnableToGetSchemas {
+                source: "Expected Arrow response, got JSON".into(),
+            }),
+            snowflake_api::QueryResult::Empty => Ok(Vec::new()),
+        }
     }
 
     async fn get_schema(
@@ -131,7 +171,7 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
     async fn query_arrow(
         &self,
         sql: &str,
-        _: &[&'a (dyn Sync)],
+        _: &[&'a dyn Sync],
         _projected_schema: Option<SchemaRef>,
     ) -> Result<SendableRecordBatchStream, Box<dyn std::error::Error + Send + Sync>> {
         let sql = sql.to_string();
@@ -177,14 +217,14 @@ impl<'a> AsyncDbConnection<Arc<SnowflakeApi>, &'a (dyn Sync)> for SnowflakeConne
     async fn execute(
         &self,
         _query: &str,
-        _: &[&'a (dyn Sync)],
+        _: &[&'a dyn Sync],
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         return NotImplementedSnafu.fail()?;
     }
 }
 
 fn to_execution_error(e: impl Into<Box<dyn std::error::Error>>) -> DataFusionError {
-    DataFusionError::Execution(format!("{}", e.into()).to_string())
+    DataFusionError::Execution(format!("{}", e.into()))
 }
 
 /// Converts `Snowflake` specific types to standard Arrow types.
@@ -227,21 +267,19 @@ pub fn snowflake_schema_cast(record_batch: &RecordBatch) -> Result<RecordBatch, 
                 {
                     if let (Some(precision_str), Some(scale_str)) =
                         (field_metadata.get("precision"), field_metadata.get("scale"))
-                    {
-                        if let (Ok(precision), Ok(scale)) =
+                        && let (Ok(precision), Ok(scale)) =
                             (precision_str.parse::<u8>(), scale_str.parse::<i8>())
-                        {
-                            fields.push(Arc::new(Field::new(
-                                field.name(),
-                                DataType::Decimal128(precision, scale),
-                                field.is_nullable(),
-                            )));
+                    {
+                        fields.push(Arc::new(Field::new(
+                            field.name(),
+                            DataType::Decimal128(precision, scale),
+                            field.is_nullable(),
+                        )));
 
-                            columns.push(cast_sf_fixed_point_number_to_decimal(
-                                column, precision, scale,
-                            )?);
-                            continue;
-                        }
+                        columns.push(cast_sf_fixed_point_number_to_decimal(
+                            column, precision, scale,
+                        )?);
+                        continue;
                     }
                 }
                 _ => {}
@@ -376,7 +414,7 @@ where
     ))
 }
 
-#[allow(clippy::cast_possible_truncation)]
+#[expect(clippy::cast_possible_truncation)]
 fn parse_snowflake_data_type(data_type_str: &str) -> Result<DataType, Error> {
     let data_type: serde_json::Value =
         serde_json::from_str(data_type_str).map_err(|e| Error::UnableToRetrieveSchema {
@@ -580,11 +618,11 @@ mod tests {
             false,
         );
 
-        assert!(result.is_err());
+        result.expect_err("Should fail for missing fraction field");
     }
 
     #[test]
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     fn test_cast_sf_fixed_point_number_to_decimal_i32() {
         let scale = 4i8;
         let data = vec![
@@ -615,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(clippy::cast_possible_truncation)]
     fn test_cast_sf_fixed_point_number_to_decimal_i64() {
         let scale = 9i8;
         let data = vec![
@@ -730,7 +768,7 @@ mod tests {
         ];
 
         let mut builder = StructBuilder::new(
-            fields.clone(),
+            fields,
             vec![
                 Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
                 Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>,
@@ -776,7 +814,7 @@ mod tests {
         ];
 
         let mut builder = StructBuilder::new(
-            fields.clone(),
+            fields,
             vec![
                 Box::new(Int64Builder::new()) as Box<dyn ArrayBuilder>,
                 Box::new(Int32Builder::new()) as Box<dyn ArrayBuilder>,

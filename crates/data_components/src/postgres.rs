@@ -14,7 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session, datasource::TableProvider, logical_expr::Expr, physical_plan::ExecutionPlan,
@@ -30,7 +29,7 @@ use crate::{
 
 use datafusion_table_providers::{
     postgres::{Postgres, PostgresTableFactory, write::PostgresTableWriter},
-    util,
+    sql::sql_provider_datafusion::expr,
 };
 
 #[async_trait]
@@ -38,7 +37,6 @@ impl Read for PostgresTableFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         self.table_provider(table_reference).await
     }
@@ -49,7 +47,6 @@ impl ReadWrite for PostgresTableFactory {
     async fn table_provider(
         &self,
         table_reference: TableReference,
-        _schema: Option<SchemaRef>,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         self.read_write_table_provider(table_reference).await
     }
@@ -83,7 +80,7 @@ impl PostgresDeletionSink {
     }
 }
 
-#[allow(clippy::cast_sign_loss)]
+#[expect(clippy::cast_sign_loss)]
 async fn delete_from(
     table_name: &str,
     transaction: &Transaction<'_>,
@@ -110,12 +107,21 @@ impl DeletionSink for PostgresDeletionSink {
         let mut db_conn = self.postgres.connect().await?;
         let postgres_conn = Postgres::postgres_conn(&mut db_conn)?;
         let tx = postgres_conn.conn.transaction().await?;
-        let count = delete_from(
-            self.postgres.table_name(),
-            &tx,
-            &util::filters_to_sql(&self.filters, None)?,
-        )
-        .await?;
+        // When filters is empty, return 0 to prevent accidental full table deletion.
+        // This is intentional - callers must provide explicit filters for deletion.
+        let count = if self.filters.is_empty() {
+            0
+        } else {
+            let sql_filters: Result<Vec<String>, _> = self
+                .filters
+                .iter()
+                .map(|f| expr::to_sql_with_engine(f, None))
+                .collect();
+            let sql_where = sql_filters
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .join(" AND ");
+            delete_from(self.postgres.table_name(), &tx, &sql_where).await?
+        };
         tx.commit().await?;
 
         Ok(count)

@@ -32,7 +32,7 @@ impl ProgressType {
 #[derive(Clone, Serialize)]
 pub struct Progress {
     #[serde(rename = "type")]
-    progress_type: ProgressType,
+    r#type: ProgressType,
     #[serde(skip_serializing_if = "Option::is_none")]
     id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -60,7 +60,7 @@ impl Progress {
     }
     fn new(progress_type: ProgressType) -> Self {
         Self {
-            progress_type,
+            r#type: progress_type,
             id: None,
             parent_id: None,
             title: None,
@@ -70,8 +70,8 @@ impl Progress {
     }
 
     #[must_use]
-    pub fn id(mut self, id: String) -> Self {
-        self.id = Some(id);
+    pub fn id(mut self, id: Option<String>) -> Self {
+        self.id = id;
         self
     }
 

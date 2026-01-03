@@ -38,8 +38,9 @@ use super::{
     ConnectorComponent, ConnectorParams, DataConnector, DataConnectorError, DataConnectorFactory,
     ParameterSpec,
 };
-use crate::component::dataset::Dataset;
-use crate::federated_table::FederatedTable;
+use crate::{
+    component::dataset::Dataset, federated_table::FederatedTable, register_data_connector,
+};
 use data_components::cdc::{
     self, ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError,
 };
@@ -49,24 +50,24 @@ use data_components::{Read, ReadWrite};
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Missing required parameter: {parameter}. Specify a value.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
+        "Missing required parameter: {parameter}. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#configuration"
     ))]
     MissingRequiredParameter { parameter: String },
 
-    #[snafu(display(r#"Failed to connect to SpiceAI endpoint "{endpoint}".\n{source}\nEnsure the endpoint is valid and reachable"#))]
+    #[snafu(display(r#"Failed to connect to SpiceAI endpoint "{endpoint}". {source} Ensure the endpoint is valid and reachable"#))]
     UnableToVerifyEndpointConnection {
         source: ns_lookup::Error,
         endpoint: String,
     },
 
-    #[snafu(display("Failed to create flight client.\n{source}"))]
+    #[snafu(display("Failed to create flight client. {source}"))]
     UnableToCreateFlightClient { source: flight_client::Error },
 
-    #[snafu(display("Failed to get append stream schema.\n{source}"))]
+    #[snafu(display("Failed to get append stream schema. {source}"))]
     UnableToGetAppendSchema { source: flight_client::Error },
 
     #[snafu(display(
-        "Could not parse <org> or <app> as ASCII: {value}\nEnsure the org and app are valid ASCII strings and retry."
+        "Could not parse <org> or <app> as ASCII: {value} Ensure the org and app are valid ASCII strings and retry."
     ))]
     InvalidMetadataValue {
         value: Arc<str>,
@@ -74,7 +75,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to apply parameter '{parameter}': {source}. Ensure the value is valid and retry.\nFor details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#parameters"
+        "Failed to apply parameter '{parameter}': {source}. Ensure the value is valid and retry. For details, visit: https://spiceai.org/docs/components/data-connectors/spiceai#parameters"
     ))]
     InvalidParameterValue {
         parameter: String,
@@ -222,20 +223,17 @@ fn configure_max_message_size(
     mut flight_client: FlightClient,
     params: &ConnectorParams,
 ) -> Result<FlightClient> {
-    if let Some(app) = params.app.as_ref() {
-        if let Some(flight) = app.runtime.flight.as_ref() {
-            if let Some(max_message_size) =
-                flight
-                    .max_message_size_bytes()
-                    .map_err(|err| Error::InvalidParameterValue {
-                        parameter: "max_message_size".to_string(),
-                        source: err,
-                    })?
-            {
-                flight_client =
-                    flight_client.with_max_message_size(max_message_size, max_message_size);
-            }
-        }
+    if let Some(app) = params.app.as_ref()
+        && let Some(flight) = app.runtime.flight.as_ref()
+        && let Some(max_message_size) =
+            flight
+                .max_message_size_bytes()
+                .map_err(|err| Error::InvalidParameterValue {
+                    parameter: "max_message_size".to_string(),
+                    source: err,
+                })?
+    {
+        flight_client = flight_client.with_max_message_size(max_message_size, max_message_size);
     }
     Ok(flight_client)
 }
@@ -250,8 +248,6 @@ impl DataConnector for SpiceAI {
         &self,
         dataset: &Dataset,
     ) -> super::DataConnectorResult<Arc<dyn TableProvider>> {
-        let dataset_schema = dataset.schema();
-
         let dataset_path = match SpiceAI::spice_dataset_path(dataset) {
             Ok(dataset_path) => dataset_path,
             Err(e) => {
@@ -265,7 +261,7 @@ impl DataConnector for SpiceAI {
 
         let (flight_factory, table_reference) = self.flight_factory(dataset_path);
 
-        match Read::table_provider(&flight_factory, table_reference, dataset_schema).await {
+        match Read::table_provider(&flight_factory, table_reference).await {
             Ok(provider) => Ok(provider),
             Err(e) => {
                 if let Some(data_components::flight::Error::UnableToGetSchema {
@@ -314,13 +310,12 @@ impl DataConnector for SpiceAI {
             SpiceAIDatasetPath::Path(path) => (self.flight_factory.clone(), path),
         };
 
-        let read_write_result =
-            ReadWrite::table_provider(&flight_factory, table_reference, dataset.schema())
-                .await
-                .context(super::UnableToGetReadWriteProviderSnafu {
-                    dataconnector: "spice.ai",
-                    connector_component: ConnectorComponent::from(dataset),
-                });
+        let read_write_result = ReadWrite::table_provider(&flight_factory, table_reference)
+            .await
+            .context(super::UnableToGetReadWriteProviderSnafu {
+                dataconnector: "spice.ai",
+                connector_component: ConnectorComponent::from(dataset),
+            });
 
         Some(read_write_result)
     }
@@ -357,6 +352,8 @@ impl DataConnector for SpiceAI {
         }))
     }
 }
+
+register_data_connector!("spice.ai", SpiceAIFactory);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum SpiceAIDatasetPath {
@@ -412,7 +409,7 @@ pub fn subscribe_to_append_stream(
                             DecodedPayload::None | DecodedPayload::Schema(_) => {},
                             DecodedPayload::RecordBatch(batch) => {
                                 match ChangeBatch::try_new(batch).map(|rb| {
-                                    ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb)
+                                    ChangeEnvelope::new(Box::new(SpiceAIChangeCommiter {}), rb, true)
                                 }) {
                                     Ok(change_batch) => yield Ok(change_batch),
                                     Err(e) => {
@@ -449,7 +446,6 @@ mod tests {
     use crate::component::dataset::builder::DatasetBuilder;
 
     #[tokio::test]
-    #[allow(clippy::too_many_lines)]
     async fn test_spice_dataset_path() {
         let tests = vec![
             (

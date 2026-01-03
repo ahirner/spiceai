@@ -15,6 +15,9 @@ limitations under the License.
 */
 
 use super::{CatalogConnector, ConnectorComponent, ParameterSpec, Parameters};
+use crate::catalogconnector::iceberg::{
+    Error as IcebergError, UnableToBuildCatalogClientSnafu, UnableToBuildCatalogSnafu,
+};
 use crate::component::dataset::builder::DatasetBuilder;
 use crate::{
     App, Runtime,
@@ -28,11 +31,11 @@ use crate::{
 };
 use async_trait::async_trait;
 use data_components::{
-    Read, RefreshableCatalogProvider, iceberg::catalog::RestCatalog,
+    Read, RefreshableCatalogProvider, iceberg::catalog::rest::RestCatalog,
     spice_cloud::provider::SpiceCloudPlatformCatalogProvider,
 };
-use iceberg::NamespaceIdent;
-use iceberg_catalog_rest::RestCatalogConfig;
+use iceberg::{CatalogBuilder, NamespaceIdent};
+use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalogBuilder};
 use snafu::prelude::*;
 use std::{any::Any, collections::HashMap, sync::Arc};
 use tonic::metadata::MetadataValue;
@@ -63,7 +66,7 @@ impl SpiceCloudPlatformCatalog {
         catalog: &Catalog,
     ) -> super::Result<Arc<dyn RefreshableCatalogProvider>> {
         let (org, app, catalog_name) = Self::parse_and_validate_catalog_id(catalog)?;
-        let catalog_client = self.create_rest_catalog_client();
+        let catalog_client = self.create_rest_catalog_client().await?;
         let read_provider = self
             .create_read_provider(runtime, catalog, &org, &app, &catalog_name)
             .await?;
@@ -80,7 +83,7 @@ impl SpiceCloudPlatformCatalog {
         )
         .await
         .map_err(|e| super::Error::UnableToGetCatalogProvider {
-            connector: "iceberg".into(),
+            connector: "spice.ai".into(),
             connector_component: ConnectorComponent::from(catalog),
             source: Box::new(e),
         })?;
@@ -93,7 +96,7 @@ impl SpiceCloudPlatformCatalog {
             return Err(
                 super::Error::InvalidConfigurationNoSource {
                     connector: "spice.ai".into(),
-                    message: "A Catalog Path is required for Spice.ai in the format of: <org>/<app>[/<catalog>] where <catalog> is optional.\nFor details, visit: https://spiceai.org/docs/components/catalogs/spiceai#from".into(),
+                    message: "A Catalog Path is required for Spice.ai in the format of: <org>/<app>[/<catalog>] where <catalog> is optional. For details, visit: https://spiceai.org/docs/components/catalogs/spiceai#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                 },
             );
@@ -104,7 +107,7 @@ impl SpiceCloudPlatformCatalog {
             Err(e) => {
                 Err(super::Error::InvalidConfiguration {
                     connector: "spice.ai".into(),
-                    message: "A Catalog Path is required for Spice.ai in the format of: <org>/<app>[/<catalog>] where <catalog> is optional.\nFor details, visit: https://spiceai.org/docs/components/catalogs/spiceai#from".into(),
+                    message: "A Catalog Path is required for Spice.ai in the format of: <org>/<app>[/<catalog>] where <catalog> is optional. For details, visit: https://spiceai.org/docs/components/catalogs/spiceai#from".into(),
                     connector_component: ConnectorComponent::from(catalog),
                     source: Box::new(e),
                 })
@@ -112,24 +115,30 @@ impl SpiceCloudPlatformCatalog {
         }
     }
 
-    fn create_rest_catalog_client(&self) -> RestCatalog {
+    async fn create_rest_catalog_client(&self) -> Result<RestCatalog, IcebergError> {
         let endpoint = self
             .params
             .get("http_endpoint")
             .expose()
             .unwrap_or_else(|_| "https://data.spiceai.io");
-
         let mut props = HashMap::new();
         if let ExposedParamLookup::Present(api_key) = self.params.get("api_key").expose() {
             props.insert("token".to_string(), api_key.to_string());
         }
 
-        let catalog_config = RestCatalogConfig::builder()
-            .uri(endpoint.to_string())
-            .props(props)
-            .build();
+        let client = reqwest::Client::builder()
+            .use_rustls_tls()
+            .build()
+            .context(UnableToBuildCatalogClientSnafu)?;
 
-        RestCatalog::new(catalog_config)
+        props.insert(REST_CATALOG_PROP_URI.to_string(), endpoint.to_string());
+        let iceberg_rest_catalog = RestCatalogBuilder::default()
+            .with_client(client)
+            .load("rest", props)
+            .await
+            .context(UnableToBuildCatalogSnafu)?;
+
+        Ok(RestCatalog::new(iceberg_rest_catalog))
     }
 
     async fn create_read_provider(
@@ -213,7 +222,7 @@ impl SpiceCloudPlatformCatalog {
                     "spice.ai".into(),
                     ConnectorComponent::Dataset(Arc::new(template_dataset)),
                 )
-                .build(runtime.secrets())
+                .build(runtime.secrets(), runtime.tokio_io_runtime())
                 .await
                 .map_err(|e| super::Error::InvalidConfiguration {
                     connector: "spice.ai".into(),
@@ -243,7 +252,7 @@ impl SpiceCloudPlatformCatalog {
     }
 }
 
-pub(crate) const PARAMETERS: &[ParameterSpec] = &[
+pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("api_key").secret(),
     ParameterSpec::component("flight_endpoint"),
     ParameterSpec::component("http_endpoint"),

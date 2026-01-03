@@ -21,12 +21,12 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use crate::{http::traceparent::override_task_history_with_traceparent, model::LLMModelStore};
+use crate::model::LLMChatCompletionsModelStore;
 #[cfg(feature = "openapi")]
-use async_openai::types::CreateChatCompletionResponse;
+use async_openai::types::chat::CreateChatCompletionResponse;
 use async_openai::{
-    error::OpenAIError,
-    types::{
+    error::{OpenAIError, StreamError},
+    types::chat::{
         ChatChoice, ChatChoiceStream, ChatCompletionResponseMessage, ChatCompletionResponseStream,
         ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
         CreateChatCompletionStreamResponse, Role,
@@ -45,6 +45,7 @@ use event_stream::get_event_stream;
 use futures::StreamExt;
 use http::HeaderValue;
 use llms::chat::Chat;
+use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::Serialize;
 use tokio::{
     select,
@@ -54,6 +55,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::{Instrument, Span};
 
 static SPICE_COMPLETION_PROGRESS_HEADER: &str = "x-spiceai-completion-progress";
+pub static KEEP_ALIVE_INTERVAL: u64 = 30;
 
 /// Create Chat Completion
 ///
@@ -117,10 +119,12 @@ static SPICE_COMPLETION_PROGRESS_HEADER: &str = "x-spiceai-completion-progress";
     )
 ))]
 pub(crate) async fn post(
-    Extension(llms): Extension<Arc<RwLock<LLMModelStore>>>,
+    Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
     headers: HeaderMap,
     Json(req): Json<CreateChatCompletionRequest>,
 ) -> Response {
+    let context = RequestContext::current(AsyncMarker::new().await);
+
     let span = tracing::span!(
         target: "task_history",
         tracing::Level::INFO,
@@ -129,7 +133,9 @@ pub(crate) async fn post(
     );
     span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
 
-    override_task_history_with_traceparent(&span.clone(), &headers);
+    if let Some(traceparent) = context.trace_parent() {
+        crate::http::traceparent::override_task_history_with_trace_parent(&span, traceparent);
+    }
 
     let span_clone = span.clone();
     async move {
@@ -187,8 +193,8 @@ async fn handle_streaming(
         let mut events = match get_event_stream() {
             Ok(o) => o,
             Err(e) => {
-                return openai_error_to_response(OpenAIError::StreamError(format!(
-                    "An error occurred in reading progress: {e}"
+                return openai_error_to_response(OpenAIError::StreamError(Box::new(
+                    StreamError::EventStream(format!("An error occurred in reading progress: {e}")),
                 )));
             }
         };
@@ -232,12 +238,12 @@ async fn handle_streaming(
 
     create_sse_response(
         Box::pin(ReceiverStream::new(rx)),
-        time::Duration::from_secs(30),
+        time::Duration::from_secs(KEEP_ALIVE_INTERVAL),
         span,
     )
 }
 
-#[allow(clippy::cast_possible_truncation, deprecated)]
+#[expect(deprecated)]
 pub(crate) fn create_working_stream_payload(
     content: String,
 ) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
@@ -287,11 +293,10 @@ fn create_sse_response(
                     if id.is_none() {
                         id = Some(resp.id.clone());
                     }
-                    if let Some(choice) = resp.choices.first() {
-                        if let Some(intermediate_chat_output) = &choice.delta.content {
+                    if let Some(choice) = resp.choices.first()
+                        && let Some(intermediate_chat_output) = &choice.delta.content {
                             chat_output.push_str(intermediate_chat_output);
                         }
-                    }
 
                     yield Ok::<Event, Infallible>(Event::default().json_data(resp).unwrap_or_else(|e| {
                         tracing::error!("Failed to serialize chat completion message: {e}");
@@ -381,11 +386,11 @@ mod tests {
 
     use crate::{
         http::v1::chat::{SPICE_COMPLETION_PROGRESS_HEADER, post},
-        model::LLMModelStore,
+        model::LLMChatCompletionsModelStore,
     };
     use async_openai::{
         error::OpenAIError,
-        types::{
+        types::chat::{
             ChatCompletionResponseStream, CreateChatCompletionRequest,
             CreateChatCompletionStreamResponse,
         },
@@ -430,8 +435,9 @@ mod tests {
             })))
         }
     }
+
     async fn run_post(progress_header: Option<&'static str>) -> Vec<String> {
-        let mut store = LLMModelStore::new();
+        let mut store = LLMChatCompletionsModelStore::new();
         store.insert("dummy".to_string(), Arc::new(DummyChat {}));
         let llms = Arc::new(RwLock::new(store));
 

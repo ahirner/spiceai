@@ -29,7 +29,6 @@ use snafu::prelude::*;
 use spicepod::component::embeddings::Embeddings;
 
 impl Runtime {
-    #[allow(dead_code)]
     pub(crate) async fn load_embeddings(&self) {
         let app_opt = self.app.read().await;
 
@@ -82,13 +81,13 @@ impl Runtime {
         }
     }
 
-    #[allow(dead_code)]
     /// Loads a specific Embedding model from the spicepod. If an error occurs, no retry attempt is made.
     async fn load_embedding(&self, in_embed: &Embeddings) -> Result<TaskEmbed> {
         let l = try_to_embedding(
             in_embed,
             Arc::clone(&self.secrets),
             self.token_provider_registry(),
+            self.datafusion().embeddings_cache_provider(),
         )
         .await
         .boxed()

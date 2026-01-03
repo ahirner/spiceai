@@ -14,19 +14,22 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+#![allow(clippy::needless_for_each)]
+
 use crate::datafusion::DataFusion;
 use crate::datafusion::request_context_extension::DataFusionContextExtension;
 use crate::model::ModelContextLayer;
-use crate::{search::vector_search, status::RuntimeStatus};
+use crate::request::DatabricksAuthExtension;
+use crate::{search::search_engine, status::RuntimeStatus};
 
 use crate::Runtime;
+use crate::config;
 #[cfg(feature = "openapi")]
 use crate::http::v1::{
     Format,
     datasets::{DatasetFilter, DatasetQueryParams},
 };
-use crate::request::Protocol;
-use crate::{config, request::RequestContext};
+use runtime_request_context::{Protocol, RequestContext};
 
 #[cfg(feature = "mcp")]
 use crate::tools::mcp::server::RuntimeServer;
@@ -65,6 +68,7 @@ use axum::{
 use runtime_auth::layer::http::AuthLayer;
 use tokio::time::Instant;
 use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
 
 #[cfg(feature = "openapi")]
 #[derive(OpenApi)]
@@ -181,16 +185,28 @@ pub fn get_api_doc() -> utoipa::openapi::OpenApi {
     openai
 }
 
-#[allow(clippy::too_many_lines)]
+// Request body size limits to prevent DoS attacks (all limits use binary units: MiB = 1024 * 1024 bytes)
+// Applied at three levels:
+// 1. DEFAULT_REQUEST_BODY_LIMIT (128 MiB) - for all authenticated endpoints (queries, chat, embeddings, evals)
+//    Applied as a route layer to the entire authenticated router to allow reasonable payload sizes for SQL INSERT operations and LLM requests
+// 2. MCP_REQUEST_BODY_LIMIT (32 MiB) - for Model Context Protocol (MCP) endpoints
+//    Applied to /v1/mcp/sse routes to support MCP message payloads while preventing excessive memory usage
+// 3. HEALTH_REQUEST_BODY_LIMIT (128 KiB) - strict limit for unauthenticated endpoints (health checks, ready checks)
+//    Applied to unauthenticated routes to prevent DoS via health check endpoints
+const DEFAULT_REQUEST_BODY_LIMIT: usize = 128 * 1024 * 1024; // 128 MiB
+#[cfg(feature = "mcp")]
+const MCP_REQUEST_BODY_LIMIT: usize = 32 * 1024 * 1024; // 32 MiB
+const HEALTH_REQUEST_BODY_LIMIT: usize = 128 * 1024; // 128 KiB
+
 pub(crate) fn routes(
     rt: &Arc<Runtime>,
     config: Arc<config::Config>,
-    vector_search: Arc<vector_search::VectorSearch>,
+    search: Arc<search_engine::SearchEngine>,
     auth_layer: Option<AuthLayer>,
     cors_config: &CorsConfig,
 ) -> Router {
     let mut authenticated_router = Router::new()
-        .route("/v1/sql", post(v1::query::post))
+        .route("/v1/sql", post(v1::query::post).layer(ModelContextLayer))
         .route("/v1/status", get(v1::status::get))
         .route("/v1/catalogs", get(v1::catalogs::get))
         .route("/v1/datasets", get(v1::datasets::get))
@@ -240,6 +256,10 @@ pub(crate) fn routes(
                 "/v1/chat/completions",
                 post(v1::chat::post).layer(ModelContextLayer),
             )
+            .route(
+                "/v1/responses",
+                post(v1::responses::post).layer(ModelContextLayer),
+            )
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route("/v1/search", post(v1::search::post))
             .route("/v1/tools", get(v1::tools::list))
@@ -252,12 +272,13 @@ pub(crate) fn routes(
             )
             .route("/v1/evals", get(v1::eval::list))
             .route("/v1/workers", get(v1::workers::get))
-            .layer(Extension(Arc::clone(&rt.llms)))
+            .layer(Extension(Arc::clone(&rt.completion_llms)))
             .layer(Extension(Arc::clone(&rt.models)))
             .layer(Extension(Arc::clone(&rt.eval_scorers)))
-            .layer(Extension(vector_search))
+            .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
-            .layer(Extension(Arc::clone(&rt.workers)));
+            .layer(Extension(Arc::clone(&rt.workers)))
+            .layer(Extension(Arc::clone(&rt.responses_llms)));
     }
 
     #[cfg(feature = "mcp")]
@@ -273,6 +294,13 @@ pub(crate) fn routes(
         let runtime_arc = Arc::clone(rt);
         let _cancellation_token =
             sse_server.with_service(move || RuntimeServer::from(&runtime_arc));
+
+        // Apply MCP-specific request body limit before merging
+        tracing::debug!(
+            "MCP request body size limit set to {} bytes",
+            MCP_REQUEST_BODY_LIMIT
+        );
+        let mcp_router = mcp_router.route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT));
         authenticated_router = mcp_router.merge(authenticated_router);
     }
 
@@ -281,16 +309,22 @@ pub(crate) fn routes(
         .layer(Extension(rt.metrics_endpoint))
         .layer(Extension(config));
 
+    // Apply request body size limit to prevent DoS attacks via unbounded request payloads
+    // This must be applied as a route layer before auth
+    authenticated_router =
+        authenticated_router.route_layer(RequestBodyLimitLayer::new(DEFAULT_REQUEST_BODY_LIMIT));
+
     // If we have an auth layer, add it to the authenticated router
     if let Some(auth_layer) = auth_layer {
-        tracing::info!("Enabled authentication on HTTP routes");
+        tracing::info!("Enabled API key authentication on HTTP routes");
         authenticated_router = authenticated_router.route_layer(auth_layer);
     }
 
     let unauthenticated_router = Router::new()
         .route("/health", get(|| async { "ok\n" }))
         .route("/v1/ready", get(v1::ready::get))
-        .layer(Extension(Arc::clone(&rt.status)));
+        .layer(Extension(Arc::clone(&rt.status)))
+        .route_layer(RequestBodyLimitLayer::new(HEALTH_REQUEST_BODY_LIMIT));
 
     unauthenticated_router
         .merge(authenticated_router)
@@ -311,15 +345,20 @@ async fn track_metrics(
     next: Next,
 ) -> impl IntoResponse {
     let app_lock = app.read().await;
+    let app = app_lock.as_ref().map(Arc::clone);
+    let mut request_context_builder = RequestContext::builder(Protocol::Http)
+        .with_app_opt(app_lock.as_ref().map(Arc::clone))
+        .from_headers(&headers);
+
+    if let Some(ext) = DatabricksAuthExtension::from_headers(&app, &Some(Arc::clone(&df)), &headers)
+    {
+        request_context_builder = ext.add_from_headers(request_context_builder, &headers);
+    }
     let request_context = Arc::new(
-        RequestContext::builder(Protocol::Http)
-            .with_app_opt(app_lock.as_ref().map(Arc::clone))
-            .with_df_opt(Some(Arc::clone(&df)))
-            .from_headers(&headers)
+        request_context_builder
+            .with_extension(DataFusionContextExtension::new(Arc::clone(&df)))
             .build(),
     );
-
-    request_context.insert_extension(DataFusionContextExtension::new(Arc::clone(&df)));
 
     let request_dimensions = request_context.to_dimensions();
 

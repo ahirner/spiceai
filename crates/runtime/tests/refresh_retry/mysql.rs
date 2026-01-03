@@ -39,6 +39,7 @@ use runtime::{
     accelerated_table::{AcceleratedTable, refresh::Refresh, refresh_task::RefreshTask},
 };
 use spicepod::acceleration::Acceleration;
+use tokio::runtime::Handle;
 use tokio::time;
 use tracing::instrument;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
@@ -118,7 +119,10 @@ async fn create_refresh_task(
             Arc::clone(&accelerated_table.get_federated_table()),
             None,
             accelerated_table.get_accelerator(),
+            Handle::current(),
+            Arc::new(tokio::sync::Mutex::new(())),
         )
+        .with_cpu_runtime(rt.datafusion().refresh_runtime().cloned())
         .build(),
         accelerated_table.refresh_params().read().await.clone(),
     ))
@@ -140,7 +144,6 @@ async fn get_accelerator(rt: &Runtime, table_name: &str) -> Result<Arc<dyn Table
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn mysql_refresh_retries() -> Result<(), String> {
     test_request_context()
         .scope(async {
@@ -169,11 +172,8 @@ async fn mysql_refresh_retries() -> Result<(), String> {
                 .with_dataset(ds_default_retries)
                 .build();
 
-            let rt = Runtime::builder()
-                .with_app(app)
-                .with_datafusion_configuration_fn(configure_test_datafusion)
-                .build()
-                .await;
+            configure_test_datafusion();
+            let rt = Runtime::builder().with_app(app).build().await;
             let cloned_rt = Arc::new(rt.clone());
 
             tokio::select! {
@@ -209,16 +209,14 @@ async fn mysql_refresh_retries() -> Result<(), String> {
                 // restore connectivity after few seconds
                 time::sleep(Duration::from_secs(2)).await;
                 tracing::debug!("Restoring connectivity...");
-                assert!(
-                    running_container_reference_copy
-                        .start()
-                        .await
-                        .map_err(|e| {
-                            tracing::error!("running_container.start: {e}");
-                            e.to_string()
-                        })
-                        .is_ok()
-                );
+                running_container_reference_copy
+                    .start()
+                    .await
+                    .map_err(|e| {
+                        tracing::error!("running_container.start: {e}");
+                        e.to_string()
+                    })
+                    .expect("should start container");
             });
 
             // set custom refresh sql to check number of items loaded later

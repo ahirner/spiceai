@@ -4,17 +4,22 @@ on:
   push:
     branches: [trunk]
     paths:
-      - "tools/spiceschema/**"
-      - "crates/**"
+      - 'tools/spiceschema/**'
+      - 'crates/**'
   workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
 
 jobs:
   generate_openapi:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6
 
       - name: Check for existing PR
         id: check_pr
@@ -58,7 +63,7 @@ jobs:
 
       - name: Upload OpenAPI artifact
         if: steps.check_pr.outputs.skip != 'true'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v5
         with:
           name: openapi.json
           path: .schema/openapi.json
@@ -79,6 +84,7 @@ jobs:
             gh pr create \
               --title "Update openapi.json" \
               --body $'Updated OpenAPI specification\n\n**Remember**\n- [ ] Updated in [spiceai/docs](https://github.com/spiceai/docs).' \
+              --label 'kind/documentation' \
               --base trunk \
               --head openapi/${GITHUB_RUN_ID}
           fi

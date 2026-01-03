@@ -16,7 +16,7 @@ limitations under the License.
 
 use async_trait::async_trait;
 
-use crate::component::dataset::Dataset;
+use crate::{component::dataset::Dataset, register_data_connector};
 use data_components::Read;
 use data_components::spark_connect::SparkConnect;
 use datafusion::datasource::TableProvider;
@@ -75,7 +75,7 @@ impl Spark {
             .await
             .context(UnableToConstructSparkConnectSnafu)?;
         Ok(Self {
-            read_provider: Arc::new(spark.clone()),
+            read_provider: Arc::new(spark),
         })
     }
 }
@@ -156,7 +156,7 @@ impl DataConnector for Spark {
         let table_reference = TableReference::from(dataset.path());
         Ok(self
             .read_provider
-            .table_provider(table_reference, dataset.schema())
+            .table_provider(table_reference)
             .await
             .context(super::UnableToGetReadProviderSnafu {
                 dataconnector: "spark",
@@ -164,3 +164,5 @@ impl DataConnector for Spark {
             })?)
     }
 }
+
+register_data_connector!("spark", SparkFactory);

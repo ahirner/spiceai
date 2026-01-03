@@ -27,6 +27,7 @@ use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct Model {
     pub from: String,
     pub name: String,
@@ -84,12 +85,14 @@ pub enum ModelSource {
     OpenAi,
     Azure,
     Anthropic,
+    Google,
     Xai,
     HuggingFace,
     Perplexity,
     SpiceAI,
     File,
     Databricks,
+    Bedrock,
 }
 
 impl ModelSource {
@@ -153,6 +156,8 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::File)
         } else if value.starts_with("anthropic") {
             Ok(ModelSource::Anthropic)
+        } else if value.starts_with("google") {
+            Ok(ModelSource::Google)
         } else if value.starts_with("perplexity") {
             Ok(ModelSource::Perplexity)
         } else if value.starts_with("openai") {
@@ -165,6 +170,8 @@ impl TryFrom<&str> for ModelSource {
             Ok(ModelSource::SpiceAI)
         } else if value.starts_with("databricks") {
             Ok(ModelSource::Databricks)
+        } else if value.starts_with("bedrock") {
+            Ok(ModelSource::Bedrock)
         } else {
             Err("Unknown prefix")
         }
@@ -179,11 +186,13 @@ impl Display for ModelSource {
             ModelSource::Azure => write!(f, "azure"),
             ModelSource::Xai => write!(f, "xai"),
             ModelSource::Anthropic => write!(f, "anthropic"),
+            ModelSource::Google => write!(f, "google"),
             ModelSource::Perplexity => write!(f, "perplexity"),
             ModelSource::HuggingFace => write!(f, "huggingface"),
             ModelSource::File => write!(f, "file"),
             ModelSource::SpiceAI => write!(f, "spiceai"),
             ModelSource::Databricks => write!(f, "databricks"),
+            ModelSource::Bedrock => write!(f, "bedrock"),
         }
     }
 }
@@ -196,11 +205,13 @@ impl ModelSource {
             ModelSource::Azure => "azure",
             ModelSource::Xai => "xai",
             ModelSource::Anthropic => "anthropic",
+            ModelSource::Google => "google",
             ModelSource::Perplexity => "perplexity",
             ModelSource::HuggingFace => "hf",
             ModelSource::File => "file",
             ModelSource::SpiceAI => "spiceai",
             ModelSource::Databricks => "databricks",
+            ModelSource::Bedrock => "bedrock",
         }
     }
 }
@@ -273,15 +284,14 @@ impl Model {
         if matches!(
             ModelSource::try_from(self.from.as_str()),
             Ok(ModelSource::File)
-        ) {
-            if let Some(id) = self.get_model_id() {
-                component_files.push(ModelFile {
-                    path: id,
-                    name: Some("from_id".to_string()),
-                    r#type: Some(ModelFileType::Weights),
-                    params: None,
-                });
-            }
+        ) && let Some(id) = self.get_model_id()
+        {
+            component_files.push(ModelFile {
+                path: id,
+                name: Some("from_id".to_string()),
+                r#type: Some(ModelFileType::Weights),
+                params: None,
+            });
         }
         component_files
             .iter()
@@ -365,6 +375,8 @@ impl Model {
                 | ModelSource::Anthropic
                 | ModelSource::Xai
                 | ModelSource::Databricks
+                | ModelSource::Bedrock
+                | ModelSource::Google
         ) {
             return Some(ModelType::Llm);
         }

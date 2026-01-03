@@ -11,19 +11,17 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
-use async_openai::types::{
-    ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestSystemMessageArgs,
-    CreateChatCompletionRequestArgs,
+use async_openai::types::chat::{
+    ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequestArgs,
 };
 use async_stream::stream;
 use async_trait::async_trait;
-use futures::{Stream, StreamExt, TryStreamExt};
+use futures::Stream;
 use nsql::SqlGeneration;
-use rand::distr::Alphanumeric;
-use rand::{Rng, rng};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use snafu::{ResultExt, Snafu};
+use spicepod::component::model::ModelSource;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -32,22 +30,23 @@ use tracing_futures::Instrument;
 
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
-        ChatChoice, ChatChoiceStream, ChatCompletionRequestAssistantMessage,
-        ChatCompletionRequestDeveloperMessage, ChatCompletionRequestDeveloperMessageContent,
-        ChatCompletionRequestFunctionMessage, ChatCompletionRequestMessage,
-        ChatCompletionRequestSystemMessage, ChatCompletionRequestToolMessage,
-        ChatCompletionRequestUserMessage, ChatCompletionRequestUserMessageContent,
-        ChatCompletionResponseMessage, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, CreateChatCompletionRequest,
-        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, Role,
+    types::chat::{
+        ChatChoice, ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
+        ChatCompletionRequestAssistantMessageContent, ChatCompletionRequestDeveloperMessage,
+        ChatCompletionRequestDeveloperMessageContent,
+        ChatCompletionRequestDeveloperMessageContentPart, ChatCompletionRequestFunctionMessage,
+        ChatCompletionRequestMessage, ChatCompletionRequestSystemMessage,
+        ChatCompletionRequestToolMessage, ChatCompletionRequestUserMessage,
+        ChatCompletionRequestUserMessageContent, ChatCompletionResponseMessage,
+        ChatCompletionResponseStream, CreateChatCompletionRequest, CreateChatCompletionResponse,
+        Role,
     },
 };
 
 #[cfg(feature = "mistralrs")]
 pub mod mistral;
 pub mod nsql;
-#[cfg(feature = "mistralrs")]
+use crate::streaming_utils::generate_stream_id;
 use indexmap::IndexMap;
 #[cfg(feature = "mistralrs")]
 use mistralrs::MessageContent;
@@ -73,50 +72,50 @@ pub enum LlmRuntime {
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to check the status of the model.\nAn error occurred: {source}\nVerify the model configuration."
+        "Failed to check the status of the model. An error occurred: {source} Verify the model configuration."
     ))]
     HealthCheckError {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Failed to run the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to run the model. An error occurred: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToRunModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Failed to find the Local model at '{expected_path}'.\nVerify the model exists, and try again."
+        "Failed to find the Local model at '{expected_path}'. Verify the model exists, and try again."
     ))]
     LocalModelNotFound { expected_path: String },
 
     #[snafu(display(
-        "Failed to find the Local model config at '{expected_path}'.\nVerify the model config exists, and try again."
+        "Failed to find the Local model config at '{expected_path}'. Verify the model config exists, and try again."
     ))]
     LocalModelConfigNotFound { expected_path: String },
 
     #[snafu(display(
-        "Failed to find the Local tokenizer at '{expected_path}'.\nVerify the tokenizer exists, and try again."
+        "Failed to find the Local tokenizer at '{expected_path}'. Verify the tokenizer exists, and try again."
     ))]
     LocalTokenizerNotFound { expected_path: String },
 
     #[snafu(display(
-        "Failed to load the model.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to load the model. An error occurred: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToLoadModel {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "Unsupported value for `model_type` parameter.\n{source}\n Verify the `model_type` parameter, and try again"
+        "Unsupported value for `model_type` parameter. {source}  Verify the `model_type` parameter, and try again"
     ))]
     UnsupportedModelType {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "The specified model identifier '{model}' is not valid for the source '{model_source}'.\nVerify the model exists, and try again."
+        "The specified model identifier '{model}' is not valid for the source '{model_source}'. Verify the model exists, and try again."
     ))]
     ModelNotFound { model: String, model_source: String },
 
@@ -126,19 +125,19 @@ pub enum Error {
     ModelNotProvided { model_source: String },
 
     #[snafu(display(
-        "Failed to load model tokenizer.\nAn error occurred: {source}\nReport a bug on GitHub: https://github.com/spiceai/spiceai/issues"
+        "Failed to load model tokenizer. An error occurred: {source} Report a bug on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     FailedToLoadTokenizer {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     #[snafu(display(
-        "An unsupported model source was specified in the 'from' parameter: '{from}'.\nSpecify a valid source, like 'openai', and try again.\nFor details, visit: https://spiceai.org/docs/components/models"
+        "An unsupported model source was specified in the 'from' parameter: '{from}'. Specify a valid source, like 'openai', and try again. For details, visit: https://spiceai.org/docs/components/models"
     ))]
     UnknownModelSource { from: String },
 
     #[snafu(display(
-        "The specified model, '{from}', does not support executing the task '{task}'.\nSelect a different model or task, and try again."
+        "The specified model, '{from}', does not support executing the task '{task}'. Select a different model or task, and try again."
     ))]
     UnsupportedTaskForModel { from: String, task: String },
 
@@ -149,22 +148,32 @@ pub enum Error {
     MissingParamError { param_key: &'static str },
 
     #[snafu(display(
-        "Failed to find weights for the model.\nExpected tensors with a file extension of: {extensions}.\nVerify the model is correctly configured, and try again."
+        "Failed to find weights for the model. Expected tensors with a file extension of: {extensions}. Verify the model is correctly configured, and try again."
     ))]
     ModelMissingWeights { extensions: String },
 
     #[snafu(display(
-        "Failed to load a file specified for the model.\nCould not find the file: {file_url}.\nVerify the `files` parameters for the model, and try again."
+        "Failed to load a file specified for the model. Could not find the file: {file_url}. Verify the `files` parameters for the model, and try again."
     ))]
     ModelFileMissing { file_url: String },
 
     #[snafu(display(
-        "Invalid parameters for model '{model}':\n{source}\nVerify the model parameters, and try again."
+        "Invalid parameters for model '{model}': {source} Verify the model parameters, and try again."
     ))]
     ModelParameterFailed {
         model: String,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    #[snafu(display(
+        "Model '{from}' does not support the OpenAI Responses API. Change the model provider to 'openai' to use the Responses API or use the Chat Completions API."
+    ))]
+    ResponsesNotSupported { from: ModelSource },
+
+    #[snafu(display(
+        "The tool '{tool}' was not found. Verify the Spicepod configuration, and view the tools documentation at https://spiceai.org/docs/components/tools"
+    ))]
+    ToolNotFound { tool: String },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -226,15 +235,18 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                 let x: Vec<_> = array
                     .iter()
                     .map(|p| match p {
-                        async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) => {
+                        async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::Text(t) => {
                             t.text.clone()
                         }
-                        async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(
+                        async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::ImageUrl(
                             i,
                         ) => i.image_url.url.clone(),
-                        async_openai::types::ChatCompletionRequestUserMessageContentPart::InputAudio(
+                        async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::InputAudio(
                             a
                         ) => a.input_audio.data.clone(),
+                        async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::File(
+                            f
+                        ) => serde_json::to_string(&f.file).unwrap_or_default(),
                     })
                     .collect();
                 x.join("\n")
@@ -244,12 +256,14 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
             content,
             ..
         }) => match content {
-            async_openai::types::ChatCompletionRequestSystemMessageContent::Text(t) => t.clone(),
-            async_openai::types::ChatCompletionRequestSystemMessageContent::Array(parts) => {
+            async_openai::types::chat::ChatCompletionRequestSystemMessageContent::Text(t) => {
+                t.clone()
+            }
+            async_openai::types::chat::ChatCompletionRequestSystemMessageContent::Array(parts) => {
                 let x: Vec<_> = parts
                     .iter()
                     .map(|p| match p {
-                        async_openai::types::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
+                        async_openai::types::chat::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
                             t.text.clone()
                         }
                     })
@@ -260,20 +274,21 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
         ChatCompletionRequestMessage::Tool(ChatCompletionRequestToolMessage {
             content, ..
         }) => match content {
-            async_openai::types::ChatCompletionRequestToolMessageContent::Text(t) => t.clone(),
-            async_openai::types::ChatCompletionRequestToolMessageContent::Array(parts) => {
+            async_openai::types::chat::ChatCompletionRequestToolMessageContent::Text(t) => {
+                t.clone()
+            }
+            async_openai::types::chat::ChatCompletionRequestToolMessageContent::Array(parts) => {
                 let x: Vec<_> = parts
                     .iter()
                     .map(|p| match p {
-                        async_openai::types::ChatCompletionRequestToolMessageContentPart::Text(
+                        async_openai::types::chat::ChatCompletionRequestToolMessageContentPart::Text(
                             t,
                         ) => t.text.clone(),
                     })
                     .collect();
                 x.join("\n")
             }
-        }
-        .clone(),
+        },
         ChatCompletionRequestMessage::Assistant(ChatCompletionRequestAssistantMessage {
             content,
             ..
@@ -283,17 +298,17 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
                 let x: Vec<_> = parts
                         .iter()
                         .map(|p| match p {
-                            async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
+                            async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
                                 t.text.clone()
                             }
-                            async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
+                            async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
                                 i.refusal.clone()
                             }
                         })
                         .collect();
                 x.join("\n")
             }
-            None => todo!(),
+            None => unimplemented!("Assistant message with no content is not supported"),
         },
         ChatCompletionRequestMessage::Function(ChatCompletionRequestFunctionMessage {
             content,
@@ -305,7 +320,13 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
         }) => match content {
             ChatCompletionRequestDeveloperMessageContent::Text(t) => t.clone(),
             ChatCompletionRequestDeveloperMessageContent::Array(parts) => {
-                let x: Vec<_> = parts.iter().map(|p| p.text.clone()).collect();
+                let x: Vec<_> = parts
+                    .iter()
+                    .map(|p| {
+                        let ChatCompletionRequestDeveloperMessageContentPart::Text(t) = p;
+                        t.text.clone()
+                    })
+                    .collect();
                 x.join("\n")
             }
         },
@@ -315,11 +336,10 @@ pub fn message_to_content(message: &ChatCompletionRequestMessage) -> String {
 /// Convert a structured [`ChatCompletionRequestMessage`] to the mistral.rs compatible [`RequestMessage`] type.
 #[cfg(feature = "mistralrs")]
 #[must_use]
-#[allow(clippy::too_many_lines)]
 pub fn message_to_mistral(
     message: &ChatCompletionRequestMessage,
 ) -> IndexMap<String, MessageContent> {
-    use async_openai::types::{
+    use async_openai::types::chat::{
         ChatCompletionRequestSystemMessageContent, ChatCompletionRequestToolMessageContent,
     };
     use either::Either;
@@ -334,21 +354,23 @@ pub fn message_to_mistral(
                     either::Either::Left(text.clone())
                 }
                 ChatCompletionRequestUserMessageContent::Array(array) => {
-                    let v = array.iter().map(|p| {
+                    let index_map = array.iter().map(|p| {
                         match p {
-                            async_openai::types::ChatCompletionRequestUserMessageContentPart::Text(t) => {
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::Text(t) => {
                                 ("content".to_string(), Value::String(t.text.clone()))
                             }
-                            async_openai::types::ChatCompletionRequestUserMessageContentPart::ImageUrl(i) => {
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::ImageUrl(i) => {
                                 ("image_url".to_string(), Value::String(i.image_url.url.clone()))
                             }
-                            async_openai::types::ChatCompletionRequestUserMessageContentPart::InputAudio(a) => {
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::InputAudio(a) => {
                                 ("input_audio".to_string(), Value::String(a.input_audio.data.clone()))
+                            }
+                            async_openai::types::chat::ChatCompletionRequestUserMessageContentPart::File(f) => {
+                                ("file".to_string(), serde_json::to_value(&f.file).unwrap_or_default())
                             }
                         }
 
-                    }).collect::<Vec<_>>();
-                    let index_map: IndexMap<String, Value> = v.into_iter().collect();
+                    }).collect();
                     either::Either::Right(vec![index_map])
                 }
             };
@@ -372,7 +394,13 @@ pub fn message_to_mistral(
             ..
         }) => {
             // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
-            let content_json = parts.iter().map(|p| p.text.clone()).collect::<Vec<_>>();
+            let content_json = parts
+                .iter()
+                .map(|p| {
+                    let ChatCompletionRequestDeveloperMessageContentPart::Text(t) = p;
+                    t.text.clone()
+                })
+                .collect::<Vec<_>>();
             IndexMap::from([
                 (
                     String::from("role"),
@@ -399,7 +427,7 @@ pub fn message_to_mistral(
             let content_json = parts
                 .iter()
                 .map(|p| match p {
-                    async_openai::types::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
+                    async_openai::types::chat::ChatCompletionRequestSystemMessageContentPart::Text(t) => {
                         ("text".to_string(), t.text.clone())
                     }
                 })
@@ -431,7 +459,7 @@ pub fn message_to_mistral(
             let content_json = parts
                 .iter()
                 .map(|p| match p {
-                    async_openai::types::ChatCompletionRequestToolMessageContentPart::Text(t) => {
+                    async_openai::types::chat::ChatCompletionRequestToolMessageContentPart::Text(t) => {
                         ("text".to_string(), t.text.clone())
                     }
                 })
@@ -466,10 +494,10 @@ pub fn message_to_mistral(
                 Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => {
                     // TODO: This will cause issue for some chat_templates. Tracking: https://github.com/EricLBuehler/mistral.rs/issues/793
                     let content_json= parts.iter().map(|p| match p {
-                        async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
+                        async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Text(t) => {
                             ("text".to_string(), t.text.clone())
                         }
-                        async_openai::types::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
+                        async_openai::types::chat::ChatCompletionRequestAssistantMessageContentPart::Refusal(i) => {
                             ("refusal".to_string(), i.refusal.clone())
                         }
                     }).collect::<Vec<_>>();
@@ -490,13 +518,16 @@ pub fn message_to_mistral(
                 let tool_call_results: Vec<IndexMap<String, Value>> = tool_calls
                     .iter()
                     .filter_map(|t| {
-                        let Ok(function) = serde_json::to_value(&t.function) else {
-                            tracing::warn!("Invalid function call: {:#?}", t.function);
+                        let ChatCompletionMessageToolCalls::Function(func_call) = t else {
+                            return None;
+                        };
+                        let Ok(function) = serde_json::to_value(&func_call.function) else {
+                            tracing::warn!("Invalid function call: {:#?}", func_call.function);
                             return None;
                         };
 
                         let mut map = IndexMap::new();
-                        map.insert("id".to_string(), Value::String(t.id.to_string()));
+                        map.insert("id".to_string(), Value::String(func_call.id.to_string()));
                         map.insert("function".to_string(), function);
                         map.insert("type".to_string(), Value::String("function".to_string()));
 
@@ -515,7 +546,7 @@ pub fn message_to_mistral(
             (String::from("role"), Either::Left(String::from("function"))),
             (
                 "content".to_string(),
-                Either::Left(content.clone().unwrap_or_default().clone()),
+                Either::Left(content.clone().unwrap_or_default()),
             ),
             ("name".to_string(), Either::Left(name.clone())),
         ]),
@@ -526,40 +557,38 @@ pub fn message_to_mistral(
 pub trait Chat: Sync + Send {
     fn as_sql(&self) -> Option<&dyn SqlGeneration>;
     async fn run(&self, prompt: String) -> Result<Option<String>> {
-        let span = tracing::Span::current();
-
-        async move {
-            let req = CreateChatCompletionRequestArgs::default()
+        // BUG FIX: Remove double .instrument(Span::current()) calls that break span propagation
+        // The outer .instrument is redundant and interferes with parent span context
+        self.chat_request(
+            CreateChatCompletionRequestArgs::default()
                 .messages(vec![
-                    ChatCompletionRequestSystemMessageArgs::default()
+                    ChatCompletionRequestUserMessageArgs::default()
                         .content(prompt)
                         .build()
-                        .boxed()
-                        .context(FailedToLoadTokenizerSnafu)?
+                        .map_err(|e| Error::FailedToRunModel {
+                            source: Box::new(e),
+                        })?
                         .into(),
                 ])
                 .build()
-                .boxed()
-                .context(FailedToLoadModelSnafu)?;
-
-            let resp = self
-                .chat_request(req)
-                .await
-                .boxed()
-                .context(FailedToRunModelSnafu)?;
-
-            Ok(resp
-                .choices
+                .map_err(|e| Error::FailedToRunModel {
+                    source: Box::new(e),
+                })?,
+        )
+        .await
+        .map_err(|e| Error::FailedToRunModel {
+            source: Box::new(e),
+        })
+        .map(|resp| {
+            resp.choices
                 .into_iter()
                 .next()
-                .and_then(|c| c.message.content))
-        }
-        .instrument(span)
-        .await
+                .and_then(|c| c.message.content)
+        })
     }
 
-    /// A basic health check to ensure the model can process future [`Self::run`] requests.
-    /// Default implementation is a basic call to [`Self::run`].
+    /// A basic health check to ensure the model can process future [`Self::run`]
+    /// requests. Default implementation is a basic call to [`Self::run`].
     async fn health(&self) -> Result<()> {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "health", input = "health");
 
@@ -594,7 +623,6 @@ pub trait Chat: Sync + Send {
         Ok(Box::pin(stream! { yield resp }))
     }
 
-    #[allow(deprecated)]
     async fn chat_stream(
         &self,
         req: CreateChatCompletionRequest,
@@ -607,7 +635,9 @@ pub trait Chat: Sync + Send {
             .collect::<Vec<String>>()
             .join("\n");
 
-        let mut stream = self.stream(prompt).await.map_err(|e| {
+        // BUG FIX: The stream() call should inherit the current span context automatically
+        // No need to explicitly instrument here as it interferes with parent span propagation
+        let stream = self.stream(prompt).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
                 r#type: None,
@@ -616,53 +646,14 @@ pub trait Chat: Sync + Send {
             })
         })?;
 
-        let strm_id: String = rng()
-            .sample_iter(&Alphanumeric)
-            .take(10)
-            .map(char::from)
-            .collect();
-        let strm = stream! {
-            let mut i  = 0;
-            while let Some(msg) = stream.next().await {
-                let choice = ChatChoiceStream {
-                    delta: ChatCompletionStreamResponseDelta {
-                        content: Some(msg?.unwrap_or_default()),
-                        tool_calls: None,
-                        role: Some(Role::System),
-                        function_call: None,
-                        refusal: None,
-                    },
-                    index: i,
-                    finish_reason: None,
-                    logprobs: None,
-                };
-
-            yield Ok(CreateChatCompletionStreamResponse {
-                id: format!("{}-{}-{i}", model_id.clone(), strm_id),
-                choices: vec![choice],
-                model: model_id.clone(),
-                created: 0,
-                system_fingerprint: None,
-                object: "list".to_string(),
-                usage: None,
-                service_tier: None,
-            });
-            i+=1;
-        }};
-
-        Ok(Box::pin(strm.map_err(|e: Error| {
-            OpenAIError::ApiError(ApiError {
-                message: e.to_string(),
-                r#type: None,
-                param: None,
-                code: None,
-            })
-        })))
+        Ok(crate::streaming_utils::string_stream_to_chat_stream(
+            model_id, stream,
+        ))
     }
 
     /// An OpenAI-compatible interface for the `v1/chat/completion` `Chat` trait. If not implemented, the default
     /// implementation will be constructed based on the trait's [`run`] method.
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     async fn chat_request(
         &self,
         req: CreateChatCompletionRequest,
@@ -674,6 +665,9 @@ pub trait Chat: Sync + Send {
             .map(message_to_content)
             .collect::<Vec<String>>()
             .join("\n");
+
+        // BUG FIX: The run() call should inherit the current span context automatically
+        // No need to explicitly instrument here as it interferes with parent span propagation
         let choices: Vec<ChatChoice> = match self.run(prompt).await.map_err(|e| {
             OpenAIError::ApiError(ApiError {
                 message: e.to_string(),
@@ -690,6 +684,7 @@ pub trait Chat: Sync + Send {
                     audio: None,
                     function_call: None,
                     refusal: None,
+                    annotations: None,
                 },
                 index: 0,
                 finish_reason: None,
@@ -699,15 +694,7 @@ pub trait Chat: Sync + Send {
         };
 
         Ok(CreateChatCompletionResponse {
-            id: format!(
-                "{}-{}",
-                model_id.clone(),
-                rng()
-                    .sample_iter(&Alphanumeric)
-                    .take(10)
-                    .map(char::from)
-                    .collect::<String>()
-            ),
+            id: generate_stream_id(&model_id),
             choices,
             model: model_id,
             created: 0,

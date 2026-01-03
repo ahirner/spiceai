@@ -44,7 +44,7 @@ fn get_dataset(from: &str, name: &str, cron: &str) -> Dataset {
 
 const NAMES_CSV: &str = include_str!("data/names.csv");
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn snapshot_names_from_runtime(name: &str, rt: &Arc<Runtime>, dataset_name: Option<&str>) {
     let result: Vec<RecordBatch> = rt
         .datafusion()
@@ -71,7 +71,6 @@ async fn snapshot_names_from_runtime(name: &str, rt: &Arc<Runtime>, dataset_name
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_cron_schedule_creates() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -87,13 +86,8 @@ async fn test_cron_schedule_creates() -> Result<(), anyhow::Error> {
                 ))
                 .build();
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
-                    .build()
-                    .await,
-            );
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
@@ -159,7 +153,6 @@ async fn test_cron_schedule_creates() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_multiple_cron_schedule_creates() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -176,19 +169,17 @@ async fn test_multiple_cron_schedule_creates() -> Result<(), anyhow::Error> {
                 app = app.with_dataset(get_dataset(
                     "file:test_multiple_cron_schedule_creates.csv",
                     format!("names_{i}").as_str(),
-                    "*/30 * * * * *", // every 30 seconds
+                    "*/10 * * * * *", // every 10 seconds
                 ));
             }
 
             let app = app.build();
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
-                    .build()
-                    .await,
-            );
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            // align schedule start to be at least a few seconds before the next 10th second
+            tokio::time::sleep(time_till_second(10, Some(2))).await;
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
@@ -246,8 +237,8 @@ async fn test_multiple_cron_schedule_creates() -> Result<(), anyhow::Error> {
                 .write_all(new_row.as_bytes())
                 .expect("append to file");
 
-            // wait for the next 30th second, and wait 10 seconds for the job to succeed
-            tokio::time::sleep(time_till_second(30, Some(10))).await;
+            // wait for the next 10th second, and wait 5 seconds for the job to succeed
+            tokio::time::sleep(time_till_second(10, Some(5))).await;
 
             for dataset_name in dataset_names.clone() {
                 snapshot_names_from_runtime(
@@ -308,7 +299,6 @@ datasets:
       refresh_cron: \"* * * * * *\" # every minute
 ";
 
-#[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_cron_reload() -> Result<(), anyhow::Error> {
     let _ = rustls::crypto::CryptoProvider::install_default(
@@ -443,7 +433,6 @@ async fn test_cron_reload() -> Result<(), anyhow::Error> {
 const NAMES_TIMESTAMPED_CSV: &str = include_str!("data/names_timestamped.csv");
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_append_cron_schedule() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -458,13 +447,8 @@ async fn test_append_cron_schedule() -> Result<(), anyhow::Error> {
             .await
             .expect("Should load app from spicepod string");
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
-                    .build()
-                    .await,
-            );
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
@@ -548,7 +532,6 @@ async fn test_append_cron_schedule() -> Result<(), anyhow::Error> {
 }
 
 #[tokio::test]
-#[allow(clippy::too_many_lines)]
 async fn test_cron_view() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
@@ -562,13 +545,8 @@ async fn test_cron_view() -> Result<(), anyhow::Error> {
             .await
             .expect("Should load app from spicepod string");
 
-            let rt = Arc::new(
-                Runtime::builder()
-                    .with_app(app)
-                    .with_datafusion_configuration_fn(configure_test_datafusion)
-                    .build()
-                    .await,
-            );
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
 
             tokio::select! {
                 () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {

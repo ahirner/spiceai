@@ -1,24 +1,24 @@
 name: Enforce Pulls with Spice
 
 on:
-  pull_request:
+  pull_request_target:
     types:
       [labeled, unlabeled, opened, edited, synchronize, assigned, unassigned]
   merge_group:
     types: [checks_requested]
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.event.merge_group.head_ref }}
   cancel-in-progress: true
 
 jobs:
   enforce-pull-with-spice:
-    runs-on: spiceai-macos
+    runs-on: self-hosted
     steps:
-      - uses: spiceai/pulls-with-spice-action@v1.0.6
-        if: github.event_name == 'pull_request'
+      - uses: spiceai/pulls-with-spice-action@8f7e144a912dc5ab3c36e9ad816ecb445f2d1427 # v1.0.7
+        if: github.event_name == 'pull_request_target'
         with:
           require_title_min_length: '10'
-          required_labels_any: 'kind/refactor,kind/bug,kind/enhancement,kind/documentation,kind/optimization,kind/dependencies,kind/endgame'
+          required_labels_any: 'kind/refactor,kind/bug,kind/enhancement,kind/documentation,kind/optimization,kind/dependencies,kind/endgame,kind/task,kind/performance'
           banned_labels: 'invalid,wontfix,nomerge,duplicate'
           require_assignee: 'true'

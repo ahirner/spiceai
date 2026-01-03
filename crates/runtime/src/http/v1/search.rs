@@ -13,23 +13,22 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-use crate::{
-    request::{AsyncMarker, RequestContext},
-    search::{
-        Error as VectorSearchError,
-        request::{SearchRequest, SearchRequestAIJson, SearchRequestHTTPJson},
-        types::{Match, to_matches_sorted},
-        vector_search::VectorSearch,
-    },
+use crate::search::{
+    Error as VectorSearchError,
+    request::{SearchRequest, SearchRequestHTTPJson},
+    search_engine::SearchEngine,
+    types::{Match, to_matches_sorted},
 };
 use axum::{
     Extension, Json,
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use http::HeaderMap;
+use http::{HeaderMap, HeaderValue};
+use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Instant};
+use tracing::Instrument;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -120,7 +119,7 @@ struct SearchResponse {
     )
 ))]
 pub(crate) async fn post(
-    Extension(vs): Extension<Arc<VectorSearch>>,
+    Extension(vs): Extension<Arc<SearchEngine>>,
     Json(payload): Json<SearchRequestHTTPJson>,
 ) -> Response {
     let start_time = Instant::now();
@@ -139,9 +138,9 @@ pub(crate) async fn post(
         return (StatusCode::BAD_REQUEST, "Limit must be greater than 0").into_response();
     }
 
-    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "vector_search", input = %payload.base.text);
+    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "search", input = %payload.base.text);
 
-    let search_request = match SearchRequest::try_from(SearchRequestAIJson::from(payload)) {
+    let search_request = match SearchRequest::try_from(payload) {
         Ok(r) => r,
         Err(e) => {
             tracing::error!(target: "task_history", parent: &span, "{e}");
@@ -149,10 +148,15 @@ pub(crate) async fn post(
         }
     };
 
-    let context = RequestContext::current(AsyncMarker::new().await);
+    let request_context = RequestContext::current(AsyncMarker::new().await);
     let cache_provider = vs.df.search_cache_provider();
     match vs
-        .search_with_cache(&search_request, cache_provider, context.cache_control())
+        .search_with_cache(
+            &search_request,
+            cache_provider,
+            Arc::clone(&request_context),
+        )
+        .instrument(span.clone())
         .await
     {
         Ok((resp, cache_status)) => match to_matches_sorted(resp, search_request.limit).await {
@@ -161,6 +165,11 @@ pub(crate) async fn post(
 
                 if let Some(val) = cache_status.to_header_string().and_then(|v| v.parse().ok()) {
                     headers.insert("Search-Results-Cache-Status", val);
+                }
+
+                // Tell CDN entry is unique per user cache key
+                if request_context.client_supplied_cache_key().is_some() {
+                    headers.insert("Vary", HeaderValue::from_static("Spice-Cache-Key"));
                 }
 
                 (
@@ -177,7 +186,7 @@ pub(crate) async fn post(
         },
         Err(e) => {
             let error_type = match e {
-                VectorSearchError::NoTablesWithEmbeddingsFound {}
+                VectorSearchError::NoTablesWithSearchFound {}
                 | VectorSearchError::CannotVectorSearchDataset { .. } => StatusCode::BAD_REQUEST,
                 VectorSearchError::SearchPipelineError { ref source } if source.is_user_error() => {
                     StatusCode::BAD_REQUEST

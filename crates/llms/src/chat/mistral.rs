@@ -15,17 +15,18 @@ limitations under the License.
 #![allow(clippy::needless_pass_by_value)]
 
 use crate::chat::message_to_mistral;
+use crate::streaming_utils::create_stream_response_with_timestamp;
 
 use super::{Chat, Error as ChatError, FailedToRunModelSnafu, Result, nsql::SqlGeneration};
 use async_openai::{
     error::{ApiError, OpenAIError},
-    types::{
+    types::chat::{
         ChatChoiceStream, ChatCompletionMessageToolCallChunk, ChatCompletionNamedToolChoice,
         ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
-        ChatCompletionStreamResponseDelta, ChatCompletionTool, ChatCompletionToolChoiceOption,
-        ChatCompletionToolType, CompletionUsage, CreateChatCompletionRequest,
-        CreateChatCompletionRequestArgs, CreateChatCompletionResponse,
-        CreateChatCompletionStreamResponse, FinishReason, FunctionCallStream, Role, Stop,
+        ChatCompletionStreamResponseDelta, ChatCompletionToolChoiceOption, ChatCompletionTools,
+        CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason,
+        FunctionCallStream, FunctionType, Role, StopConfiguration, ToolChoiceOptions,
     },
 };
 use async_stream::stream;
@@ -63,8 +64,10 @@ pub struct MistralLlama {
 fn to_openai_response(
     resp: &ChatCompletionResponse,
 ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-    let resp_str = serde_json::to_string(resp)?;
-    serde_json::from_str(&resp_str).map_err(OpenAIError::from)
+    let resp_str = serde_json::to_string(resp)
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to serialize response: {e}")))?;
+    serde_json::from_str(&resp_str)
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to deserialize response: {e}")))
 }
 
 impl MistralLlama {
@@ -84,28 +87,28 @@ impl MistralLlama {
             }
         }
 
-        if let Some(config) = config {
-            if !config.exists() {
-                return Err(ChatError::LocalModelConfigNotFound {
-                    expected_path: config.to_string_lossy().to_string(),
-                });
-            }
+        if let Some(config) = config
+            && !config.exists()
+        {
+            return Err(ChatError::LocalModelConfigNotFound {
+                expected_path: config.to_string_lossy().to_string(),
+            });
         }
 
-        if let Some(tokenizer) = tokenizer {
-            if !tokenizer.exists() {
-                return Err(ChatError::LocalTokenizerNotFound {
-                    expected_path: tokenizer.to_string_lossy().to_string(),
-                });
-            }
+        if let Some(tokenizer) = tokenizer
+            && !tokenizer.exists()
+        {
+            return Err(ChatError::LocalTokenizerNotFound {
+                expected_path: tokenizer.to_string_lossy().to_string(),
+            });
         }
 
-        if let Some(tokenizer_config) = tokenizer_config {
-            if !tokenizer_config.exists() {
-                return Err(ChatError::LocalTokenizerNotFound {
-                    expected_path: tokenizer_config.to_string_lossy().to_string(),
-                });
-            }
+        if let Some(tokenizer_config) = tokenizer_config
+            && !tokenizer_config.exists()
+        {
+            return Err(ChatError::LocalTokenizerNotFound {
+                expected_path: tokenizer_config.to_string_lossy().to_string(),
+            });
         }
 
         let paths = Self::create_paths(
@@ -367,7 +370,7 @@ impl MistralLlama {
         Ok(Self::from_pipeline(pipeline).await)
     }
 
-    #[allow(clippy::expect_used)]
+    #[expect(clippy::expect_used)]
     async fn from_pipeline(p: Arc<tokio::sync::Mutex<dyn Pipeline + Sync + Send>>) -> Self {
         Self {
             pipeline: MistralRsBuilder::new(
@@ -415,7 +418,6 @@ impl MistralLlama {
     }
 
     /// Prepares and sends a [`CreateChatCompletionRequest`] to the model pipeline.
-    #[allow(clippy::cast_possible_truncation)]
     async fn send_message(
         &self,
         req: CreateChatCompletionRequest,
@@ -441,8 +443,8 @@ impl MistralLlama {
             frequency_penalty: req.frequency_penalty,
             presence_penalty: req.presence_penalty,
             stop_toks: req.stop.map(|s| match s {
-                Stop::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
-                Stop::StringArray(s) => mistralrs::StopTokens::Seqs(s),
+                StopConfiguration::String(s) => mistralrs::StopTokens::Seqs(vec![s]),
+                StopConfiguration::StringArray(s) => mistralrs::StopTokens::Seqs(s),
             }),
             max_len: req.max_completion_tokens.map(|x| x as usize),
             logits_bias: None,
@@ -683,7 +685,7 @@ fn stream_from_response(
 }
 
 /// Convert a [`CompletionChunkResponse`] to a [`CreateChatCompletionStreamResponse`].
-#[allow(clippy::cast_possible_truncation)]
+#[expect(deprecated, clippy::cast_possible_truncation)]
 fn chunk_to_openai_stream(
     c: ChatCompletionChunkResponse,
 ) -> Result<CreateChatCompletionStreamResponse, OpenAIError> {
@@ -692,30 +694,25 @@ fn chunk_to_openai_stream(
         .iter()
         .map(chunk_choices_to_openai)
         .collect::<Result<Vec<_>, OpenAIError>>()?;
-    Ok(CreateChatCompletionStreamResponse {
-        id: c.id,
-        model: c.model,
-        system_fingerprint: Some(c.system_fingerprint),
-        object: "chat.completion.chunk".to_string(),
-        // mistralrs uses milliseconds, OpenAI uses seconds
-        created: (c.created / 1000) as u32,
-        service_tier: None,
-        usage: c.usage.map(|u| CompletionUsage {
-            prompt_tokens: u.prompt_tokens as u32,
-            completion_tokens: u.completion_tokens as u32,
-            total_tokens: u.total_tokens as u32,
-            prompt_tokens_details: None,
-            completion_tokens_details: None,
-        }),
-        choices,
-    })
+
+    let usage = c.usage.map(|u| CompletionUsage {
+        prompt_tokens: u.prompt_tokens as u32,
+        completion_tokens: u.completion_tokens as u32,
+        total_tokens: u.total_tokens as u32,
+        prompt_tokens_details: None,
+        completion_tokens_details: None,
+    });
+
+    // mistralrs uses milliseconds, OpenAI uses seconds
+    let created = (c.created / 1000) as u32;
+
+    let mut response =
+        create_stream_response_with_timestamp(&c.id, &c.model, choices, usage, created)?;
+    response.system_fingerprint = Some(c.system_fingerprint);
+    Ok(response)
 }
 
-#[allow(
-    deprecated,
-    clippy::cast_possible_truncation,
-    clippy::cast_possible_wrap
-)]
+#[expect(deprecated, clippy::cast_possible_truncation)]
 fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, OpenAIError> {
     let ChunkChoice {
         index,
@@ -724,13 +721,13 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
         ..
     } = choice;
     let role: Role = serde_json::from_str(&format!("\"{}\"", delta.role))
-        .map_err(OpenAIError::JSONDeserialize)?;
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to parse role: {e}")))?;
 
     let finish_reason: Option<FinishReason> = finish_reason
         .as_ref()
         .map(|f| serde_json::from_str(&format!("\"{f}\"")))
         .transpose()
-        .map_err(OpenAIError::JSONDeserialize)?;
+        .map_err(|e| OpenAIError::InvalidArgument(format!("Failed to parse finish_reason: {e}")))?;
 
     Ok(ChatChoiceStream {
         index: *index as u32,
@@ -752,12 +749,13 @@ fn chunk_choices_to_openai(choice: &ChunkChoice) -> Result<ChatChoiceStream, Ope
 
 fn convert_tool_choice(x: &ChatCompletionToolChoiceOption) -> ToolChoice {
     match x {
-        ChatCompletionToolChoiceOption::None => ToolChoice::None,
-        ChatCompletionToolChoiceOption::Auto => ToolChoice::Auto,
-        ChatCompletionToolChoiceOption::Required => {
+        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Auto) => ToolChoice::Auto,
+        ChatCompletionToolChoiceOption::Mode(ToolChoiceOptions::Required) => {
             unimplemented!("`mistral_rs::core` does not yet have `ToolChoice::Required`")
         }
-        ChatCompletionToolChoiceOption::Named(t) => ToolChoice::Tool(convert_named_tool(t)),
+        ChatCompletionToolChoiceOption::Function(t) => ToolChoice::Tool(convert_named_tool(t)),
+        // None, AllowedTools, or Custom not supported
+        _ => ToolChoice::None,
     }
 }
 
@@ -774,17 +772,27 @@ fn convert_named_tool(x: &ChatCompletionNamedToolChoice) -> Tool {
     }
 }
 
-fn convert_tool(x: &ChatCompletionTool) -> Tool {
-    Tool {
-        tp: ToolType::Function,
-        function: Function {
-            description: x.function.description.clone(),
-            name: x.function.name.clone(),
-            parameters: x
-                .function
-                .parameters
-                .clone()
-                .and_then(|p| p.as_object().map(|p| HashMap::from_iter(p.clone()))),
+fn convert_tool(x: &ChatCompletionTools) -> Tool {
+    match x {
+        ChatCompletionTools::Function(tool) => Tool {
+            tp: ToolType::Function,
+            function: Function {
+                description: tool.function.description.clone(),
+                name: tool.function.name.clone(),
+                parameters: tool
+                    .function
+                    .parameters
+                    .clone()
+                    .and_then(|p| p.as_object().map(|p| HashMap::from_iter(p.clone()))),
+            },
+        },
+        ChatCompletionTools::Custom(_) => Tool {
+            tp: ToolType::Function,
+            function: Function {
+                description: None,
+                name: String::new(),
+                parameters: None,
+            },
         },
     }
 }
@@ -796,7 +804,7 @@ fn parse_tool_call_response(
     ChatCompletionMessageToolCallChunk {
         id: Some(r.id.clone()),
         index,
-        r#type: Some(ChatCompletionToolType::Function),
+        r#type: Some(FunctionType::Function),
         function: Some(FunctionCallStream {
             name: Some(r.function.name.clone()),
             arguments: Some(r.function.arguments.clone()),

@@ -21,6 +21,7 @@ use arrow::datatypes::{DataType, Schema, SchemaRef};
 use arrow_schema::Field;
 use arrow_tools::schema;
 use async_trait::async_trait;
+use chunking::{Chunker, ChunkingConfig};
 use datafusion::catalog::Session;
 use datafusion::common::{Constraints, Statistics, project_schema};
 use datafusion::error::Result as DataFusionResult;
@@ -32,33 +33,35 @@ use datafusion::{
     logical_expr::Expr,
 };
 use itertools::Itertools;
-use llms::{
-    chunking::{Chunker, ChunkingConfig},
-    embeddings::Error as EmbedError,
-};
 use snafu::prelude::*;
 
-use tokio::sync::RwLock;
-
 use crate::embeddings::common::base_col;
+use crate::embeddings::construct_chunker;
 use crate::embeddings::execution_plan::EmbeddingTableExec;
 use crate::model::EmbeddingModelStore;
 use crate::{embedding_col, offset_col};
+use spicepod::component::embeddings::ColumnEmbeddingConfig;
+use tokio::sync::RwLock;
 
 use super::common::{is_valid_embedding_type, is_valid_offset_type, vector_length};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Column '{column}' has an unsupported data type for embedding. Only string types are allowed.\nFor details, visit: https://spiceai.org/docs/components/embeddings",
+        "Column '{column}' has an unsupported data type for embedding. Only string types are allowed. For details, visit: https://spiceai.org/docs/components/embeddings",
     ))]
     InvalidColumnType { column: String, data_type: DataType },
+
+    #[snafu(display(
+        "The dataset is configured with an embedding model '{model}' to embed column '{column}', but the model '{model}' is not defined in Spicepod (as an 'embeddings') or failed to load.\nFor details, visit: https://spiceai.org/docs/components/embeddings"
+    ))]
+    EmbeddingModelNotFound { column: String, model: String },
 }
 
 /// An [`EmbeddingTable`] is a [`TableProvider`] where some columns are augmented with associated embedding columns
 #[derive(Clone)]
 pub struct EmbeddingTable {
-    base_table: Arc<dyn TableProvider>,
+    pub base_table: Arc<dyn TableProvider>,
 
     pub embedded_columns: HashMap<String, EmbeddingColumnConfig>,
 
@@ -101,18 +104,74 @@ impl std::fmt::Debug for EmbeddingColumnConfig {
 }
 
 impl EmbeddingTable {
-    /// When creating a new [`EmbeddingTable`], the provided columns (in `embedded_column_to_model`) must be checked to see if they are already in the base table.
+    pub async fn from_spicepod_columns(
+        base_table: Arc<dyn TableProvider>,
+        embeddings: Vec<ColumnEmbeddingConfig>,
+        embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
+        file_format: Option<&str>,
+    ) -> Result<Arc<dyn TableProvider>, Error> {
+        if embeddings.is_empty() {
+            return Ok(base_table);
+        }
+
+        let embed_columns: HashMap<String, ColumnEmbeddingConfig, _> = embeddings
+            .iter()
+            .map(|e| (e.column.clone(), e.clone()))
+            .collect::<HashMap<_, _>>();
+
+        // Early check if embedding models are available.
+        for (column, config) in &embed_columns {
+            let model = &config.model;
+            if !embedding_models.read().await.contains_key(model) {
+                return Err(Error::EmbeddingModelNotFound {
+                    column: column.clone(),
+                    model: model.clone(),
+                });
+            }
+        }
+
+        let embed_chunker_config: HashMap<String, ChunkingConfig> = embeddings
+            .iter()
+            .filter(|e| e.chunking.as_ref().is_some_and(|s| s.enabled))
+            .filter_map(|e| {
+                e.chunking.as_ref().map(|chunk_cfg| {
+                    (
+                        e.column.clone(),
+                        ChunkingConfig {
+                            target_chunk_size: chunk_cfg.target_chunk_size,
+                            overlap_size: chunk_cfg.overlap_size,
+                            trim_whitespace: chunk_cfg.trim_whitespace,
+                            file_format,
+                        },
+                    )
+                })
+            })
+            .collect::<HashMap<_, _>>();
+
+        let embedding_table = EmbeddingTable::try_new(
+            base_table,
+            embed_columns,
+            Arc::clone(embedding_models),
+            embed_chunker_config,
+        )
+        .await?;
+
+        Ok(Arc::new(embedding_table) as Arc<dyn TableProvider>)
+    }
+
+    /// When creating a new [`EmbeddingTable`], the provided columns (in `embed_columns`) must be checked to see if they are already in the base table.
     /// Constructing the [`EmbeddingColumnConfig`] for each column is different depending on whether the column is in the base table or not.
     pub async fn try_new(
         base_table: Arc<dyn TableProvider>,
-        embedded_column_to_model: HashMap<String, String>,
+        embed_columns: HashMap<String, ColumnEmbeddingConfig>,
         embedding_models: Arc<RwLock<EmbeddingModelStore>>,
         embed_chunker_config: HashMap<String, ChunkingConfig<'_>>,
     ) -> Result<Self, Error> {
         let base_schema = base_table.schema();
         let mut embedded_columns: HashMap<String, EmbeddingColumnConfig> = HashMap::new();
 
-        for (column, model) in embedded_column_to_model {
+        for (column, config) in embed_columns {
+            let model = config.model;
             let chunking_config_opt = embed_chunker_config.get(&column);
 
             if Self::base_table_has_embedding_column(&base_schema, &column) {
@@ -129,10 +188,10 @@ impl EmbeddingTable {
 
                 let Some(vector_length) =
                     Self::embedding_size_from_base_table(&column, &base_schema)
+                        .or(config.vector_size.and_then(|sz| i32::try_from(sz).ok()))
                 else {
                     tracing::warn!(
-                        "Column '{}' has embeddings in base table, but the vector length could not be determined. Ignoring column.",
-                        column
+                        "Column '{column}' has embeddings in base table, but the vector length could not be determined from schema. Ignoring column. Provide a value for the vector_size key in the column's embedding configuration.",
                     );
                     continue;
                 };
@@ -164,8 +223,7 @@ impl EmbeddingTable {
 
                 let mut chunker = None;
                 if let Some(chunking_config) = chunking_config_opt {
-                    match Self::construct_chunker(&model, chunking_config, &embedding_models).await
-                    {
+                    match construct_chunker(&model, chunking_config, &embedding_models).await {
                         Ok(c) => chunker = Some(c),
                         Err(e) => {
                             tracing::warn!(
@@ -223,17 +281,16 @@ impl EmbeddingTable {
         if let DataType::List(inner)
         | DataType::LargeList(inner)
         | DataType::FixedSizeList(inner, _) = embedding_field.data_type()
+            && let DataType::FixedSizeList(_, _) = inner.data_type()
         {
-            if let DataType::FixedSizeList(_, _) = inner.data_type() {
-                let Some((_, offsets_field)) =
-                    base_schema.column_with_name(offset_col!(column).as_str())
-                else {
-                    return false;
-                };
+            let Some((_, offsets_field)) =
+                base_schema.column_with_name(offset_col!(column).as_str())
+            else {
+                return false;
+            };
 
-                if !is_valid_offset_type(offsets_field.data_type()) {
-                    return false;
-                }
+            if !is_valid_offset_type(offsets_field.data_type()) {
+                return false;
             }
         }
         true
@@ -326,20 +383,9 @@ impl EmbeddingTable {
         self.base_table.schema()
     }
 
-    /// Makes a [`Chunker`] from [`ChunkingConfig`] and a column's embedding model in [`EmbeddingModelStore`].
-    async fn construct_chunker(
-        model_name: &str,
-        chunk_config: &ChunkingConfig<'_>,
-        embedding_models: &Arc<RwLock<EmbeddingModelStore>>,
-    ) -> Result<Arc<dyn Chunker>, EmbedError> {
-        let embedding_models_guard = embedding_models.read().await;
-        let Some(embed_model) = embedding_models_guard.get(model_name) else {
-            // Don't need warn, as we should have already checked/logged this.
-            return Err(EmbedError::ModelDoesNotExist {
-                model_name: model_name.to_string(),
-            });
-        };
-        embed_model.chunker(chunk_config)
+    #[must_use]
+    pub fn get_underlying_ref(&self) -> &Arc<dyn TableProvider> {
+        &self.base_table
     }
 
     fn embedding_size_from_base_table(column: &str, base_schema: &SchemaRef) -> Option<i32> {
@@ -457,7 +503,7 @@ impl EmbeddingTable {
         } else {
             vec![Arc::new(Field::new_fixed_size_list(
                 embedding_col!(field.name()),
-                Field::new("item", DataType::Float32, false),
+                Field::new("item", DataType::Float32, true),
                 cfg.vector_size,
                 true,
             ))]

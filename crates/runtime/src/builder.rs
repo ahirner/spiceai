@@ -14,19 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
-
+use crate::cluster::ResolvedClusterConfig;
+use crate::config::Config;
+use crate::datafusion::udf::register_udfs;
 use crate::{
     Runtime, catalogconnector,
     dataaccelerator::AcceleratorEngineRegistry,
     dataconnector,
     datafusion::DataFusion,
     datasets_health_monitor::DatasetsHealthMonitor,
-    embeddings::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFunc},
     extension::{Extension, ExtensionFactory},
     flight::RateLimits,
     metrics, podswatcher,
-    search::full_text::udtf::{TEXT_SEARCH_UDTF_NAME, TextSearchTableFunc},
     secrets::{self, Secrets},
     status,
     timing::TimeMeasurement,
@@ -34,8 +33,11 @@ use crate::{
 };
 use app::App;
 use spicepod::component::caching::Caching;
+use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use token_provider::registry::TokenProviderRegistry;
+use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
+use util::in_tracing_context;
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
@@ -49,9 +51,12 @@ pub struct RuntimeBuilder {
     prometheus_registry: Option<prometheus::Registry>,
     runtime_status: Arc<status::RuntimeStatus>,
     rate_limits: Option<Arc<RateLimits>>,
+    io_runtime: Option<Handle>,
     accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     datafusion_configuration_fn: Option<DatafusionConfigurationCallback>,
     token_provider_registry: Arc<TokenProviderRegistry>,
+    runtime_config: Arc<Config>,
+    resolved_cluster_config: Option<ResolvedClusterConfig>,
 }
 
 impl RuntimeBuilder {
@@ -66,9 +71,12 @@ impl RuntimeBuilder {
             autoload_extensions: HashMap::new(),
             runtime_status: status::RuntimeStatus::new(),
             rate_limits: None,
+            io_runtime: None,
             accelerator_engine_registry: Arc::new(AcceleratorEngineRegistry::new()),
             datafusion_configuration_fn: None,
             token_provider_registry: Arc::new(TokenProviderRegistry::new()),
+            runtime_config: Arc::new(Config::default()),
+            resolved_cluster_config: None,
         }
     }
 
@@ -79,6 +87,11 @@ impl RuntimeBuilder {
 
     pub fn with_app_opt(mut self, app: Option<Arc<app::App>>) -> Self {
         self.app = app;
+        self
+    }
+
+    pub fn with_runtime_config(mut self, config: Config) -> Self {
+        self.runtime_config = Arc::new(config);
         self
     }
 
@@ -126,36 +139,49 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Used to configure `DataFusion` in integration tests & test CI
-    pub fn with_datafusion_configuration_fn(
-        mut self,
-        callback: DatafusionConfigurationCallback,
-    ) -> Self {
-        self.datafusion_configuration_fn = Some(callback);
-        self
-    }
-
     pub fn with_rate_limits(mut self, rate_limits: RateLimits) -> Self {
         self.rate_limits = Some(Arc::new(rate_limits));
         self
     }
 
-    #[allow(clippy::too_many_lines)]
+    pub fn with_io_runtime(mut self, io_runtime: Handle) -> Self {
+        self.io_runtime = Some(io_runtime);
+        self
+    }
+
+    pub fn with_resolved_cluster_config(
+        mut self,
+        resolved_cluster_config: ResolvedClusterConfig,
+    ) -> Self {
+        self.resolved_cluster_config = Some(resolved_cluster_config);
+        self
+    }
+
     pub async fn build(self) -> Runtime {
+        // Initialize DataFusion tracer for span context propagation across async boundaries
+        if let Err(e) = tracers::init_datafusion_tracer() {
+            tracing::warn!(
+                "Failed to initialize DataFusion tracer: {e}. Span context may not propagate correctly across async boundaries."
+            );
+        }
+
         self.accelerator_engine_registry.register_all().await;
         dataconnector::register_all().await;
         catalogconnector::register_all().await;
         document_parse::register_all().await;
 
-        let memory_limit = self
+        let query = self
             .app
             .as_ref()
-            .and_then(|app| parse_memory_limit(app.runtime.memory_limit.clone()));
+            .and_then(|app| app.runtime.query.clone())
+            .unwrap_or_default();
 
-        let temp_directory = self
+        let memory_limit = parse_memory_limit(query.memory_limit.clone());
+
+        let metrics = self
             .app
             .as_ref()
-            .and_then(|app| app.runtime.temp_directory.clone());
+            .and_then(|app| app.runtime.metrics.clone());
 
         let dataset_parallelism = self
             .app
@@ -176,24 +202,36 @@ impl RuntimeBuilder {
             .as_ref()
             .and_then(|app| app.runtime.results_cache.clone())
         {
-            crate::in_tracing_context(|| {
+            in_tracing_context(|| {
                 tracing::warn!(
-                    "The `results_cache` Runtime parameter is deprecated and will be removed in a future release.\nUse `caching.sql_results` instead.\nFor more information, visit: https://spiceai.org/docs/features/caching"
+                    "The `results_cache` Runtime parameter is deprecated and will be removed in a future release. Use `caching.sql_results` instead. For more information, visit: https://spiceai.org/docs/features/caching"
                 );
             });
             caching_config.sql_results = Some(results_cache.into());
         }
 
         let caching = Runtime::init_caching(Some(&caching_config));
+        let io_runtime = self.io_runtime.clone().unwrap_or_else(|| Handle::current());
+
+        // Create resource monitor early so it can be passed to DataFusion
+        let resource_monitor = crate::resource_monitor::ResourceMonitor::new();
 
         let mut df_builder = DataFusion::builder(
             Arc::clone(&self.runtime_status),
             Arc::clone(&self.accelerator_engine_registry),
+            io_runtime.clone(),
         )
         .memory_limit(memory_limit)
-        .temp_directory(temp_directory)
+        .temp_directory(query.temp_directory)
+        .spill_compression(query.spill_compression)
         .with_task_history(task_history)
-        .with_caching(caching);
+        .with_caching(caching)
+        .with_metrics(metrics)
+        .with_resource_monitor(resource_monitor.clone());
+
+        if let Some(resolved_cluster_config) = self.resolved_cluster_config {
+            df_builder = df_builder.with_cluster_config(resolved_cluster_config);
+        }
 
         if let Some(dataset_parallelism) = dataset_parallelism {
             df_builder = df_builder.max_parallel_accelerated_refreshes(dataset_parallelism);
@@ -206,16 +244,6 @@ impl RuntimeBuilder {
         }
 
         let df = Arc::new(df);
-
-        // UDFs that require a weak reference to the DataFusion instance defined here.
-        df.ctx.register_udtf(
-            TEXT_SEARCH_UDTF_NAME,
-            Arc::new(TextSearchTableFunc::new(Arc::downgrade(&df))),
-        );
-        df.ctx.register_udtf(
-            VECTOR_SEARCH_UDTF_NAME,
-            Arc::new(VectorSearchTableFunc::new(Arc::downgrade(&df))),
-        );
 
         let datasets_health_monitor = if self.datasets_health_monitor_enabled {
             let is_task_history_enabled = self
@@ -242,7 +270,8 @@ impl RuntimeBuilder {
             app: Arc::new(RwLock::new(self.app)),
             df,
             models: Arc::new(RwLock::new(HashMap::new())),
-            llms: Arc::new(RwLock::new(HashMap::new())),
+            completion_llms: Arc::new(RwLock::new(HashMap::new())),
+            responses_llms: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             embeds: Arc::new(RwLock::new(HashMap::new())),
             evals: Arc::new(RwLock::new(evals)),
@@ -258,11 +287,14 @@ impl RuntimeBuilder {
             metrics_endpoint: self.metrics_endpoint,
             prometheus_registry: self.prometheus_registry,
             rate_limits: self.rate_limits.unwrap_or_default(),
+            io_runtime,
             status: self.runtime_status,
-            runtime_tasks: Arc::new(RwLock::new(HashMap::new())),
+            tasks: Arc::new(RwLock::new(HashMap::new())),
             accelerator_engine_registry: self.accelerator_engine_registry,
             token_provider_registry: self.token_provider_registry,
             schedulers: Arc::new(RwLock::new(HashMap::new())),
+            resource_monitor,
+            config: Arc::clone(&self.runtime_config),
         };
 
         let mut extensions: HashMap<String, Arc<dyn Extension>> = HashMap::new();
@@ -277,6 +309,8 @@ impl RuntimeBuilder {
         }
         rt.extensions = Arc::new(RwLock::new(extensions));
 
+        register_udfs(&rt).await;
+
         rt
     }
 
@@ -284,10 +318,10 @@ impl RuntimeBuilder {
         let _guard = TimeMeasurement::new(&metrics::secrets::STORES_LOAD_DURATION_MS, &[]);
         let mut secrets = secrets::Secrets::new();
 
-        if let Some(app) = app {
-            if let Err(e) = secrets.load_from(&app.secrets).await {
-                eprintln!("Error loading secret stores: {e}");
-            }
+        if let Some(app) = app
+            && let Err(e) = secrets.load_from(&app.secrets).await
+        {
+            eprintln!("Error loading secret stores: {e}");
         }
 
         secrets
@@ -304,24 +338,24 @@ fn parse_memory_limit(memory_limit: Option<String>) -> Option<u64> {
     let memory_limit = memory_limit?;
     let original_memory_limit = memory_limit.clone();
 
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let memory_limit = byte_unit::Byte::from_str(&memory_limit)
         .ok()
         // losing the fractional part of a byte is not a problem
         .map(|v| v.get_adjusted_unit(byte_unit::Unit::B).get_value() as u64);
 
     if memory_limit.is_none() {
-        crate::in_tracing_context(|| {
+        in_tracing_context(|| {
             tracing::warn!(
-                "An invalid Runtime memory limit was specified: {original_memory_limit}\n A memory limit must be specified as an integer in GB, MB, or KB size."
+                "An invalid Runtime memory limit was specified: {original_memory_limit} A memory limit must be specified as an integer in GB, MB, or KB size."
             );
         });
     }
 
     if memory_limit == Some(0) {
-        crate::in_tracing_context(|| {
+        in_tracing_context(|| {
             tracing::warn!(
-                "A Runtime memory limit of 0 was specified: {original_memory_limit}\n A memory limit must be greater than 0."
+                "A Runtime memory limit of 0 was specified: {original_memory_limit} A memory limit must be greater than 0."
             );
         });
         None

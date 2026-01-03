@@ -19,10 +19,12 @@ use std::sync::Arc;
 use arrow_schema::SchemaRef;
 use arrow_tools::schema::schema_meta_get_computed_columns;
 use datafusion::arrow::datatypes::Schema;
+use datafusion::error::DataFusionError;
 use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::ast::{Expr, GroupByExpr, SelectItem, SetExpr};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
 use datafusion::sql::{TableReference, sqlparser};
+use datafusion_expr::sqlparser::ast::LimitClause;
 use itertools::Itertools;
 use snafu::prelude::*;
 use sqlparser::ast::Statement as SQLStatement;
@@ -32,14 +34,12 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "The provided Refresh SQL could not be parsed.\n{source}\nCheck the SQL for syntax errors."
+        "The provided Refresh SQL could not be parsed. {source} Check the SQL for syntax errors."
     ))]
-    UnableToParseSql {
-        source: sqlparser::parser::ParserError,
-    },
+    UnableToParseSql { source: DataFusionError },
 
     #[snafu(display(
-        "Expected a single SQL statement for the refresh SQL, found {num_statements}.\nRewrite the SQL to only contain a single SELECT statement."
+        "Expected a single SQL statement for the refresh SQL, found {num_statements}. Rewrite the SQL to only contain a single SELECT statement."
     ))]
     ExpectedSingleSqlStatement { num_statements: usize },
 
@@ -47,7 +47,7 @@ pub enum Error {
     InvalidSqlStatement { expected_table: TableReference },
 
     #[snafu(display(
-        "Unexpected '{expr}' in the Refresh SQL statement.\nRewrite the SQL to only perform WHERE filters, i.e. SELECT col1, col2, col3 FROM {expected_table} WHERE col1 = 'foo'"
+        "Unexpected '{expr}' in the Refresh SQL statement. Rewrite the SQL to only perform WHERE filters, i.e. SELECT col1, col2, col3 FROM {expected_table} WHERE col1 = 'foo'"
     ))]
     UnexpectedExpression {
         expr: &'static str,
@@ -55,12 +55,12 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Only column references are allowed in the SELECT clause of the refresh SQL, custom expressions and aliases are not supported.\nChange the SQL to only use columns references, i.e. SELECT col1, col2, col3 FROM {expected_table}"
+        "Only column references are allowed in the SELECT clause of the refresh SQL, custom expressions and aliases are not supported. Change the SQL to only use columns references, i.e. SELECT col1, col2, col3 FROM {expected_table}"
     ))]
     OnlyColumnReferences { expected_table: TableReference },
 
     #[snafu(display(
-        "The column '{column}' is not present in the source table '{expected_table}', valid columns are: {valid_columns}\nRewrite the SQL to only select columns that exist in the source table."
+        "The column '{column}' is not present in the source table '{expected_table}', valid columns are: {valid_columns} Rewrite the SQL to only select columns that exist in the source table."
     ))]
     ColumnNotFoundInSource {
         column: Arc<str>,
@@ -84,7 +84,6 @@ macro_rules! ensure_no_expr {
     };
 }
 
-#[allow(clippy::too_many_lines)]
 pub fn validate_refresh_sql(
     expected_table: TableReference,
     refresh_sql: &str,
@@ -104,11 +103,28 @@ pub fn validate_refresh_sql(
         Statement::Statement(statement) => match statement.as_ref() {
             SQLStatement::Query(query) => {
                 ensure_no_expr!(query.fetch.is_none(), "FETCH", expected_table);
-                ensure_no_expr!(query.offset.is_none(), "OFFSET", expected_table);
                 ensure_no_expr!(query.with.is_none(), "WITH", expected_table);
                 ensure_no_expr!(query.order_by.is_none(), "ORDER BY", expected_table);
                 ensure_no_expr!(query.for_clause.is_none(), "FOR", expected_table);
-                ensure_no_expr!(query.limit_by.is_empty(), "LIMIT BY", expected_table);
+
+                if let Some(limit) = &query.limit_clause {
+                    let LimitClause::LimitOffset {
+                        limit: _,
+                        offset,
+                        limit_by,
+                    } = limit
+                    else {
+                        return UnexpectedExpressionSnafu {
+                            expr: "LIMIT <offset>, <limit>",
+                            expected_table,
+                        }
+                        .fail();
+                    };
+
+                    ensure_no_expr!(limit_by.is_empty(), "LIMIT BY", expected_table);
+                    ensure_no_expr!(offset.is_none(), "OFFSET", expected_table);
+                }
+
                 ensure_no_expr!(query.format_clause.is_none(), "FORMAT", expected_table);
                 ensure_no_expr!(query.settings.is_none(), "SETTINGS", expected_table);
 
@@ -191,7 +207,6 @@ pub fn validate_refresh_sql(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn validate_select_columns(
     select: &Vec<SelectItem>,
     source_schema: Arc<Schema>,

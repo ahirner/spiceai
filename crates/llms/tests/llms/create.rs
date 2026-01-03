@@ -16,12 +16,17 @@ limitations under the License.
 
 use anyhow::Context;
 use async_openai::error::OpenAIError;
+use aws_config::Region;
+use aws_credential_types::Credentials;
+use aws_sdk_credential_bridge::default_aws_config;
 use hf_hub::{Repo, RepoType, api::sync::ApiBuilder};
 use llms::{
     anthropic::Anthropic,
+    bedrock::chat::BedrockConverse,
     chat::{Chat, Error as ChatError, create_hf_model, create_local_model},
     config::GenericAuthMechanism,
     embeddings::candle::link_files_into_tmp_dir,
+    google::Google,
     openai::new_openai_client,
     perplexity::PerplexitySonar,
     xai::Xai,
@@ -33,6 +38,46 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+pub(crate) async fn create_bedrock(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
+    let mut config_builder = default_aws_config();
+
+    if let Ok(region) = std::env::var("SPICE_BEDROCK_REGION") {
+        config_builder = config_builder.region(Region::new(region));
+    }
+
+    match (
+        std::env::var("SPICE_BEDROCK_ACCESS_KEY"),
+        std::env::var("SPICE_BEDROCK_SECRET_KEY"),
+    ) {
+        (Ok(access_key), Ok(secret_key)) => {
+            config_builder = config_builder.credentials_provider(Credentials::new(
+                access_key,
+                secret_key,
+                std::env::var("SPICE_BEDROCK_SESSION_TOKEN").ok(),
+                None,
+                "bedrock-chat",
+            ));
+        }
+        (Err(_), Ok(_)) => {
+            return Err(anyhow::anyhow!("SPICE_BEDROCK_ACCESS_KEY not set"));
+        }
+        (Ok(_), Err(_)) => {
+            return Err(anyhow::anyhow!("SPICE_BEDROCK_SECRET_KEY not set"));
+        }
+        (Err(_), Err(_)) => {
+            return Err(anyhow::anyhow!(
+                "SPICE_BEDROCK_ACCESS_KEY & SPICE_BEDROCK_SECRET_KEY not set"
+            ));
+        }
+    }
+
+    let config: aws_config::SdkConfig = config_builder.load().await;
+    Ok(Arc::new(BedrockConverse::new(
+        Arc::new((&config).into()),
+        model_id.to_string(),
+    )) as Arc<dyn Chat>)
+}
 
 pub(crate) fn create_xai(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
     let Ok(api_key) = std::env::var("SPICE_XAI_API_KEY") else {
@@ -47,6 +92,7 @@ pub(crate) fn create_openai(model_id: &str) -> Arc<dyn Chat> {
         model_id.to_string(),
         None,
         api_key.as_deref(),
+        None,
         None,
         None,
     ))
@@ -84,10 +130,21 @@ pub(crate) fn create_perplexity() -> Result<Arc<dyn Chat>, ChatError> {
     if let Ok(api_key) = std::env::var("SPICE_PERPLEXITY_AUTH_TOKEN") {
         params.insert("auth_token".to_string(), SecretString::from(api_key));
     }
-    let sonar = PerplexitySonar::from_params(None, &params)
+    let sonar = PerplexitySonar::from_unprefixed_params(None, &params)
         .map_err(|e| ChatError::FailedToLoadModel { source: e })?;
 
     Ok(Arc::new(sonar))
+}
+
+pub(crate) fn create_google(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
+    let api_key = std::env::var("SPICE_GOOGLE_API_KEY")
+        .or_else(|_| std::env::var("GEMINI_API_KEY"))
+        .context("SPICE_GOOGLE_API_KEY or GEMINI_API_KEY not set")?;
+
+    let google = Google::new(&SecretString::from(api_key), model_id)
+        .map_err(|e| anyhow::anyhow!("Failed to create Google client: {e}"))?;
+
+    Ok(Arc::new(google))
 }
 
 pub(crate) async fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow::Error> {
@@ -108,7 +165,7 @@ pub(crate) async fn create_local(model_id: &str) -> Result<Arc<dyn Chat>, anyhow
 }
 
 /// For a given `HuggingFace` repo, downloads the specified file and save them into provided folder. Return folder, and which ones are model weights.
-#[allow(clippy::case_sensitive_file_extension_comparisons)]
+#[expect(clippy::case_sensitive_file_extension_comparisons)]
 fn download_hf_model_artifacts(
     model_id: &str,
     revision: Option<&str>,
@@ -125,7 +182,7 @@ fn download_hf_model_artifacts(
     } else {
         Repo::new(model_id.to_string(), RepoType::Model)
     };
-    let api_repo = api.repo(repo.clone());
+    let api_repo = api.repo(repo);
 
     let mut files = HashMap::<String, PathBuf>::new();
     let mut weights = vec![];

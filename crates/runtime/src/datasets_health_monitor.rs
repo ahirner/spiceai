@@ -24,15 +24,17 @@ use std::{
 use arrow::array::{AsArray, RecordBatch};
 use datafusion::{datasource::TableProvider, error::DataFusionError, sql::TableReference};
 use futures::{future::join_all, stream::TryStreamExt};
+use iceberg_datafusion::IcebergTableProvider;
 use opentelemetry::KeyValue;
 use snafu::{ResultExt, Snafu};
 use tokio::sync::Mutex;
 use tracing_futures::Instrument;
 
 use crate::{
-    component::dataset::Dataset,
+    component::dataset::{CheckAvailability, Dataset},
     datafusion::{DataFusion, error::find_datafusion_root},
     metrics,
+    search::util::find_concrete_table_provider,
 };
 
 const DATASETS_AVAILABILITY_CHECK_INTERVAL_SECONDS: u64 = 60; // every minute
@@ -43,7 +45,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to read the table.\n{source}"))]
+    #[snafu(display("Failed to read the table. {source}"))]
     UnableToGetTable { source: DataFusionError },
 
     #[snafu(display("{source}"))]
@@ -51,11 +53,11 @@ pub enum Error {
         source: crate::datafusion::query::Error,
     },
 
-    #[snafu(display("Failed to get recently access datasets.\n{source}"))]
+    #[snafu(display("Failed to get recently access datasets. {source}"))]
     UnableToGetRecentlyAccessedDatasets { source: DataFusionError },
 
     #[snafu(display(
-        "Spice received an unexpected data type from a `task_history` query: {data_type}\nThis is likely a bug in Spice, which can be reported here: https://github.com/spiceai/spiceai/issues"
+        "Spice received an unexpected data type from a `task_history` query: {data_type} This is likely a bug in Spice, which can be reported here: https://github.com/spiceai/spiceai/issues"
     ))]
     UnexpectedDataType {
         data_type: arrow::datatypes::DataType,
@@ -63,7 +65,7 @@ pub enum Error {
 }
 
 #[derive(Clone)]
-struct DatasetAvailabilityInfo {
+pub struct DatasetAvailabilityInfo {
     name: String,
     table_provider: Arc<dyn TableProvider>,
     last_available_time: SystemTime,
@@ -95,7 +97,7 @@ enum AvailabilityVerificationResult {
 
 pub struct DatasetsHealthMonitor {
     df: Arc<DataFusion>,
-    monitored_datasets: Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>>,
+    pub monitored_datasets: Arc<Mutex<HashMap<String, Arc<DatasetAvailabilityInfo>>>>,
     is_task_history_enabled: bool,
 }
 
@@ -120,11 +122,28 @@ impl DatasetsHealthMonitor {
             return Ok(());
         }
 
+        if matches!(dataset.check_availability, CheckAvailability::Disabled) {
+            tracing::debug!(
+                "Skipping dataset {} for availability monitoring (disabled in config)",
+                dataset.name
+            );
+            return Ok(());
+        }
+
         let dataset_name = &dataset.name.to_string();
 
         tracing::debug!("Registering dataset {dataset_name} for periodic availability check");
 
         let table_provider = self.get_table_provider(dataset.name.clone()).await?;
+
+        // Don't enable health check for IcebergTableProvider until this is fixed:
+        // https://github.com/spiceai/spiceai/issues/6994
+        if find_concrete_table_provider::<IcebergTableProvider>(&table_provider).is_some() {
+            tracing::debug!(
+                "Availability monitoring skipped for dataset '{dataset_name}': Iceberg format unsupported. Support planned for future release.",
+            );
+            return Ok(());
+        }
 
         let mut monitored_datasets = self.monitored_datasets.lock().await;
         monitored_datasets.insert(
@@ -231,7 +250,7 @@ AND labels.error_code IS NULL"
                 // Only datasets without recent activity/availability
                 let datasets_to_check = datasets_for_availability_check(&monitored_datasets).await;
 
-                // check `task_history` first to exlude anything that had a successful query in the last 10 minutes
+                // check `task_history` first to exclude anything that had a successful query in the last 10 minutes
                 let recently_accessed_datasets = if is_task_history_enabled {
                     match Self::get_recently_accessed_datasets(Arc::clone(&df)).await {
                         Ok(datasets) => datasets,
@@ -320,7 +339,7 @@ async fn update_dataset_availability_info(
             report_dataset_unavailable_time(dataset_name, None);
         }
         AvailabilityVerificationResult::Unavailable(last_available_time, err) => {
-            tracing::warn!("Failed to verify the dataset {dataset_name} was available.\n{err}\n");
+            tracing::warn!("Failed to verify the dataset {dataset_name} was available. {err}");
             report_dataset_unavailable_time(dataset_name, Some(last_available_time));
         }
     }
@@ -396,6 +415,7 @@ mod test {
         catalog::MemorySchemaProvider, catalog::SchemaProvider, datasource::MemTable,
     };
     use std::sync::Arc;
+    use tokio::runtime::Handle;
 
     #[tokio::test]
     async fn test_register_dataset_with_schema() {
@@ -411,14 +431,18 @@ mod test {
             .build()
             .expect("Failed to build dataset");
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-        let table_provider = MemTable::try_new(schema, vec![]).expect("to create table provider");
+        let table_provider =
+            MemTable::try_new(schema, vec![vec![]]).expect("to create table provider");
         df.ctx
             .register_table(dataset.name.clone(), Arc::new(table_provider))
             .expect("to register table provider");
 
         let monitor = DatasetsHealthMonitor::new(Arc::clone(&df));
 
-        assert!(monitor.register_dataset(&dataset).await.is_ok());
+        monitor
+            .register_dataset(&dataset)
+            .await
+            .expect("should register dataset");
 
         monitor.deregister_dataset(&dataset.name.to_string()).await;
     }
@@ -427,7 +451,12 @@ mod test {
         accelerator_engine_registry: Arc<AcceleratorEngineRegistry>,
     ) -> Arc<DataFusion> {
         let df = Arc::new(
-            DataFusion::builder(RuntimeStatus::new(), accelerator_engine_registry).build(),
+            DataFusion::builder(
+                RuntimeStatus::new(),
+                accelerator_engine_registry,
+                Handle::current(),
+            )
+            .build(),
         );
 
         let catalog = df.ctx.catalog("spice").expect("default catalog is spice");

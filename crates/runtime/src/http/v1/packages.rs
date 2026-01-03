@@ -14,15 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use crate::objectstore::github::GitHubRawObjectStore;
 use axum::{
     Json,
     http::{StatusCode, header::CONTENT_TYPE},
     response::{IntoResponse, Response},
 };
 use object_store::{ObjectStore, path::Path};
+use runtime_object_store::store::github::GitHubRawObjectStore;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
+use tokio::runtime::Handle;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -99,7 +100,8 @@ pub(crate) async fn generate(Json(payload): Json<GeneratePackageRequest>) -> Res
 
     let github_token = payload.params.get("github_token").map(String::as_str);
 
-    let store = match GitHubRawObjectStore::try_new(org, repo, sha, github_token) {
+    let store = match GitHubRawObjectStore::try_new(org, repo, sha, github_token, Handle::current())
+    {
         Ok(store) => Arc::new(store) as Arc<dyn ObjectStore>,
         Err(e) => {
             return (StatusCode::BAD_REQUEST, e.to_string()).into_response();

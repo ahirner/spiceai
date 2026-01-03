@@ -19,7 +19,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt::Display};
 
-use crate::{component::dataset::ReadyState, metric::Metrics, param::Params};
+use crate::{
+    component::dataset::ReadyState,
+    metric::Metrics,
+    param::Params,
+    partitioning::{PartitionedBy, deserialize_partition_by},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -28,15 +33,21 @@ pub enum RefreshMode {
     Full,
     Append,
     Changes,
+    Caching,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum Mode {
     #[default]
     Memory,
+    /// Open an existing file if it exists, otherwise create a new one.
+    /// This is the default file behavior that preserves data across restarts.
     File,
+    /// Always create a new file, truncating/overwriting any existing file on startup.
+    /// Use this when you want a fresh acceleration on each startup.
+    FileCreate,
 }
 
 impl Display for Mode {
@@ -44,6 +55,7 @@ impl Display for Mode {
         match self {
             Mode::Memory => write!(f, "memory"),
             Mode::File => write!(f, "file"),
+            Mode::FileCreate => write!(f, "file_create"),
         }
     }
 }
@@ -109,23 +121,36 @@ impl Display for IndexType {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum OnConflictBehavior {
     #[default]
     Drop,
     Upsert,
+    UpsertDedup,
+    UpsertDedupByRowId,
 }
 
-impl Display for OnConflictBehavior {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            OnConflictBehavior::Drop => write!(f, "drop"),
-            OnConflictBehavior::Upsert => write!(f, "upsert"),
-        }
-    }
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotBehavior {
+    /// Snapshots are disabled (default).
+    #[default]
+    Disabled,
+    /// Enable both creating and bootstrapping from snapshots.
+    Enabled,
+    /// Only bootstrap from existing snapshots, don't attempt to create new ones.
+    BootstrapOnly,
+    /// Only create new snapshots.
+    CreateOnly,
 }
 
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::trivially_copy_pass_by_ref)]
+fn is_default_snapshot_behavior(b: &SnapshotBehavior) -> bool {
+    *b == SnapshotBehavior::Disabled
+}
+
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -206,11 +231,26 @@ pub struct Acceleration {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub metrics: Option<Metrics>,
 
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub partition_by: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_partition_by"
+    )]
+    pub partition_by: Vec<PartitionedBy>,
+
+    /// Enables snapshots for this dataset, requires the top-level config `snapshots` to be defined.
+    ///
+    /// Options: `enabled` / `disabled` / `bootstrap_only` / `create_only`.
+    ///
+    /// `disabled` (default) will turn off snapshots for this dataset.
+    /// `enabled` will enable both creating and bootstrapping from snapshots.
+    /// `bootstrap_only` will only bootstrap on startup, it won't attempt to write new snapshots.
+    /// `create_only` will only create snapshots, it won't attempt to bootstrap from one.
+    #[serde(default, skip_serializing_if = "is_default_snapshot_behavior")]
+    pub snapshots: SnapshotBehavior,
 }
 
-#[allow(clippy::trivially_copy_pass_by_ref)]
+#[expect(clippy::trivially_copy_pass_by_ref)]
 fn is_false(b: &bool) -> bool {
     !b
 }
@@ -220,7 +260,7 @@ const fn default_true() -> bool {
 }
 
 impl Default for Acceleration {
-    #[allow(deprecated)]
+    #[expect(deprecated)]
     fn default() -> Self {
         Self {
             enabled: true,
@@ -249,6 +289,69 @@ impl Default for Acceleration {
             on_conflict: HashMap::default(),
             metrics: None,
             partition_by: vec![],
+            snapshots: SnapshotBehavior::Disabled,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_yaml;
+
+    #[test]
+    fn test_deserialize_acceleration_on_conflict_string() {
+        let yaml = r"
+                on_conflict:
+                  foo: upsert
+            ";
+        let acceleration: Acceleration =
+            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert_eq!(
+            acceleration.on_conflict.get("foo"),
+            Some(&OnConflictBehavior::Upsert)
+        );
+    }
+
+    #[test]
+    fn test_deserialize_acceleration_on_conflict_upsert_dedup() {
+        let yaml = r"
+                on_conflict:
+                  foo: upsert_dedup
+            ";
+        let acceleration: Acceleration =
+            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert_eq!(
+            acceleration.on_conflict.get("foo"),
+            Some(&OnConflictBehavior::UpsertDedup)
+        );
+    }
+
+    #[test]
+    fn test_deserialize_acceleration_on_conflict_upsert_dedup_by_row_id() {
+        let yaml = r"
+                on_conflict:
+                  foo: upsert_dedup_by_row_id
+            ";
+        let acceleration: Acceleration =
+            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert_eq!(
+            acceleration.on_conflict.get("foo"),
+            Some(&OnConflictBehavior::UpsertDedupByRowId)
+        );
+    }
+
+    #[test]
+    fn test_deserialize_acceleration_on_conflict_drop_string() {
+        let yaml = r"
+                on_conflict:
+                  foo: drop
+            ";
+        let acceleration: Acceleration =
+            serde_yaml::from_str(yaml).expect("Failed to parse Acceleration");
+        assert_eq!(
+            acceleration.on_conflict.get("foo"),
+            Some(&OnConflictBehavior::Drop)
+        );
     }
 }

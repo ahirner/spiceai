@@ -28,11 +28,11 @@ use datafusion::{
 
 use futures::StreamExt;
 
-use super::{CandidateGeneration, FullTextSearchFieldIndex};
+use super::FullTextSearchFieldIndex;
 
 /// Executes a search on a [`FullTextSearchFieldIndex`] with a given query.
 pub struct FullTextSearchExec {
-    pub(super) index: FullTextSearchFieldIndex,
+    pub(super) index: Arc<FullTextSearchFieldIndex>,
     pub(super) query: String,
     filters: Vec<LogicalExpr>,
     limit: usize,
@@ -41,7 +41,7 @@ pub struct FullTextSearchExec {
 
 impl FullTextSearchExec {
     pub fn try_new(
-        index: FullTextSearchFieldIndex,
+        index: &Arc<FullTextSearchFieldIndex>,
         query: String,
         schema: SchemaRef,
         projection: Option<&Vec<usize>>,
@@ -54,7 +54,7 @@ impl FullTextSearchExec {
         };
 
         Ok(Self {
-            index,
+            index: Arc::clone(index),
             query,
             filters,
             limit,
@@ -113,14 +113,15 @@ impl ExecutionPlan for FullTextSearchExec {
         _partition: usize,
         _context: Arc<datafusion::execution::TaskContext>,
     ) -> DataFusionResult<SendableRecordBatchStream> {
-        let idx = self.index.clone();
+        let idx = Arc::clone(&self.index);
         let schema = self.schema();
         let limit = self.limit;
         let query = self.query.clone();
+
         let s = stream! {
-        // TODO: Support filters.
+          // TODO: Support filters.
             match idx
-                .search(query, &[], &[], limit)
+                .search(query, &[], limit)
                 .await
                 .map_err(|e| DataFusionError::Plan(format!("Failed to prepare full text search: {e}"))) {
                 Ok(mut stream) => {
@@ -128,14 +129,14 @@ impl ExecutionPlan for FullTextSearchExec {
                         match item {
                             Err(e) => yield Err(e),
                             Ok(rb) => {
-                                // Apply projection, as per `self.schema()`, to record batch from FTS.
-                                let proj = rb.schema().fields().iter().enumerate().filter_map(|(i, f)| {
-                                    if schema.column_with_name(f.name()).is_some() {
-                                        Some(i)
-                                    } else {
-                                        None
-                                    }
+                                let data_columns: Vec<_> = rb.schema().fields().iter().map(|f| f.name().clone()).collect();
+
+                                // Apply projection. Must return in the order it exists in
+                                // `self.schema()`, not in the record batch.
+                                let proj = schema.fields().iter().filter_map(|f| {
+                                    data_columns.iter().position(|data_col| data_col == f.name())
                                 }).collect::<Vec<_>>();
+
                                 yield rb.project(proj.as_slice()).map_err(DataFusionError::from)
                             }
                         }

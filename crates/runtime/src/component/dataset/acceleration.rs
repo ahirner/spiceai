@@ -14,9 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion_table_providers::util::column_reference::ColumnReference;
+#[cfg(feature = "duckdb")]
+use crate::dataaccelerator::partitioned_duckdb::{DuckDBPartitionMode, get_duckdb_partition_mode};
+use datafusion_table_providers::util::{
+    column_reference::ColumnReference, constraints::UpsertOptions,
+};
+use runtime_acceleration::snapshot::SnapshotBehavior;
 use serde::{Deserialize, Serialize};
-use spicepod::{acceleration as spicepod_acceleration, param::Params};
+use spicepod::{
+    acceleration::{self as spicepod_acceleration},
+    param::Params,
+    partitioning::PartitionedBy,
+};
 use std::{collections::HashMap, fmt::Display, sync::Arc, time::Duration};
 
 pub mod constraints;
@@ -30,6 +39,7 @@ pub enum RefreshMode {
     Full,
     Append,
     Changes,
+    Caching,
 }
 
 impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
@@ -38,6 +48,7 @@ impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
             spicepod_acceleration::RefreshMode::Full => RefreshMode::Full,
             spicepod_acceleration::RefreshMode::Append => RefreshMode::Append,
             spicepod_acceleration::RefreshMode::Changes => RefreshMode::Changes,
+            spicepod_acceleration::RefreshMode::Caching => RefreshMode::Caching,
         }
     }
 }
@@ -46,7 +57,12 @@ impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
 pub enum Mode {
     #[default]
     Memory,
+    /// Open an existing file if it exists, otherwise create a new one.
+    /// This is the default file behavior that preserves data across restarts.
     File,
+    /// Always create a new file, truncating/overwriting any existing file on startup.
+    /// Use this when you want a fresh acceleration on each startup.
+    FileCreate,
 }
 
 impl From<spicepod_acceleration::Mode> for Mode {
@@ -54,6 +70,7 @@ impl From<spicepod_acceleration::Mode> for Mode {
         match mode {
             spicepod_acceleration::Mode::Memory => Mode::Memory,
             spicepod_acceleration::Mode::File => Mode::File,
+            spicepod_acceleration::Mode::FileCreate => Mode::FileCreate,
         }
     }
 }
@@ -63,6 +80,7 @@ impl Display for Mode {
         match self {
             Mode::Memory => write!(f, "memory"),
             Mode::File => write!(f, "file"),
+            Mode::FileCreate => write!(f, "file_create"),
         }
     }
 }
@@ -128,19 +146,24 @@ pub enum Engine {
     Arrow,
     DuckDB,
     PartitionedDuckDB,
+    TableModePartitionedDuckDB,
     Sqlite,
+    Turso,
     PostgreSQL,
-    Void,
+    Cayenne,
 }
 
 impl Display for Engine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Engine::Arrow => write!(f, "arrow"),
-            Engine::DuckDB | Engine::PartitionedDuckDB => write!(f, "duckdb"),
+            Engine::DuckDB | Engine::PartitionedDuckDB | Engine::TableModePartitionedDuckDB => {
+                write!(f, "duckdb")
+            }
             Engine::Sqlite => write!(f, "sqlite"),
+            Engine::Turso => write!(f, "turso"),
             Engine::PostgreSQL => write!(f, "postgres"),
-            Engine::Void => write!(f, "void"),
+            Engine::Cayenne => write!(f, "cayenne"),
         }
     }
 }
@@ -153,8 +176,9 @@ impl TryFrom<&str> for Engine {
             "arrow" => Ok(Engine::Arrow),
             "duckdb" => Ok(Engine::DuckDB),
             "sqlite" => Ok(Engine::Sqlite),
+            "turso" => Ok(Engine::Turso),
             "postgres" | "postgresql" => Ok(Engine::PostgreSQL),
-            "void" => Ok(Engine::Void),
+            "cayenne" | "vortex" => Ok(Engine::Cayenne),
             _ => crate::AcceleratorEngineNotAvailableSnafu {
                 name: engine.to_string(),
             }
@@ -205,18 +229,26 @@ impl Display for IndexType {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum OnConflictBehavior {
     #[default]
     Drop,
-    Upsert,
+    Upsert(UpsertOptions),
 }
 
 impl From<spicepod_acceleration::OnConflictBehavior> for OnConflictBehavior {
     fn from(index_type: spicepod_acceleration::OnConflictBehavior) -> Self {
         match index_type {
             spicepod_acceleration::OnConflictBehavior::Drop => OnConflictBehavior::Drop,
-            spicepod_acceleration::OnConflictBehavior::Upsert => OnConflictBehavior::Upsert,
+            spicepod_acceleration::OnConflictBehavior::Upsert => {
+                OnConflictBehavior::Upsert(UpsertOptions::default())
+            }
+            spicepod_acceleration::OnConflictBehavior::UpsertDedup => {
+                OnConflictBehavior::Upsert(UpsertOptions::default().with_remove_duplicates(true))
+            }
+            spicepod_acceleration::OnConflictBehavior::UpsertDedupByRowId => {
+                OnConflictBehavior::Upsert(UpsertOptions::default().with_last_write_wins(true))
+            }
         }
     }
 }
@@ -224,7 +256,7 @@ impl From<spicepod_acceleration::OnConflictBehavior> for OnConflictBehavior {
 impl From<&str> for OnConflictBehavior {
     fn from(index_type: &str) -> Self {
         match index_type.to_lowercase().as_str() {
-            "upsert" => OnConflictBehavior::Upsert,
+            "upsert" => OnConflictBehavior::Upsert(UpsertOptions::default()),
             _ => OnConflictBehavior::Drop,
         }
     }
@@ -234,12 +266,39 @@ impl Display for OnConflictBehavior {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OnConflictBehavior::Drop => write!(f, "drop"),
-            OnConflictBehavior::Upsert => write!(f, "upsert"),
+            OnConflictBehavior::Upsert(_options) => write!(f, "upsert"),
         }
     }
 }
 
-#[allow(clippy::struct_excessive_bools)]
+/// Behavior when a stale-if-error condition occurs in caching mode.
+/// When enabled, serves expired cached data if the upstream source returns an error.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum StaleIfError {
+    /// Do not serve stale data on error - propagate the error to the client.
+    #[default]
+    Disabled,
+    /// Serve expired data if the upstream source returns an error.
+    Enabled,
+}
+
+impl StaleIfError {
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        matches!(self, StaleIfError::Enabled)
+    }
+}
+
+impl Display for StaleIfError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StaleIfError::Disabled => write!(f, "disabled"),
+            StaleIfError::Enabled => write!(f, "enabled"),
+        }
+    }
+}
+
+#[expect(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq)]
 pub struct Acceleration {
     pub enabled: bool,
@@ -253,6 +312,12 @@ pub struct Acceleration {
     pub refresh_on_startup: RefreshOnStartup,
 
     pub refresh_check_interval: Option<Duration>,
+
+    pub caching_ttl: Option<Duration>,
+
+    pub caching_stale_while_revalidate_ttl: Option<Duration>,
+
+    pub caching_stale_if_error: StaleIfError,
 
     pub refresh_cron: Option<Arc<str>>,
 
@@ -290,7 +355,13 @@ pub struct Acceleration {
 
     pub disable_federation: bool,
 
-    pub partition_by: Vec<String>,
+    pub partition_by: Vec<PartitionedBy>,
+
+    pub snapshot_behavior: SnapshotBehavior,
+
+    pub snapshots_trigger_threshold: Option<i64>,
+
+    pub snapshots_create_interval: Option<Duration>,
 }
 
 impl Acceleration {
@@ -313,7 +384,6 @@ impl Acceleration {
 impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
     type Error = crate::Error;
 
-    #[allow(clippy::too_many_lines)]
     fn try_from(
         acceleration: spicepod_acceleration::Acceleration,
     ) -> std::result::Result<Self, Self::Error> {
@@ -358,13 +428,19 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             );
         }
 
-        let engine =
-            match Engine::try_from(acceleration.engine.unwrap_or_else(|| "arrow".to_string()))? {
-                Engine::DuckDB if !acceleration.partition_by.is_empty() => {
-                    Engine::PartitionedDuckDB
+        let mut params = acceleration.params.clone();
+
+        let engine_str = acceleration.engine.as_deref().unwrap_or("arrow");
+        let engine = match Engine::try_from(engine_str)? {
+            #[cfg(feature = "duckdb")]
+            Engine::DuckDB if !acceleration.partition_by.is_empty() => {
+                match get_duckdb_partition_mode(&params) {
+                    DuckDBPartitionMode::Tables => Engine::TableModePartitionedDuckDB,
+                    DuckDBPartitionMode::Files => Engine::PartitionedDuckDB,
                 }
-                engine => engine,
-            };
+            }
+            engine => engine,
+        };
 
         if engine == Engine::Arrow && !indexes.is_empty() {
             tracing::warn!(
@@ -382,9 +458,14 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             );
         }
 
-        let mut params = acceleration.params.clone();
-
         let disable_federation = parse_is_query_federation_disabled(&mut params)?;
+        let snapshots_trigger_threshold = parse_snapshots_trigger_threshold(&mut params)?;
+        let snapshots_create_interval = parse_snapshots_create_interval(&mut params)?;
+
+        let caching_ttl = parse_caching_ttl(&mut params)?;
+        let caching_stale_while_revalidate_ttl =
+            parse_caching_stale_while_revalidate_ttl(&mut params)?;
+        let caching_stale_if_error = parse_caching_stale_if_error(&mut params)?;
 
         let refresh_check_interval = try_parse_duration(
             "refresh_check_interval",
@@ -401,6 +482,8 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
         let refresh_jitter_max =
             try_parse_duration("refresh_jitter_max", acceleration.refresh_jitter_max)?;
 
+        // TODO: Add validation for other refresh mode params here if needed.
+
         Ok(Acceleration {
             enabled: acceleration.enabled,
             mode: Mode::from(acceleration.mode),
@@ -408,6 +491,9 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             refresh_mode: acceleration.refresh_mode.map(RefreshMode::from),
             refresh_on_startup: RefreshOnStartup::from(acceleration.refresh_on_startup),
             refresh_check_interval,
+            caching_ttl,
+            caching_stale_while_revalidate_ttl,
+            caching_stale_if_error,
             refresh_cron,
             refresh_sql: acceleration.refresh_sql,
             refresh_data_window: acceleration.refresh_data_window,
@@ -433,6 +519,9 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             primary_key,
             on_conflict,
             partition_by: acceleration.partition_by,
+            snapshot_behavior: SnapshotBehavior::disabled(),
+            snapshots_trigger_threshold,
+            snapshots_create_interval,
         })
     }
 }
@@ -445,6 +534,9 @@ impl Default for Acceleration {
             engine: Engine::default(),
             refresh_mode: None,
             refresh_check_interval: None,
+            caching_ttl: None,
+            caching_stale_while_revalidate_ttl: None,
+            caching_stale_if_error: StaleIfError::default(),
             refresh_cron: None,
             refresh_sql: None,
             refresh_data_window: None,
@@ -465,27 +557,167 @@ impl Default for Acceleration {
             disable_federation: false,
             refresh_on_startup: RefreshOnStartup::default(),
             partition_by: vec![],
+            snapshot_behavior: SnapshotBehavior::Disabled,
+            snapshots_trigger_threshold: None,
+            snapshots_create_interval: None,
         }
     }
 }
 
 /// Returns true if the `query_federation` parameter is set to "disabled".
+#[expect(clippy::result_large_err)]
 fn parse_is_query_federation_disabled(params: &mut Option<Params>) -> Result<bool, crate::Error> {
-    if let Some(params) = params {
-        if let Some(value) = params.data.remove("query_federation") {
-            match value {
-                spicepod::param::ParamValue::String(s) if s == "enabled" => return Ok(false),
-                spicepod::param::ParamValue::String(s) if s == "disabled" => return Ok(true),
-                _ => {
-                    return Err(crate::Error::InvalidAccelerationConfiguration {
+    if let Some(params) = params
+        && let Some(value) = params.data.remove("query_federation")
+    {
+        match value {
+            spicepod::param::ParamValue::String(s) if s == "enabled" => return Ok(false),
+            spicepod::param::ParamValue::String(s) if s == "disabled" => return Ok(true),
+            _ => {
+                return Err(crate::Error::InvalidAccelerationConfiguration {
                         source:
                             format!("Invalid 'query_federation' param value: {value:?}. Expected 'enabled' or 'disabled'.").into(),
                     });
-                }
             }
         }
     }
     Ok(false)
+}
+
+#[expect(clippy::result_large_err)]
+fn parse_snapshots_trigger_threshold(
+    params: &mut Option<Params>,
+) -> Result<Option<i64>, crate::Error> {
+    if let Some(params) = params
+        && let Some(value) = params.data.remove("snapshots_trigger_threshold")
+    {
+        match value {
+            spicepod::param::ParamValue::Int(s) => {
+                Ok(Some(s))
+            }
+            _ => Err(crate::Error::InvalidAccelerationConfiguration {
+                source: format!(
+                    "Invalid 'snapshots_trigger_threshold' param value: {value:?}. Expected an integer number."
+                ).into(),
+            }),
+        }
+    } else {
+        Ok(None)
+    }
+}
+
+#[expect(clippy::result_large_err)]
+fn parse_snapshots_create_interval(
+    params: &mut Option<Params>,
+) -> Result<Option<Duration>, crate::Error> {
+    let Some(params) = params else {
+        return Ok(None);
+    };
+    let Some(value) = params.data.remove("snapshots_create_interval") else {
+        return Ok(None);
+    };
+
+    match value {
+        spicepod::param::ParamValue::String(s) => {
+            let interval =
+                fundu::parse_duration(&s).map_err(|e| crate::Error::InvalidSpicepodDataset {
+                    source: super::Error::UnableToParseFieldAsDuration {
+                        source: e,
+                        field: "snapshots_create_interval".into(),
+                    },
+                })?;
+            if interval.is_zero() {
+                return Err(crate::Error::InvalidAccelerationConfiguration {
+                    source:
+                        "Invalid 'snapshots_create_interval' param value: duration must be greater than zero."
+                            .into(),
+                });
+            }
+            Ok(Some(interval))
+        }
+        _ => Err(crate::Error::InvalidAccelerationConfiguration {
+            source: format!(
+                "Invalid 'snapshots_create_interval' param value: {value:?}. Expected a duration string."
+            )
+            .into(),
+        }),
+    }
+}
+
+/// Parse `caching_ttl` duration from params for caching mode.
+#[expect(clippy::result_large_err)]
+fn parse_caching_ttl(params: &mut Option<Params>) -> Result<Option<Duration>, crate::Error> {
+    parse_duration_param(params, "caching_ttl")
+}
+
+/// Parse `caching_stale_while_revalidate_ttl` duration from params for caching mode.
+#[expect(clippy::result_large_err)]
+fn parse_caching_stale_while_revalidate_ttl(
+    params: &mut Option<Params>,
+) -> Result<Option<Duration>, crate::Error> {
+    parse_duration_param(params, "caching_stale_while_revalidate_ttl")
+}
+
+/// Parse `caching_stale_if_error` from params for caching mode.
+/// Valid values: "enabled", "disabled" (default)
+#[expect(clippy::result_large_err)]
+fn parse_caching_stale_if_error(params: &mut Option<Params>) -> Result<StaleIfError, crate::Error> {
+    let Some(params) = params else {
+        return Ok(StaleIfError::default());
+    };
+    let Some(value) = params.data.remove("caching_stale_if_error") else {
+        return Ok(StaleIfError::default());
+    };
+    match value {
+        spicepod::param::ParamValue::String(s) => match s.to_lowercase().as_str() {
+            "enabled" => Ok(StaleIfError::Enabled),
+            "disabled" => Ok(StaleIfError::Disabled),
+            _ => Err(crate::Error::InvalidAccelerationConfiguration {
+                source: format!(
+                    "Invalid 'caching_stale_if_error' value: '{s}'. Expected 'enabled' or 'disabled'."
+                )
+                .into(),
+            }),
+        },
+        _ => Err(crate::Error::InvalidAccelerationConfiguration {
+            source: format!(
+                "Invalid 'caching_stale_if_error' param value: {value:?}. Expected 'enabled' or 'disabled'."
+            )
+            .into(),
+        }),
+    }
+}
+
+/// Helper to parse a duration parameter from params.
+#[expect(clippy::result_large_err)]
+fn parse_duration_param(
+    params: &mut Option<Params>,
+    param_name: &str,
+) -> Result<Option<Duration>, crate::Error> {
+    let Some(params) = params else {
+        return Ok(None);
+    };
+    let Some(value) = params.data.remove(param_name) else {
+        return Ok(None);
+    };
+    match value {
+        spicepod::param::ParamValue::String(s) => {
+            fundu::parse_duration(&s)
+                .map(Some)
+                .map_err(|e| crate::Error::InvalidSpicepodDataset {
+                    source: super::Error::UnableToParseFieldAsDuration {
+                        source: e,
+                        field: param_name.into(),
+                    },
+                })
+        }
+        _ => Err(crate::Error::InvalidAccelerationConfiguration {
+            source: format!(
+                "Invalid '{param_name}' param value: {value:?}. Expected a duration string."
+            )
+            .into(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -515,11 +747,41 @@ mod tests {
             "invalid".to_string(),
         )]));
         let result_invalid = parse_is_query_federation_disabled(&mut Some(params_invalid));
-        assert!(result_invalid.is_err());
+        result_invalid.expect_err("should error parsing query_federation param");
 
         let params_missing = Params::from_string_map(HashMap::new());
         let is_disabled =
             parse_is_query_federation_disabled(&mut Some(params_missing)).expect("to parse");
         assert!(!is_disabled);
+    }
+
+    #[test]
+    fn test_parse_caching_stale_if_error() {
+        // Test "enabled"
+        let params_enabled = Params::from_string_map(HashMap::from([(
+            "caching_stale_if_error".to_string(),
+            "enabled".to_string(),
+        )]));
+        let result = parse_caching_stale_if_error(&mut Some(params_enabled)).expect("to parse");
+        assert_eq!(result, StaleIfError::Enabled);
+
+        // Test "disabled"
+        let params_disabled = Params::from_string_map(HashMap::from([(
+            "caching_stale_if_error".to_string(),
+            "disabled".to_string(),
+        )]));
+        let result = parse_caching_stale_if_error(&mut Some(params_disabled)).expect("to parse");
+        assert_eq!(result, StaleIfError::Disabled);
+
+        // Test invalid value
+        let params_invalid = Params::from_string_map(HashMap::from([(
+            "caching_stale_if_error".to_string(),
+            "invalid".to_string(),
+        )]));
+        parse_caching_stale_if_error(&mut Some(params_invalid)).expect_err("should error");
+
+        // Test missing parameter (default)
+        let result = parse_caching_stale_if_error(&mut None).expect("to parse");
+        assert_eq!(result, StaleIfError::Disabled);
     }
 }

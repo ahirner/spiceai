@@ -16,7 +16,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 use crate::DEFAULT_TRACING_MODELS;
-use crate::models::{sort_json_keys, sql_to_display, sql_to_json_values, sql_to_single_json_value};
+use crate::models::{sort_json_keys, sql_to_display, sql_to_single_json_value};
 use crate::{
     init_tracing,
     models::{
@@ -27,28 +27,36 @@ use crate::{
     utils::{runtime_ready_check, test_request_context, verify_env_secret_exists},
 };
 use app::AppBuilder;
-use async_openai::types::{
+use async_openai::Client as OpenAIClient;
+use async_openai::config::OpenAIConfig;
+use async_openai::types::chat::{
     ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestUserMessageArgs,
-    CreateChatCompletionRequestArgs, EmbeddingInput,
+    CreateChatCompletionRequestArgs,
 };
+use async_openai::types::embeddings::EmbeddingInput;
+use async_openai::types::responses::{
+    CreateResponseArgs, FunctionTool, OutputItem, OutputMessage, OutputMessageContent,
+    ResponseStreamEvent, Status, Tool as ToolDefinition,
+};
+use async_openai::types::responses::{OutputTextContent, Response as OpenAIResponse};
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
 use jsonpath_rust::JsonPath;
 use llms::chat::Chat;
-use opentelemetry_sdk::trace::TracerProvider;
+use opentelemetry_sdk::trace::SdkTracerProvider;
+use runtime::tools::utils::get_tools;
 use runtime::{Runtime, auth::EndpointAuth, model::try_to_chat_model};
+use serde_json::Value;
 use serde_json::json;
 use spicepod::component::{embeddings::Embeddings, model::Model};
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 
-#[allow(clippy::expect_used)]
 mod nsql {
-
-    use crate::models::nsql::{TestCase, run_nsql_test};
-
     use super::*;
+    use crate::models::nsql::{TestCase, run_nsql_test};
 
     #[tokio::test]
     async fn openai_test_nsql() -> Result<(), anyhow::Error> {
@@ -66,6 +74,7 @@ mod nsql {
                         model: "openai_embeddings".to_string(),
                         row_ids: None,
                         chunking: None,
+                        vector_size: None,
                     }],
                     description: None,
                     full_text_search: None,
@@ -139,16 +148,12 @@ mod nsql {
     }
 }
 
-#[allow(clippy::expect_used)]
 mod search {
     use spicepod::component::embeddings::EmbeddingChunkConfig;
 
     use crate::models::{
-        get_small_clickbench_dataset,
-        search::{
-            SearchTestCase, catalog_page_tpch_dataset_w_embeddings, item_tpch_dataset_w_embeddings,
-            run_search,
-        },
+        get_mega_science_dataset, get_small_clickbench_dataset,
+        search::{SearchTestCase, SearchTestType, run_search},
     };
 
     use super::*;
@@ -158,66 +163,62 @@ mod search {
         verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await
             .map_err(anyhow::Error::msg)?;
-        let app = AppBuilder::new("search_app")
-            // taxi_trips dataset is used to test search when there is a dataset w/o embeddings
-            .with_dataset(get_taxi_trips_dataset())
-            .with_dataset(item_tpch_dataset_w_embeddings(
-                "item",
-                "openai_embeddings",
-                Some(vec!["i_item_sk".to_string()]),
-                None,
-            ))
-            .with_dataset(catalog_page_tpch_dataset_w_embeddings(
-                "catalog_page_with_chunking",
-                "openai_embeddings",
-                Some(vec!["cp_catalog_page_sk".to_string()]),
-                Some(EmbeddingChunkConfig {
-                    enabled: true,
-                    target_chunk_size: 512,
-                    overlap_size: 128,
-                    trim_whitespace: false,
-                }),
-            ))
-            .with_embedding(get_openai_embeddings(
-                Some("text-embedding-3-small"),
-                "openai_embeddings",
-            ))
-            .build();
-
         run_search(
-            app,
+            AppBuilder::new("search_app")
+                .with_embedding(get_openai_embeddings(
+                    Some("text-embedding-3-small"),
+                    "openai_embeddings",
+                ))
+                .with_dataset(get_mega_science_dataset(
+                    Some("qs"),
+                    None,
+                    Some(Column {
+                        name: "answer".to_string(),
+                        embeddings: vec![ColumnLevelEmbeddingConfig {
+                            model: "openai_embeddings".into(),
+                            chunking: None,
+                            row_ids: Some(vec!["id".to_string()]),
+                            vector_size: None,
+                        }],
+                        description: None,
+                        full_text_search: None,
+                        metadata: HashMap::new(),
+                    }),
+                ))
+                .build(),
             vec![
-                SearchTestCase {
-                    name: "openai_basic",
-                    body: json!({
-                        "text": "new patient",
-                        "limit": 2,
-                        "datasets": ["item"],
-                        "additional_columns": ["i_color", "i_item_id"],
-                    }),
-                },
-                SearchTestCase {
-                    name: "openai_all_datasets",
-                    body: json!({
-                        "text": "new patient",
-                        "limit": 2,
-                    }),
-                },
-                SearchTestCase {
-                    name: "openai_chunking",
-                    body: json!({
-                        "text": "friends",
-                        "datasets": ["catalog_page_with_chunking"],
-                        "limit": 1,
-                    }),
-                },
+                SearchTestCase::new(
+                    "openai_basic",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "openai_additional_columns",
+                    SearchTestType::Http(json!({
+                        "text": "second",
+                        "limit": 4,
+                        "datasets": ["qs"],
+                        "additional_columns": ["question"],
+                    })),
+                ),
+                SearchTestCase::new(
+                    "openai_with_where",
+                    SearchTestType::Http(json!({
+                        "text": "secondary",
+                        "datasets": ["qs"],
+                        "where": "subject!='math'",
+                        "limit": 4,
+                    })),
+                ),
             ],
-            vec![],
         )
         .await
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_search_column_casing() -> Result<(), anyhow::Error> {
         verify_env_secret_exists("SPICE_OPENAI_API_KEY")
             .await
@@ -232,6 +233,7 @@ mod search {
                 model: "openai_embeddings".to_string(),
                 row_ids: None,
                 chunking: None,
+                vector_size: None,
             }],
             description: None,
             full_text_search: None,
@@ -249,6 +251,7 @@ mod search {
                     overlap_size: 128,
                     trim_whitespace: false,
                 }),
+                vector_size: None,
             }],
             description: None,
             full_text_search: None,
@@ -266,36 +269,38 @@ mod search {
         run_search(
             app,
             vec![
-                SearchTestCase {
-                    name: "openai_casing_no_chunking",
-                    body: json!({
+                SearchTestCase::new(
+                    "openai_casing_no_chunking",
+                    SearchTestType::Http(json!({
                         "text": "go.mail",
                         "limit": 2,
                         "datasets": ["clickbench_no_chunking"],
-                    }),
-                },
-                SearchTestCase {
-                    name: "openai_casing_chunking",
-                    body: json!({
+                    })),
+                ),
+                SearchTestCase::new(
+                    "openai_casing_chunking",
+                    SearchTestType::Http(json!({
                         "text": "go.mail",
                         "limit": 2,
                         "datasets": ["clickbench_chunking"],
-                    }),
-                },
+                    })),
+                ),
             ],
-            vec![],
         )
         .await
     }
 }
 
-#[allow(clippy::expect_used)]
 mod embeddings {
-    use std::time::Duration;
+    use spicepod::component::caching::CacheConfig;
+    use std::time::{Duration, Instant};
 
     use crate::models::embedding::{
         EmbeddingTestCase, run_beta_functionality_criteria_test, run_embedding_tests,
     };
+
+    use crate::models::search::start_app;
+    use crate::models::send_embeddings_request;
 
     use super::*;
 
@@ -373,6 +378,40 @@ mod embeddings {
             })
             .await
     }
+
+    #[tokio::test]
+    async fn openai_test_embeddings_cache() -> Result<(), anyhow::Error> {
+        let app = AppBuilder::new("embeddings_cache")
+            .with_embedding(get_openai_embeddings(
+                Some("text-embedding-3-small"),
+                "openai_embeddings",
+            ))
+            .with_embeddings_cache(CacheConfig {
+                enabled: true,
+                max_size: Some("512mb".to_string()),
+                item_ttl: Some("30s".to_string()),
+                ..Default::default()
+            })
+            .build();
+
+        let _tracing = init_tracing(None);
+
+        test_request_context()
+        .scope(async {
+            let api_config = start_app(app).await?;
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let embedding_input = EmbeddingInput::StringArray((0..10).map(|i| format!("The food was delicious {i}")).collect());
+            let start = Instant::now();
+            send_embeddings_request(http_base_url.as_str(), "openai_embeddings", embedding_input.clone(), Some("float"), None, None).await?;
+            let duration = start.elapsed();
+            let start = Instant::now();
+            send_embeddings_request(http_base_url.as_str(), "openai_embeddings", embedding_input, Some("float"), None, None).await?;
+            let duration_cached = start.elapsed();
+            assert!(duration_cached * 10 < duration, "Cache did not improve performance by an order of magnitude. First: {duration:?}, Second: {duration_cached:?}");
+            Ok(())
+        })
+        .await
+    }
 }
 
 #[tokio::test]
@@ -448,6 +487,7 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
                     model: "openai_embeddings".to_string(),
                     row_ids: Some(vec!["i_item_sk".to_string()]),
                     chunking: None,
+                    vector_size: None,
                 }],
                 description: None,
                 full_text_search: None,
@@ -478,7 +518,446 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
             runtime_ready_check(&rt).await;
 
             verify_sql_query_chat_completion(Arc::clone(&rt), &trace_provider).await?;
-            verify_similarity_search_chat_completion(Arc::clone(&rt), &trace_provider).await?;
+            verify_similarity_search_chat_completion(Arc::clone(&rt)).await?;
+
+            Ok(())
+        })
+        .await
+}
+
+fn extract_text(response: &OpenAIResponse) -> Option<String> {
+    response.output.first().and_then(|out| {
+        if let OutputItem::Message(OutputMessage { content, .. }) = out {
+            match content.first() {
+                Some(OutputMessageContent::OutputText(OutputTextContent { text, .. })) => {
+                    Some(text.clone())
+                }
+                _ => None,
+            }
+        } else {
+            None
+        }
+    })
+}
+
+#[tokio::test]
+async fn openai_responses_api_non_streaming() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let mut model = get_openai_model("gpt-4o-mini", "openai_model");
+
+            model.params.insert(
+                "responses_api".to_string(),
+                Value::String("enabled".to_string()),
+            );
+
+            let app = AppBuilder::new("responses_api").with_model(model).build();
+
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let openai_config =
+                OpenAIConfig::default().with_api_base(format!("{http_base_url}/v1"));
+            let openai_client = OpenAIClient::with_config(openai_config);
+            let request = CreateResponseArgs::default()
+                .model("openai_model")
+                .input("Copy exactly what I say: The quick brown fox jumps over the lazy dog")
+                .build()?;
+
+            let response = openai_client.responses().create(request).await?;
+            let text = extract_text(&response);
+            assert_eq!(response.model, "openai_model".to_string());
+            assert!(text.is_some());
+            assert_eq!(response.status, Status::Completed);
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn openai_responses_api_streaming() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let mut model = get_openai_model("gpt-4o-mini", "openai_model");
+            model.params.insert(
+                "responses_api".to_string(),
+                Value::String("enabled".to_string()),
+            );
+
+            let app = AppBuilder::new("responses_api").with_model(model).build();
+
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let openai_config =
+                OpenAIConfig::default().with_api_base(format!("{http_base_url}/v1"));
+            let openai_client = OpenAIClient::with_config(openai_config);
+            let request = CreateResponseArgs::default()
+                .model("openai_model")
+                .input("Copy exactly what I say: The quick brown fox jumps over the lazy dog")
+                .stream(true)
+                .build()?;
+            let mut stream = openai_client.responses().create_stream(request).await?;
+
+            let mut final_response = String::new();
+            let mut delta_count = 0;
+            let mut failure = false;
+
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(response_event) => match &response_event {
+                        ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
+                            final_response += &delta.delta;
+                            delta_count += 1;
+                        }
+                        ResponseStreamEvent::ResponseCompleted(_) => {
+                            break;
+                        }
+                        ResponseStreamEvent::ResponseIncomplete(_)
+                        | ResponseStreamEvent::ResponseFailed(_) => {
+                            failure = true;
+                            break;
+                        }
+                        _ => {
+                            // Handle other events if necessary
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("{e:#?}");
+                        // When a stream ends, it returns Err(OpenAIError::StreamError("Stream ended"))
+                        // Without this, the stream will never end
+                        break;
+                    }
+                }
+            }
+
+            // Check that we received a non-empty response
+            assert!(!final_response.is_empty());
+            // Check that we didn't fail at any point while streaming
+            assert!(!failure);
+            // Check that we received more than 1 delta, indicating streaming
+            assert!(delta_count > 1);
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn openai_responses_api_with_tools_streaming() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let mut model = get_openai_model("gpt-4o-mini", "openai_model");
+            model
+                .params
+                .insert("tools".to_string(), Value::String("auto".to_string()));
+
+            model.params.insert(
+                "responses_api".to_string(),
+                Value::String("enabled".to_string()),
+            );
+
+            let app = AppBuilder::new("responses_api")
+                .with_model(model)
+                .with_dataset(get_taxi_trips_dataset())
+                .build();
+
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let openai_config =
+                OpenAIConfig::default().with_api_base(format!("{http_base_url}/v1"));
+            let openai_client = OpenAIClient::with_config(openai_config);
+            let request = CreateResponseArgs::default()
+                .model("openai_model")
+                .input("What datasets do you have access to? Use the list datasets tool.")
+                .stream(true)
+                .build()?;
+            let mut stream = openai_client.responses().create_stream(request).await?;
+
+            let mut final_response = String::new();
+            let mut delta_count = 0;
+            let mut failure = false;
+
+            while let Some(result) = stream.next().await {
+                match result {
+                    Ok(response_event) => match &response_event {
+                        ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
+                            final_response += &delta.delta;
+                            delta_count += 1;
+                        }
+                        ResponseStreamEvent::ResponseCompleted(_) => {
+                            break;
+                        }
+                        ResponseStreamEvent::ResponseIncomplete(_)
+                        | ResponseStreamEvent::ResponseFailed(_) => {
+                            failure = true;
+                            break;
+                        }
+                        _ => {
+                            // Handle other events if necessary
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("{e:#?}");
+                        // When a stream ends, it returns Err(OpenAIError::StreamError("Stream ended"))
+                        // Without this, the stream will never end
+                        break;
+                    }
+                }
+            }
+
+            // Check that the model used the tool, indicating the tool was injected correctly
+            assert!(final_response.contains("taxi_trips"));
+            // Check that we didn't fail at any point while streaming
+            assert!(!failure);
+            // Check that we received more than 1 delta, indicating streaming
+            assert!(delta_count > 1);
+
+            Ok(())
+        })
+        .await
+}
+
+#[tokio::test]
+async fn openai_responses_api_with_tools_non_streaming() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let mut model = get_openai_model("gpt-4o-mini", "openai_model");
+
+            model.params.insert(
+                "responses_api".to_string(),
+                Value::String("enabled".to_string()),
+            );
+
+            model
+                .params
+                .insert("tools".to_string(), Value::String("auto".to_string()));
+
+            let app = AppBuilder::new("responses_api")
+                .with_model(model)
+                .with_dataset(get_taxi_trips_dataset())
+                .build();
+
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let openai_config =
+                OpenAIConfig::default().with_api_base(format!("{http_base_url}/v1"));
+            let openai_client = OpenAIClient::with_config(openai_config);
+            let request = CreateResponseArgs::default()
+                .model("openai_model")
+                .input("What datasets do I have access to?")
+                .build()?;
+
+            let response = openai_client.responses().create(request).await?;
+            let text = extract_text(&response);
+            assert_eq!(response.model, "openai_model".to_string());
+            assert!(text.is_some_and(|s| s.contains("taxi_trips")));
+            assert_eq!(response.status, Status::Completed);
+            Ok(())
+        })
+        .await
+}
+
+fn get_responses_model_with_tools(
+    model: impl Into<String>,
+    name: impl Into<String>,
+    openai_responses_tools: impl Into<String>,
+) -> Model {
+    let mut model = get_openai_model(model, name);
+    model.params.insert(
+        "openai_responses_tools".into(),
+        serde_json::Value::String(openai_responses_tools.into()),
+    );
+    model
+        .params
+        .insert("tools".into(), serde_json::Value::String("auto".into()));
+    model
+}
+
+#[tokio::test]
+async fn openai_responses_api_tools() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+
+    test_request_context()
+        .scope(async {
+            verify_env_secret_exists("SPICE_OPENAI_API_KEY")
+                .await
+                .map_err(anyhow::Error::msg)?;
+
+            let model = get_responses_model_with_tools(
+                "gpt-4o-mini",
+                "openai_model",
+                "web_search, code_interpreter",
+            );
+
+            let app = AppBuilder::new("responses_api").with_model(model).build();
+
+            let api_config = create_api_bindings_config();
+            let http_base_url = format!("http://{}", api_config.http_bind_address);
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+
+            let rt_ref_copy = Arc::clone(&rt);
+            tokio::spawn(async move {
+                Box::pin(rt_ref_copy.start_servers(api_config, None, EndpointAuth::no_auth())).await
+            });
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            runtime_ready_check(&rt).await;
+
+            let openai_config =
+                OpenAIConfig::default().with_api_base(format!("{http_base_url}/v1"));
+            let openai_client = OpenAIClient::with_config(openai_config);
+            let request = CreateResponseArgs::default()
+                .model("openai_model")
+                .input("Tell me about the movie Ocean's Eleven")
+                .build()?;
+
+            let responses_client = openai_client.responses();
+
+            let response = tokio::select! {
+                resp = responses_client.create(request) => {
+                    resp?
+                }
+                () = tokio::time::sleep(std::time::Duration::from_secs(60)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for OpenAI response"));
+                }
+            };
+            let tools = get_tools(
+                Arc::clone(&rt),
+                &runtime::tools::options::SpiceToolsOptions::Auto,
+            )
+            .await;
+
+            let mut desired_tools = tools.iter().map(|t| t.name()).collect::<HashSet<_>>();
+            desired_tools.insert(std::borrow::Cow::Borrowed("web_search"));
+            desired_tools.insert(std::borrow::Cow::Borrowed("code_interpreter"));
+
+            assert!(response.tools.is_some());
+
+            let Some(tools) = response.tools.as_ref() else {
+                unreachable!("We just asserted that response.tools is Some");
+            };
+
+            // Validate that the tools provided to the model are of the types we expect
+            assert!(tools.iter().all(|tool| matches!(
+                tool,
+                ToolDefinition::CodeInterpreter(_)
+                    | ToolDefinition::WebSearchPreview(_)
+                    | ToolDefinition::Function(_)
+            )));
+
+            // Validate that the individual tools themselves are correct
+            for tool in tools {
+                match tool {
+                    ToolDefinition::CodeInterpreter(_) => {
+                        assert!(desired_tools.remove("code_interpreter"));
+                    }
+                    ToolDefinition::WebSearchPreview(_) => {
+                        assert!(desired_tools.remove("web_search"));
+                    }
+                    ToolDefinition::Function(FunctionTool { name, .. }) => {
+                        assert!(desired_tools.remove(name.as_str()));
+                    }
+                    _ => {}
+                }
+            }
+
+            assert!(
+                desired_tools.is_empty(),
+                "Not all desired tools were found in the response: {desired_tools:?}"
+            );
 
             Ok(())
         })
@@ -486,10 +965,10 @@ async fn openai_test_chat_messages() -> Result<(), anyhow::Error> {
 }
 
 /// Verifies that the model correctly uses the SQL tool to process user query and return the result
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn verify_sql_query_chat_completion(
     rt: Arc<Runtime>,
-    trace_provider: &TracerProvider,
+    trace_provider: &SdkTracerProvider,
 ) -> Result<(), anyhow::Error> {
     let model =
         get_openai_chat_model(Arc::clone(&rt), "gpt-4o-mini", "openai_model", "auto").await?;
@@ -560,11 +1039,8 @@ async fn verify_sql_query_chat_completion(
 }
 
 /// Verifies that the model correctly uses similirity search tool to process user query and return the result
-#[allow(clippy::expect_used)]
-async fn verify_similarity_search_chat_completion(
-    rt: Arc<Runtime>,
-    trace_provider: &TracerProvider,
-) -> Result<(), anyhow::Error> {
+#[expect(clippy::expect_used)]
+async fn verify_similarity_search_chat_completion(rt: Arc<Runtime>) -> Result<(), anyhow::Error> {
     let model =
         get_openai_chat_model(Arc::clone(&rt), "gpt-4o-mini", "openai_model", "auto").await?;
 
@@ -578,7 +1054,6 @@ async fn verify_similarity_search_chat_completion(
             .into()])
         .build()?;
 
-    let task_start_time = std::time::SystemTime::now();
     let response = model.chat_request(req).await?;
 
     // Verify Response
@@ -596,76 +1071,10 @@ async fn verify_similarity_search_chat_completion(
             .expect("Failed to serialize response.choices")
     );
 
-    // ensure all spans are exported into task_history
-    let _ = trace_provider.force_flush();
-    let task_input = sql_to_json_values(
-        &rt,
-        format!(
-            "SELECT input
-            FROM runtime.task_history
-            WHERE start_time >= '{}' and task='tool_use::document_similarity';",
-            Into::<DateTime<Utc>>::into(task_start_time).to_rfc3339()
-        )
-        .as_str(),
-    )
-    .await;
-
-    let mut stable_inputs: Vec<serde_json::Value> = Vec::new();
-
-    for mut value in task_input {
-        if let serde_json::Value::Object(ref mut map) = value {
-            // Remove the unstable "text" and "datasets" field
-            map.remove("text");
-            map.remove("datasets");
-
-            // Sort the keys for consistent ordering
-            sort_json_keys(&mut value);
-
-            // Add the filtered value to our stable array
-            stable_inputs.push(value);
-        }
-    }
-
-    // Sort the array of objects for consistent ordering in snapshots
-    stable_inputs.sort_by(|a, b| {
-        let a_str = serde_json::to_string(a).unwrap_or_default();
-        let b_str = serde_json::to_string(b).unwrap_or_default();
-        a_str.cmp(&b_str)
-    });
-
-    // Instead of creating a snapshot, verify keywords contain expected values
-    let mut found_journalist = false;
-    let mut found_vehicle = false;
-    let mut actual_keywords = Vec::new();
-
-    for input in &stable_inputs {
-        if let Some(keywords) = input.get("keywords").and_then(|k| k.as_array()) {
-            actual_keywords.push(keywords.clone());
-            for keyword in keywords {
-                if let Some(keyword_str) = keyword.as_str() {
-                    if keyword_str.contains("journalist") {
-                        found_journalist = true;
-                    } else if keyword_str.contains("vehicle") {
-                        found_vehicle = true;
-                    }
-                }
-            }
-        }
-    }
-
-    assert!(
-        found_journalist,
-        "Expected to find 'journalist' in keywords, found {actual_keywords:?}",
-    );
-    assert!(
-        found_vehicle,
-        "Expected to find 'vehicle' in keywords, found {actual_keywords:?}",
-    );
-
     Ok(())
 }
 
-fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model {
+pub(crate) fn get_openai_model(model: impl Into<String>, name: impl Into<String>) -> Model {
     let mut model = Model::new(format!("openai:{}", model.into()), name);
     model.params.insert(
         "openai_api_key".to_string(),

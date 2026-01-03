@@ -15,42 +15,63 @@ limitations under the License.
 */
 #![allow(clippy::missing_errors_doc)]
 use async_openai::config::Config;
+use async_openai::error::OpenAIError;
 use bytes::Bytes;
+use cache::CacheProvider;
+use cache::result::embeddings::CachedEmbeddingResult;
+use reqwest::StatusCode;
+use runtime_rate_control::RateController;
 use std::fmt::Debug;
 use std::sync::Arc;
+use std::time::Instant;
+use util::fibonacci_backoff::{FibonacciBackoff, FibonacciBackoffBuilder};
+use util::{RetryError, retry};
 
-use crate::chunking::{
-    ArcSizer, Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper,
+use chunking::{
+    ArcSizer, ChunkSizer, Chunker, ChunkingConfig, RecursiveSplittingChunker, TokenizerWrapper,
 };
 
-use crate::embeddings::{Embed, Error as EmbedError, Result as EmbedResult};
-use async_openai::error::OpenAIError;
-use async_openai::types::{
+use crate::embeddings::{
+    Embed, Error as EmbedError, FailedToAcquireRateControllerPermitSnafu,
+    FailedToCreateEmbeddingSnafu, Result as EmbedResult,
+};
+use async_openai::types::embeddings::{
     CreateEmbeddingRequest, CreateEmbeddingRequestArgs, CreateEmbeddingResponse, EmbeddingInput,
 };
 
 use async_trait::async_trait;
 use futures::future::try_join_all;
 use snafu::ResultExt;
-use text_splitter::ChunkSizer;
 use tokenizers::Tokenizer;
 
-use super::Openai;
+use super::{Openai, default_rate_controller};
 
 pub(crate) const TEXT_EMBED_3_SMALL: &str = "text-embedding-3-small";
 
 pub const DEFAULT_EMBEDDING_MODEL: &str = TEXT_EMBED_3_SMALL;
 
+fn default_retry_strategy() -> FibonacciBackoff {
+    FibonacciBackoffBuilder::new().max_retries(Some(10)).build()
+}
+
 /// Embedding implementation for `OpenAI` compatible embedding models.
 ///
 /// For non-OpenAI models, a [`Tokenizer`] can be provided to correctly size
 /// chunks (instead of the default `OpenAI` BPE tokenizer).
-pub struct OpenaiEmbed<C: Config> {
+pub struct OpenaiEmbed<C: Config + Clone> {
     pub inner: Openai<C>,
     pub chunk_sizer: Option<Arc<dyn ChunkSizer + Send + Sync>>,
+    // Retry strategy for transient or throttling errors
+    retry_strategy: FibonacciBackoff,
+
+    // Rate limiter for requests
+    rate_controller: Arc<RateController>,
+
+    // Shared embeddings cache
+    cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
 }
 
-impl<C: Config + Debug> std::fmt::Debug for OpenaiEmbed<C> {
+impl<C: Config + Debug + Clone> std::fmt::Debug for OpenaiEmbed<C> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OpenaiEmbed")
             .field("inner", &self.inner)
@@ -58,18 +79,30 @@ impl<C: Config + Debug> std::fmt::Debug for OpenaiEmbed<C> {
     }
 }
 
-impl<C: Config> OpenaiEmbed<C> {
+impl<C: Config + Clone> OpenaiEmbed<C> {
     #[must_use]
-    pub fn new(inner: Openai<C>) -> Self {
+    pub fn new(inner: Openai<C>, rate_controller: Option<Arc<RateController>>) -> Self {
         Self {
             inner,
             chunk_sizer: None,
+            retry_strategy: default_retry_strategy(),
+            rate_controller: rate_controller.unwrap_or_else(default_rate_controller),
+            cache: None,
         }
     }
 
     #[must_use]
     fn with_tokenizer(mut self, tokenizer: Arc<Tokenizer>) -> Self {
         self.chunk_sizer = Some(Arc::new(Into::<TokenizerWrapper>::into(tokenizer)));
+        self
+    }
+
+    #[must_use]
+    pub fn set_cache(
+        mut self,
+        cache: Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>>,
+    ) -> Self {
+        self.cache = cache;
         self
     }
 
@@ -83,23 +116,55 @@ impl<C: Config> OpenaiEmbed<C> {
 }
 
 #[async_trait]
-impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
+impl<C: Config + Sync + Send + Debug + Clone> Embed for OpenaiEmbed<C> {
+    fn cache(&self) -> Option<Arc<dyn CacheProvider<CachedEmbeddingResult> + Send + Sync>> {
+        self.cache.as_ref().map(Arc::clone)
+    }
+
     async fn embed_request(
         &self,
         req: CreateEmbeddingRequest,
-    ) -> Result<CreateEmbeddingResponse, OpenAIError> {
+    ) -> EmbedResult<CreateEmbeddingResponse> {
+        if let Some(CachedEmbeddingResult::Response(cached)) =
+            self.get_cached_embed((&req).into()).await
+        {
+            return Ok(cached);
+        }
+
         let outer_model = req.model.clone();
         let mut inner_req = req.clone();
+
         inner_req.model.clone_from(&self.inner.model);
-        let mut resp = self.inner.client.embeddings().create(inner_req).await?;
+        let permit = self
+            .rate_controller
+            .acquire()
+            .await
+            .context(FailedToAcquireRateControllerPermitSnafu)?;
+        let mut resp = self
+            .inner
+            .client
+            .embeddings()
+            .create(inner_req)
+            .await
+            .boxed()
+            .context(FailedToCreateEmbeddingSnafu)?;
+        drop(permit);
 
         resp.model = outer_model;
+
+        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Response(resp.clone()))
+            .await;
+
         Ok(resp)
     }
 
     async fn embed(&self, input: EmbeddingInput) -> EmbedResult<Vec<Vec<f32>>> {
         // Batch requests to match OpenAI API limits: max_tokens_per_request and max array size.
         let embed_batches: Vec<EmbeddingInput> = chunk_embedding_input(&input);
+        tracing::trace!(
+            "OpenAI embedding input split into {} batches",
+            embed_batches.len()
+        );
 
         let request_batches_result: EmbedResult<Vec<CreateEmbeddingRequest>> = embed_batches
             .into_iter()
@@ -113,22 +178,53 @@ impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
             })
             .collect();
 
+        let client_ref = Arc::new(self.inner.client.clone());
+
         let embed_futures: Vec<_> = request_batches_result?
             .into_iter()
             .map(|req| {
-                let local_client = self.inner.client.clone();
+                let retry_strategy = self.retry_strategy.clone();
+                let client = Arc::clone(&client_ref);
+                let rate_controller = Arc::clone(&self.rate_controller);
                 async move {
-                    let embedding: Vec<Vec<f32>> = local_client
-                        .embeddings()
-                        .create_float(req)
-                        .await
-                        .boxed()
-                        .map_err(|source| EmbedError::FailedToCreateEmbedding { source })?
-                        .data
-                        .into_iter()
-                        .map(|d| d.embedding.into())
-                        .collect();
-                    Ok::<Vec<Vec<f32>>, EmbedError>(embedding)
+                    retry(retry_strategy, async || {
+                        if let Some(CachedEmbeddingResult::Vector(cached)) = self.get_cached_embed((&req).into()).await {
+                            return Ok(cached);
+                        }
+
+                        let permit = rate_controller.acquire().await.context(FailedToAcquireRateControllerPermitSnafu)?;
+                        let start = Instant::now();
+
+                        let embeddings: Vec<Vec<f32>> = client.embeddings().create_float(req.clone()).await
+                            .map(|resp| {
+                                let end = Instant::now();
+                                drop(permit);
+                                tracing::trace!("OpenAI embedding request completed in {:?}", end - start);
+                                resp.data.into_iter().map(|d| d.embedding.into()).collect::<Vec<_>>()
+                            })
+                            .map_err(|err| {
+                                if is_retriable_error(&err) {
+                                    tracing::debug!(
+                                        "OpenAI embedding model encountered a retriable server error: {err}. Backing off and retrying..."
+                                    );
+
+                                    if is_throttling_error(&err) {
+                                        return RetryError::transient(EmbedError::RateLimited { source: err.into() });
+                                    }
+
+                                    return RetryError::transient(EmbedError::FailedToCreateEmbedding { source: err.into() });
+                                }
+                                tracing::debug!(
+                                    "OpenAI embedding model encountered a non-retriable server error: {err}"
+                                );
+                                RetryError::permanent(EmbedError::FailedToCreateEmbedding { source: err.into() })
+                            })?;
+
+                        self.put_cached_embed((&req).into(), CachedEmbeddingResult::Vector(embeddings.clone())).await;
+
+                        Ok(embeddings)
+                    })
+                    .await
                 }
             })
             .collect();
@@ -165,9 +261,49 @@ impl<C: Config + Sync + Send + Debug> Embed for OpenaiEmbed<C> {
     }
 }
 
-// `OpenAPI` estimator counts utf-8 bytes as 0.25 tokens so allowed string size is 1,200,000 bytes.
-const MAX_BATCH_STR_BYTES: usize = 300_000 * 4;
-const MAX_BATCH_SIZE: usize = 2048;
+fn is_retriable_error(err: &OpenAIError) -> bool {
+    match err {
+        OpenAIError::ApiError(api_err) => {
+            // Supported error codes: https://platform.openai.com/docs/guides/error-codes/api-errors
+            matches!(api_err.code.as_deref(), None | Some("429" | "500" | "503"))
+        }
+        OpenAIError::JSONDeserialize(..) => true,
+        OpenAIError::Reqwest(request) => {
+            request.is_timeout()
+                || request.is_connect()
+                || request.is_request()
+                || request.is_body()
+                || matches!(
+                    request.status(),
+                    Some(
+                        StatusCode::TOO_MANY_REQUESTS
+                            | StatusCode::INTERNAL_SERVER_ERROR
+                            | StatusCode::BAD_GATEWAY
+                            | StatusCode::SERVICE_UNAVAILABLE
+                            | StatusCode::GATEWAY_TIMEOUT
+                    )
+                )
+        }
+        _ => false,
+    }
+}
+
+fn is_throttling_error(err: &OpenAIError) -> bool {
+    match err {
+        OpenAIError::ApiError(api_err) => {
+            // Supported error codes: https://platform.openai.com/docs/guides/error-codes/api-errors
+            matches!(api_err.code.as_deref(), Some("429"))
+        }
+        OpenAIError::Reqwest(request) => {
+            matches!(request.status(), Some(StatusCode::TOO_MANY_REQUESTS))
+        }
+        _ => false,
+    }
+}
+
+// `OpenAPI` estimator counts utf-8 bytes as 0.25 tokens so max allowed string size is 1,200,000 bytes.
+const MAX_BATCH_STR_BYTES: usize = 512 * 1024; // 512 KiB
+const MAX_BATCH_SIZE: usize = 256; // set from https://github.com/spiceai/spiceai/issues/6743
 
 /// Chunks embedding input to batches to be `OpenAI` API compliant: `<https://platform.openai.com/docs/api-reference/embeddings/create>`
 ///  - "any array must be 2048 dimensions or less"
@@ -226,11 +362,11 @@ mod tests {
 
     #[test]
     fn test_chunk_embedding_input_breaks_max_batch_size() {
-        let input = EmbeddingInput::StringArray(vec!["test".to_string(); 3000]);
+        let input = EmbeddingInput::StringArray(vec!["test".to_string(); 2048]);
         let batches = chunk_embedding_input(&input);
 
-        // Should break into multiple batches due to MAX_BATCH_SIZE (2048)
-        assert_eq!(batches.len(), 2);
+        // Should break into multiple batches due to MAX_BATCH_SIZE (256)
+        assert_eq!(batches.len(), 8);
 
         let total_items: usize = batches
             .iter()
@@ -243,21 +379,19 @@ mod tests {
             })
             .sum();
 
-        assert_eq!(total_items, 3000);
+        assert_eq!(total_items, 2048);
     }
 
     #[test]
     fn test_chunk_embedding_input_breaks_300k_tokens_fits_estimator() {
-        // 1001 chunks each 300 characters = 300300 characters
-        // OpenAI estimator counts utf-8 bytes as 0.25 tokens
-        // ASCII characters are 1 byte each, so 300300 bytes = 75075 tokens (under 300k)
-        let input = EmbeddingInput::StringArray(vec!["a".repeat(300); 1001]);
+        // 256 chunks each 1900 characters = 486,400 bytes
+        // MAX_BATCH_STR_BYTES is 512 KiB, so this should fit in one batch
+        let input = EmbeddingInput::StringArray(vec!["a".repeat(1900); 256]);
         let batches = chunk_embedding_input(&input);
 
-        // Should fit in one batch since estimated tokens < 300k
         assert_eq!(batches.len(), 1);
         if let EmbeddingInput::StringArray(strings) = &batches[0] {
-            assert_eq!(strings.len(), 1001);
+            assert_eq!(strings.len(), 256);
         } else {
             panic!("Expected StringArray");
         }
@@ -265,13 +399,13 @@ mod tests {
 
     #[test]
     fn test_chunk_embedding_input_breaks_300k_tokens() {
-        // 500 chunks each 3000 ASCII characters = 1,500,000 bytes
-        // 1500,000 bytes / 4 = 375000 tokens (over 300k, should split)
-        let input = EmbeddingInput::StringArray(vec!["a".repeat(3000); 500]);
+        // 256 chunks each 5859 ASCII characters = 1,499,904 bytes
+        // MAX_BATCH_STR_BYTES is 512 KiB, so this should break into multiple batches
+        let input = EmbeddingInput::StringArray(vec!["a".repeat(5859); 256]);
         let batches = chunk_embedding_input(&input);
 
-        // Should break into 2 batches due to exceeding MAX_BATCH_STR_BYTES
-        assert_eq!(batches.len(), 2);
+        // Should break into 3 batches due to exceeding MAX_BATCH_STR_BYTES
+        assert_eq!(batches.len(), 3);
 
         let total_items: usize = batches
             .iter()
@@ -284,18 +418,18 @@ mod tests {
             })
             .sum();
 
-        assert_eq!(total_items, 500);
+        assert_eq!(total_items, 256);
     }
 
     #[test]
     fn test_chunk_embedding_input_breaks_300k_tokens_unicode() {
-        // 500 chunks each 1000 characters using multi-byte UTF-8 character (中)
-        // 中 is 3 bytes = 0.75 tokens * 1000 * 500 = 375000 tokens (over 300k, should split)
-        let input = EmbeddingInput::StringArray(vec!["中".repeat(1000); 500]);
+        // 256 chunks each 1500 characters using multi-byte UTF-8 character (中)
+        // 中 is 3 bytes * 1500 * 256 = 1,152,000 bytes (over MAX_BATCH_STR_BYTES, should split)
+        let input = EmbeddingInput::StringArray(vec!["中".repeat(1500); 256]);
         let batches = chunk_embedding_input(&input);
 
-        // Should break into 2 batches due to exceeding MAX_BATCH_STR_BYTES
-        assert_eq!(batches.len(), 2);
+        // Should break into 3 batches due to exceeding MAX_BATCH_STR_BYTES
+        assert_eq!(batches.len(), 3);
 
         let total_items: usize = batches
             .iter()
@@ -308,7 +442,7 @@ mod tests {
             })
             .sum();
 
-        assert_eq!(total_items, 500);
+        assert_eq!(total_items, 256);
     }
 
     #[test]
@@ -317,7 +451,7 @@ mod tests {
         let input = EmbeddingInput::ArrayOfIntegerArray(large_array);
         let batches = chunk_embedding_input(&input);
 
-        // Should break into chunks of MAX_BATCH_SIZE (2048)
+        // Should break into chunks of MAX_BATCH_SIZE (256)
         assert!(batches.len() > 1);
 
         let total_items: usize = batches

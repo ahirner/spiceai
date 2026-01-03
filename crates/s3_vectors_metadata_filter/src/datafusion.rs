@@ -70,10 +70,10 @@ pub fn convert_datafusion_filters_to_s3_vectors(
             return Ok(None);
         }
 
-        if and_filters.len() == 1 {
-            if let Some(filter_expr) = and_filters.pop() {
-                return Ok(Some(MetadataFilter::Complex(filter_expr)));
-            }
+        if and_filters.len() == 1
+            && let Some(filter_expr) = and_filters.pop()
+        {
+            return Ok(Some(MetadataFilter::Complex(filter_expr)));
         }
 
         let logical_op = LogicalOperation {
@@ -130,7 +130,7 @@ fn supports_in_list(columns: &[String], in_list: &datafusion::logical_expr::expr
 
 /// Checks if an expression is a literal value
 fn is_literal(expr: &Expr) -> bool {
-    matches!(expr, Expr::Literal(_))
+    matches!(expr, Expr::Literal(..))
 }
 
 /// Converts a single `DataFusion` Expr to a `MetadataFilter`
@@ -293,7 +293,7 @@ fn extract_field_name(expr: &Expr) -> DataFusionResult<String> {
 /// Extracts literal value from a `DataFusion` expression
 fn extract_literal_value(expr: &Expr) -> DataFusionResult<serde_json::Value> {
     match expr {
-        Expr::Literal(scalar) => scalar_to_json_value(scalar),
+        Expr::Literal(scalar, _) => scalar_to_json_value(scalar),
         _ => Err(DataFusionError::Plan(format!(
             "Expected literal value, got: {expr:?}"
         ))),
@@ -593,7 +593,6 @@ mod tests {
     use datafusion::sql::unparser::{Unparser, dialect::DefaultDialect};
 
     #[test]
-    #[allow(clippy::too_many_lines)]
     fn test_valid_datafusion_expressions() {
         let columns = vec![
             "genre".to_string(),
@@ -704,7 +703,7 @@ mod tests {
             let result = convert_datafusion_filters_to_s3_vectors(&[expr])
                 .expect("Failed to convert DataFusion filters to S3 Vectors filters");
             if let Some(filter) = result {
-                assert!(filter.validate().is_ok());
+                filter.validate().expect("Should be a valid filter");
 
                 let json_result = filter.to_json().expect("Failed to convert filter to JSON");
                 let parsed_value: serde_json::Value =

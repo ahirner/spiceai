@@ -14,16 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use arrow::{array::StringArray, compute::concat_batches, util::pretty::pretty_format_batches};
-use async_openai::types::EmbeddingInput;
+use arrow::{array::StringArray, util::pretty::pretty_format_batches};
+use async_openai::types::embeddings::EmbeddingInput;
 use futures::TryStreamExt;
 use rand::Rng;
 use reqwest::{Client, header::HeaderMap};
-use runtime::{Runtime, config::Config, get_params_with_secrets};
+use runtime::{Runtime, config::Config};
+use runtime_secrets::get_params_with_secrets;
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::acceleration::Acceleration;
-use spicepod::{component::dataset::Dataset, param::Params};
+use spicepod::{
+    component::{dataset::Dataset, view::View},
+    param::Params,
+};
 use std::sync::Arc;
 use std::{
     collections::HashMap,
@@ -31,10 +35,12 @@ use std::{
 };
 
 use serde_json::{Value, json};
+mod ai_udf;
 mod bedrock;
 mod embedding;
-mod hf;
+pub(crate) mod hf;
 mod local;
+mod models_http_endpoint;
 pub(crate) mod openai;
 #[cfg(feature = "s3_vectors")]
 mod s3_vectors;
@@ -47,7 +53,7 @@ mod nsql {
         HeaderMap, HeaderValue,
         header::{ACCEPT, CONTENT_TYPE},
     };
-    use opentelemetry_sdk::trace::TracerProvider;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
 
     use crate::models::http_post;
 
@@ -59,7 +65,7 @@ mod nsql {
     pub async fn run_nsql_test(
         base_url: &str,
         ts: &TestCase,
-        trace_provider: &TracerProvider,
+        trace_provider: &SdkTracerProvider,
     ) -> Result<(), anyhow::Error> {
         tracing::info!("Running test cases {}", ts.name);
         let task_start_time = std::time::SystemTime::now();
@@ -135,22 +141,20 @@ mod nsql {
     }
 }
 
-fn create_api_bindings_config() -> Config {
+pub(crate) fn create_api_bindings_config() -> Config {
     let mut rng = rand::rng();
     let http_port: u16 = rng.random_range(50000..60000);
     let flight_port: u16 = http_port + 1;
-    let otel_port: u16 = http_port + 2;
-    let metrics_port: u16 = http_port + 3;
+    let metrics_port: u16 = http_port + 2;
 
-    let localhost: IpAddr = IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1));
+    let localhost: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
     let api_config = Config::new()
         .with_http_bind_address(SocketAddr::new(localhost, http_port))
-        .with_flight_bind_address(SocketAddr::new(localhost, flight_port))
-        .with_open_telemetry_bind_address(SocketAddr::new(localhost, otel_port));
+        .with_flight_bind_address(SocketAddr::new(localhost, flight_port));
 
     tracing::debug!(
-        "Created api bindings configuration: http: {http_port}, flight: {flight_port}, otel: {otel_port}, metrics: {metrics_port}"
+        "Created api bindings configuration: http: {http_port}, flight: {flight_port}, metrics: {metrics_port}"
     );
 
     api_config
@@ -193,6 +197,102 @@ fn get_small_clickbench_dataset(name: &str) -> Dataset {
         ..Default::default()
     });
     dataset
+}
+
+// This dataset is derived from https://huggingface.co/datasets/MegaScience/MegaScience, with the following alterations:
+//  - Any `question` or `answer` > 256 characters is removed.
+//  - An arbitrary but unique `id` integer column is added.
+pub fn get_mega_science_dataset(
+    spice_name: Option<&str>,
+    question_column: Option<spicepod::semantic::Column>,
+    answer_column: Option<spicepod::semantic::Column>,
+) -> Dataset {
+    let mut dataset = mega_science_dataset(spice_name, true);
+
+    dataset.columns = [question_column, answer_column]
+        .into_iter()
+        .flatten()
+        .collect();
+
+    dataset
+}
+
+fn mega_science_dataset(spice_name: Option<&str>, accelerate: bool) -> Dataset {
+    let mut dataset = Dataset::new(
+        // Can use this to run efficiently, locally:
+        // "file:../../data/mega-science-small.jsonl",
+        "s3://spiceai-public-datasets/MegaScience/mega-science-small.jsonl",
+        spice_name.unwrap_or("megascience"),
+    );
+    dataset.params = Some(Params::from_string_map(
+        vec![("client_timeout".to_string(), "120s".to_string())]
+            .into_iter()
+            .collect(),
+    ));
+
+    dataset.acceleration = Some(Acceleration {
+        enabled: accelerate,
+        ..Default::default()
+    });
+
+    dataset
+}
+
+// This dataset view is derived from https://huggingface.co/datasets/MegaScience/MegaScience, with the following alterations:
+//  - Any `question` or `answer` > 256 characters is removed.
+//  - An arbitrary but unique `id` integer column is added.
+//
+// ```sql
+//   SELECT *
+//   FROM (
+//      SELECT id, question, reference_answer FROM mega_science_ds where subject!='math'
+//   ) v1
+//   INNER JOIN (
+//     SELECT id, answer, source, subject FROM mega_science_ds where subject!='math'
+//   ) v2
+//   ON v1.id = v2.id
+//   UNION ALL (
+//     SELECT id, question, answer, reference_answer, source, subject FROM mega_science_ds where subject='math'
+//   )
+// ```
+pub fn get_mega_science_view(
+    spice_name: Option<&str>,
+    question_column: Option<spicepod::semantic::Column>,
+    answer_column: Option<spicepod::semantic::Column>,
+) -> (Dataset, Vec<View>) {
+    let ds = mega_science_dataset(Some("mega_science_ds"), false);
+
+    let mut v1 = View::new("v1".to_string());
+    v1.sql = Some(
+        "SELECT id, question, reference_answer FROM mega_science_ds where subject!='math'"
+            .to_string(),
+    );
+
+    let mut v2 = View::new("v2".to_string());
+    v2.sql = Some(
+        "SELECT id, answer, source, subject FROM mega_science_ds where subject!='math'".to_string(),
+    );
+    v2.acceleration = Some(Acceleration {
+        enabled: true,
+        ..Default::default()
+    });
+
+    let mut v3 = View::new("v3".to_string());
+    v3.sql = Some("SELECT * FROM mega_science_ds where subject='math'".to_string());
+
+    let mut v = View::new(spice_name.unwrap_or("megascience").to_string());
+    v.sql = Some("SELECT v1.*, v2.answer, v2.source, v2.subject FROM v1 INNER JOIN v2 ON v1.id = v2.id UNION ALL (SELECT id, question, reference_answer, answer, source, subject FROM v3)".to_string());
+
+    v.acceleration = Some(Acceleration {
+        enabled: true,
+        ..Default::default()
+    });
+    v.columns = [question_column, answer_column]
+        .into_iter()
+        .flatten()
+        .collect();
+
+    (ds, vec![v1, v2, v3, v])
 }
 
 pub fn get_tpcds_dataset(
@@ -250,14 +350,14 @@ fn normalize_embeddings_response(mut json: Value) -> String {
 /// Normalizes chat completion response for consistent snapshot testing by replacing dynamic values
 fn normalize_chat_completion_response(mut json: Value, normalize_message_content: bool) -> String {
     // Replace `content`
-    if normalize_message_content {
-        if let Some(choices) = json.get_mut("choices").and_then(|c| c.as_array_mut()) {
-            for choice in choices {
-                if let Some(message) = choice.get_mut("message") {
-                    if let Some(content) = message.get_mut("content") {
-                        *content = json!("content_val");
-                    }
-                }
+    if normalize_message_content
+        && let Some(choices) = json.get_mut("choices").and_then(|c| c.as_array_mut())
+    {
+        for choice in choices {
+            if let Some(message) = choice.get_mut("message")
+                && let Some(content) = message.get_mut("content")
+            {
+                *content = json!("content_val");
             }
         }
     }
@@ -299,7 +399,7 @@ fn normalize_chat_completion_response(mut json: Value, normalize_message_content
 }
 
 /// Sorts the keys of a JSON object in place for consistent snapshot testing
-fn sort_json_keys(value: &mut Value) {
+pub(crate) fn sort_json_keys(value: &mut Value) {
     match value {
         Value::Object(map) => {
             let mut sorted_map = serde_json::Map::new();
@@ -324,7 +424,7 @@ fn sort_json_keys(value: &mut Value) {
     }
 }
 
-async fn send_embeddings_request(
+pub async fn send_embeddings_request(
     base_url: &str,
     model: &str,
     input: EmbeddingInput,
@@ -462,7 +562,7 @@ async fn sql_to_display(
     pretty_format_batches(&data).map(|d| format!("{d}")).boxed()
 }
 
-#[allow(clippy::expect_used)]
+#[expect(clippy::expect_used)]
 async fn sql_to_single_json_value(rt: &Arc<Runtime>, query: &str) -> Value {
     let data = rt
         .datafusion()
@@ -490,46 +590,6 @@ async fn sql_to_single_json_value(rt: &Arc<Runtime>, query: &str) -> Value {
     .expect("value is a JSON string")
 }
 
-#[allow(clippy::expect_used)]
-async fn sql_to_json_values(rt: &Arc<Runtime>, query: &str) -> Vec<Value> {
-    let data = rt
-        .datafusion()
-        .query_builder(query)
-        .build()
-        .run()
-        .await
-        .boxed()
-        .expect("Failed to collect data")
-        .data
-        .try_collect::<Vec<_>>()
-        .await
-        .boxed()
-        .expect("Failed to collect data");
-
-    // Data may be split into multiple batches, so we need to concatenate them
-    let concat_data = if data.len() > 1 {
-        concat_batches(&data[0].schema(), &data).expect("Failed to concatenate batches")
-    } else {
-        data[0].clone()
-    };
-
-    let mut json_values: Vec<Value> = Vec::new();
-
-    let string_column = concat_data
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("column is a StringArray");
-
-    for row_idx in 0..concat_data.num_rows() {
-        let json_str = string_column.value(row_idx);
-        let json_val = serde_json::from_str(json_str).expect("value is a JSON string");
-
-        json_values.push(json_val);
-    }
-    json_values
-}
-
 async fn get_params_with_secrets_value(
     params: &HashMap<String, Value>,
     rt: &Runtime,
@@ -547,4 +607,48 @@ async fn get_params_with_secrets_value(
         .collect::<HashMap<_, _>>();
 
     get_params_with_secrets(rt.secrets(), &params).await
+}
+
+pub(crate) fn get_anthropic_model(
+    model: impl Into<String>,
+    name: impl Into<String>,
+) -> spicepod::component::model::Model {
+    let mut model =
+        spicepod::component::model::Model::new(format!("anthropic:{}", model.into()), name);
+    model.params.insert(
+        "anthropic_api_key".to_string(),
+        "${ secrets:SPICE_ANTHROPIC_API_KEY }".into(),
+    );
+    model
+}
+
+pub(crate) fn get_xai_model(
+    model: impl Into<String>,
+    name: impl Into<String>,
+) -> spicepod::component::model::Model {
+    let mut model = spicepod::component::model::Model::new(format!("xai:{}", model.into()), name);
+    model.params.insert(
+        "xai_api_key".to_string(),
+        "${ secrets:SPICE_XAI_API_KEY }".into(),
+    );
+    model
+}
+
+pub(crate) fn get_local_model(
+    hf_model: impl Into<String>,
+    model_type: impl Into<String>,
+    name: impl Into<String>,
+) -> spicepod::component::model::Model {
+    let mut model = spicepod::component::model::Model::new(
+        format!("huggingface:huggingface.co/{}", hf_model.into()),
+        name,
+    );
+    model
+        .params
+        .insert("model_type".to_string(), model_type.into().into());
+    model
+        .params
+        .insert("hf_max_completion_tokens".to_string(), 10.into());
+    // Local models don't require HF token for public models like Phi
+    model
 }

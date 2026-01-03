@@ -44,17 +44,18 @@ use tonic::IntoRequest;
 use tonic::IntoStreamingRequest;
 use tonic::transport::Channel;
 
+pub mod arrow_flight_factory;
 pub mod tls;
 
 pub const MAX_ENCODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 pub const MAX_DECODING_MESSAGE_SIZE: usize = 100 * 1024 * 1024;
 
 #[derive(Debug)]
-pub struct TonicStatusError(tonic::Status);
+pub struct TonicStatusError(Box<tonic::Status>);
 
 impl From<tonic::Status> for TonicStatusError {
     fn from(status: tonic::Status) -> Self {
-        TonicStatusError(status)
+        TonicStatusError(Box::new(status))
     }
 }
 
@@ -65,11 +66,11 @@ impl std::fmt::Display for TonicStatusError {
         let source = self.0.source();
 
         match (source, message.clone()) {
-            (Some(source), TonicStatusMessage::TransportError) => write!(f, "{message}\n{source}"),
+            (Some(source), TonicStatusMessage::TransportError) => write!(f, "{message} {source}"),
             (None, TonicStatusMessage::TransportError) => write!(f, "{message}"),
-            (None, TonicStatusMessage::Unmatched(message)) => write!(f, "{code}.\n{message}"),
+            (None, TonicStatusMessage::Unmatched(message)) => write!(f, "{code}. {message}"),
             (Some(source), TonicStatusMessage::Unmatched(message)) => {
-                write!(f, "{code}.\n{message}\n{source}")
+                write!(f, "{code}. {message} {source}")
             }
         }
     }
@@ -130,16 +131,16 @@ impl std::fmt::Display for TonicStatusMessage {
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display(
-        "Failed to connect to server: TLS error.\n{source}\nEnsure the flight endpoint is valid and reachable."
+        "Failed to connect to server: TLS error. {source} Ensure the flight endpoint is valid and reachable."
     ))]
     UnableToConnectToServer { source: tls::Error },
 
-    #[snafu(display("Authentication failed.\n{source}\nEnsure the credentials are valid."))]
+    #[snafu(display("Authentication failed. {source} Ensure the credentials are valid."))]
     InvalidMetadata {
         source: tonic::metadata::errors::InvalidMetadataValue,
     },
 
-    #[snafu(display("Failed to connect to Flight server: Handshake failed.\n{source}"))]
+    #[snafu(display("Failed to connect to Flight server: Handshake failed. {source}"))]
     UnableToPerformHandshake { source: TonicStatusError },
 
     #[snafu(display(
@@ -150,16 +151,16 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to get schema.\n{source}\nReport a bug to request support: https://github.com/spiceai/spiceai/issues"
+        "Failed to get schema. {source} Report a bug to request support: https://github.com/spiceai/spiceai/issues"
     ))]
     UnableToConvertSchema { source: arrow::error::ArrowError },
 
-    #[snafu(display("Query execution failed.\n{source}"))]
+    #[snafu(display("Query execution failed. {source}"))]
     UnableToQuery {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
-    #[snafu(display("Failed to publish data to flight endpoint.\n{source}"))]
+    #[snafu(display("Failed to publish data to flight endpoint. {source}"))]
     UnableToPublish { source: TonicStatusError },
 
     #[snafu(display("Unauthorized. Verify the credentials are configured correctly."))]
@@ -173,8 +174,13 @@ pub enum Error {
     ))]
     NoEndpointsFound,
 
-    #[snafu(display("Connection is reset by the server. Please retry the request.\n{source}"))]
+    #[snafu(display("Connection is reset by the server. Please retry the request. {source}"))]
     ConnectionReset { source: TonicStatusError },
+
+    #[snafu(display("An Arrow flight client error has occurred: {source}"))]
+    ArrowFlightError {
+        source: arrow_flight::error::FlightError,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -241,7 +247,7 @@ impl Credentials {
 /// also designed to be cheap to clone.
 #[derive(Debug, Clone)]
 pub struct FlightClient {
-    flight_client: FlightServiceClient<Channel>,
+    client: FlightServiceClient<Channel>,
     credentials: Credentials,
     url: Arc<str>,
     metadata: Option<tonic::metadata::MetadataMap>,
@@ -268,7 +274,7 @@ impl FlightClient {
             .context(UnableToConnectToServerSnafu)?;
 
         Ok(FlightClient {
-            flight_client: FlightServiceClient::new(flight_channel)
+            client: FlightServiceClient::new(flight_channel)
                 .max_encoding_message_size(MAX_ENCODING_MESSAGE_SIZE)
                 .max_decoding_message_size(MAX_DECODING_MESSAGE_SIZE),
             credentials,
@@ -291,8 +297,8 @@ impl FlightClient {
         max_encoding_message_size: usize,
         max_decoding_message_size: usize,
     ) -> Self {
-        self.flight_client = self
-            .flight_client
+        self.client = self
+            .client
             .max_encoding_message_size(max_encoding_message_size)
             .max_decoding_message_size(max_decoding_message_size);
         self
@@ -330,7 +336,7 @@ impl FlightClient {
         }
 
         let schema_result = self
-            .flight_client
+            .client
             .clone()
             .get_schema(req)
             .await
@@ -372,7 +378,7 @@ impl FlightClient {
         }
 
         let schema_result = self
-            .flight_client
+            .client
             .clone()
             .get_schema(req)
             .await
@@ -414,7 +420,7 @@ impl FlightClient {
         }
 
         let info = self
-            .flight_client
+            .client
             .clone()
             .get_flight_info(req)
             .await
@@ -441,7 +447,7 @@ impl FlightClient {
             }
 
             let (md, response_stream, _ext) = self
-                .flight_client
+                .client
                 .clone()
                 .do_get(req)
                 .await
@@ -491,7 +497,7 @@ impl FlightClient {
         }
 
         let (_md, response_stream, _ext) = self
-            .flight_client
+            .client
             .clone()
             .do_exchange(req)
             .await
@@ -557,7 +563,7 @@ impl FlightClient {
                 .insert("authorization", auth_header_value);
         }
 
-        let resp = match self.flight_client.clone().do_put(publish_request).await {
+        let resp = match self.client.clone().do_put(publish_request).await {
             Ok(resp) => resp,
             Err(e) => match e.code() {
                 tonic::Code::PermissionDenied => PermissionDeniedSnafu.fail(),
@@ -598,22 +604,17 @@ impl FlightClient {
             .parse()
             .context(InvalidMetadataSnafu)?;
         req.metadata_mut().insert("authorization", val);
-        let mut resp = self
-            .flight_client
-            .clone()
-            .handshake(req)
-            .await
-            .map_err(|e| {
-                if is_connection_reset_error(&e) {
-                    Error::ConnectionReset {
-                        source: TonicStatusError::from(e),
-                    }
-                } else {
-                    Error::UnableToPerformHandshake {
-                        source: TonicStatusError::from(e),
-                    }
+        let mut resp = self.client.clone().handshake(req).await.map_err(|e| {
+            if is_connection_reset_error(&e) {
+                Error::ConnectionReset {
+                    source: TonicStatusError::from(e),
                 }
-            })?;
+            } else {
+                Error::UnableToPerformHandshake {
+                    source: TonicStatusError::from(e),
+                }
+            }
+        })?;
 
         let mut token: Option<Token> = None;
 
@@ -657,11 +658,10 @@ impl FlightClient {
     }
 
     pub fn client(&self) -> &FlightServiceClient<Channel> {
-        &self.flight_client
+        &self.client
     }
 }
 
-#[allow(clippy::needless_pass_by_value)]
 fn map_tonic_error_to_message(e: tonic::Status) -> Error {
     if is_connection_reset_error(&e) {
         return Error::ConnectionReset {
