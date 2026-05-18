@@ -23,11 +23,13 @@ use crate::context::RuntimeContext;
 use crate::error::{InvalidArgumentSnafu, Result};
 use crate::output::{OutputFormat, TableOutput, write_json};
 use clap::{Args, Subcommand};
+use dialoguer::{Input, Password, Select, theme::ColorfulTheme};
 use snafu::ResultExt;
+use std::{fmt, io::IsTerminal};
 
 pub use client::CloudClient;
 pub use config::{CloudLink, get_linked_app, load_cloud_link, remove_cloud_link, save_cloud_link};
-use spice_cloud_client::types::IngestionMetrics;
+use spice_cloud_client::types::{IngestionMetrics, PodMetrics};
 
 /// Arguments for the cloud command.
 #[derive(Args, Debug)]
@@ -95,9 +97,6 @@ pub enum CloudCommands {
     /// Inspect current deployment status
     Inspect(InspectArgs),
 
-    /// Rollback to a previous deployment
-    Rollback(RollbackArgs),
-
     /// Show API keys for an app
     #[command(name = "api-keys")]
     ApiKeys(ApiKeysArgs),
@@ -131,11 +130,102 @@ pub struct RegionsArgs {
     pub output: OutputFormat,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args)]
 pub struct LoginArgs {
-    /// Skip opening the browser and print the auth URL instead
+    #[command(subcommand)]
+    pub method: Option<LoginMethod>,
+}
+
+impl fmt::Debug for LoginArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LoginArgs")
+            .field("method", &self.method)
+            .finish()
+    }
+}
+
+#[derive(Subcommand)]
+pub enum LoginMethod {
+    /// Log in with your Spice Cloud subscription in a browser
+    Subscription(SubscriptionLoginArgs),
+
+    /// Log in with a Spice Cloud personal access token
+    #[command(name = "pat")]
+    Pat(PatLoginArgs),
+
+    /// Log in with OAuth client credentials for automation
+    Api(ApiLoginArgs),
+}
+
+impl fmt::Debug for LoginMethod {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Subscription(args) => f.debug_tuple("Subscription").field(args).finish(),
+            Self::Pat(args) => f.debug_tuple("Pat").field(args).finish(),
+            Self::Api(args) => f.debug_tuple("Api").field(args).finish(),
+        }
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct SubscriptionLoginArgs {
+    /// Don't open a browser; print the URL and a one-time code to enter on
+    /// another device. Useful over SSH or in headless shells.
     #[arg(long)]
-    pub no_browser: bool,
+    pub device: bool,
+}
+
+#[derive(Args)]
+pub struct PatLoginArgs {
+    /// Personal access token. Omit to enter it securely.
+    #[arg(
+        long,
+        env = "SPICE_CLOUD_PAT",
+        value_name = "TOKEN",
+        help_heading = "PAT Login Options"
+    )]
+    pub token: Option<String>,
+}
+
+impl fmt::Debug for PatLoginArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PatLoginArgs")
+            .field("token", &self.token.as_deref().map(|_| "[REDACTED]"))
+            .finish()
+    }
+}
+
+#[derive(Args)]
+pub struct ApiLoginArgs {
+    /// OAuth client ID. Omit to enter it interactively.
+    #[arg(
+        long,
+        env = "SPICE_CLOUD_CLIENT_ID",
+        value_name = "CLIENT_ID",
+        help_heading = "API Login Options"
+    )]
+    pub client_id: Option<String>,
+
+    /// OAuth client secret. Omit to enter it securely.
+    #[arg(
+        long,
+        env = "SPICE_CLOUD_CLIENT_SECRET",
+        value_name = "CLIENT_SECRET",
+        help_heading = "API Login Options"
+    )]
+    pub client_secret: Option<String>,
+}
+
+impl fmt::Debug for ApiLoginArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApiLoginArgs")
+            .field("client_id", &self.client_id)
+            .field(
+                "client_secret",
+                &self.client_secret.as_deref().map(|_| "[REDACTED]"),
+            )
+            .finish()
+    }
 }
 
 #[derive(Args, Debug)]
@@ -225,21 +315,6 @@ pub struct InspectArgs {
     /// App name in org/app format (uses linked app if not specified)
     #[arg(long)]
     pub app: Option<String>,
-
-    /// Output format
-    #[arg(long, short = 'o', default_value = "table")]
-    pub output: OutputFormat,
-}
-
-#[derive(Args, Debug)]
-pub struct RollbackArgs {
-    /// App name in org/app format (uses linked app if not specified)
-    #[arg(long)]
-    pub app: Option<String>,
-
-    /// Target deployment ID to rollback to
-    #[arg(long)]
-    pub target: Option<i64>,
 
     /// Output format
     #[arg(long, short = 'o', default_value = "table")]
@@ -519,7 +594,6 @@ pub async fn execute(_ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
         CloudCommands::Delete(delete_cmd) => execute_delete(delete_cmd).await,
         CloudCommands::Deploy(deploy_args) => execute_deploy(deploy_args).await,
         CloudCommands::Inspect(inspect_args) => execute_inspect(inspect_args).await,
-        CloudCommands::Rollback(rollback_args) => execute_rollback(rollback_args).await,
         CloudCommands::ApiKeys(api_keys_args) => execute_api_keys(api_keys_args).await,
         CloudCommands::Metrics(metrics_args) => execute_metrics(metrics_args).await,
     }
@@ -530,7 +604,217 @@ pub async fn execute(_ctx: &RuntimeContext, args: &CloudArgs) -> Result<()> {
 // ============================================================================
 
 async fn execute_login(args: &LoginArgs) -> Result<()> {
+    match &args.method {
+        Some(LoginMethod::Subscription(args)) => execute_login_device_flow(!args.device).await,
+        Some(LoginMethod::Pat(args)) => execute_login_pat(args).await,
+        Some(LoginMethod::Api(args)) => execute_login_api(args).await,
+        None => execute_login_with_chooser().await,
+    }
+}
+
+async fn execute_login_with_chooser() -> Result<()> {
+    ensure_login_chooser_tty(std::io::stdin().is_terminal())?;
+
+    let items = [
+        "Subscription Login (browser)",
+        "Subscription Login (device code, no browser)",
+        "Personal Access Token (PAT)",
+        "API Login (OAuth client)",
+    ];
+    let selection = Select::with_theme(&ColorfulTheme::default())
+        .with_prompt("How would you like to log in to Spice Cloud?")
+        .items(items)
+        .default(0)
+        .interact()
+        .map_err(|err| crate::error::Error::InvalidArgument {
+            message: format!("Failed to read login selection: {err}"),
+        })?;
+
+    match selection {
+        0 => execute_login_device_flow(true).await,
+        1 => execute_login_device_flow(false).await,
+        2 => execute_login_pat(&PatLoginArgs { token: None }).await,
+        3 => {
+            execute_login_api(&ApiLoginArgs {
+                client_id: None,
+                client_secret: None,
+            })
+            .await
+        }
+        _ => InvalidArgumentSnafu {
+            message: "Invalid login selection".to_string(),
+        }
+        .fail(),
+    }
+}
+
+fn ensure_login_chooser_tty(is_terminal: bool) -> Result<()> {
+    if !is_terminal {
+        return InvalidArgumentSnafu {
+            message: "Choose a login type explicitly when running non-interactively: 'spice cloud login subscription', 'spice cloud login subscription --device', 'spice cloud login pat', or 'spice cloud login api'",
+        }
+        .fail();
+    }
+
+    Ok(())
+}
+
+async fn execute_login_pat(args: &PatLoginArgs) -> Result<()> {
+    let token = resolve_string_or_prompt(
+        args.token.as_deref(),
+        "PAT",
+        "--token",
+        "SPICE_CLOUD_PAT",
+        "Spice Cloud personal access token",
+        true,
+    )?;
+
+    save_token_and_print_login_result(&token).await
+}
+
+async fn execute_login_api(args: &ApiLoginArgs) -> Result<()> {
+    let client_id = resolve_string_or_prompt(
+        args.client_id.as_deref(),
+        "OAuth client ID",
+        "--client-id",
+        "SPICE_CLOUD_CLIENT_ID",
+        "OAuth client ID",
+        false,
+    )?;
+    let client_secret = resolve_string_or_prompt(
+        args.client_secret.as_deref(),
+        "OAuth client secret",
+        "--client-secret",
+        "SPICE_CLOUD_CLIENT_SECRET",
+        "OAuth client secret",
+        true,
+    )?;
+
+    let client = CloudClient::new_unauthenticated()?;
+    let token = client
+        .exchange_client_credentials(&client_id, &client_secret)
+        .await?;
+
+    save_token_and_print_login_result(&token).await
+}
+
+fn resolve_string_or_prompt(
+    value: Option<&str>,
+    label: &str,
+    flag: &str,
+    env_var: &str,
+    prompt: &str,
+    secret: bool,
+) -> Result<String> {
+    resolve_string_or_prompt_with_terminal(
+        value,
+        label,
+        flag,
+        env_var,
+        prompt,
+        secret,
+        std::io::stdin().is_terminal(),
+    )
+}
+
+fn resolve_string_or_prompt_with_terminal(
+    value: Option<&str>,
+    label: &str,
+    flag: &str,
+    env_var: &str,
+    prompt: &str,
+    secret: bool,
+    is_terminal: bool,
+) -> Result<String> {
+    if let Some(value) = value {
+        if value.is_empty() {
+            return InvalidArgumentSnafu {
+                message: format!("{label} cannot be empty."),
+            }
+            .fail();
+        }
+
+        return Ok(value.to_string());
+    }
+
+    // The chooser path constructs args structs with all fields set to None,
+    // bypassing Clap's env-var resolution. Re-resolve here so chooser-based
+    // PAT/API logins respect the configured env vars.
+    if let Ok(env_value) = std::env::var(env_var)
+        && !env_value.is_empty()
+    {
+        return Ok(env_value);
+    }
+
+    if !is_terminal {
+        return InvalidArgumentSnafu {
+            message: format!("{label} is required. Provide {flag} or set {env_var}."),
+        }
+        .fail();
+    }
+
+    let value = if secret {
+        Password::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt)
+            .interact()
+            .map_err(|err| crate::error::Error::InvalidArgument {
+                message: format!("Failed to read {label}: {err}"),
+            })?
+    } else {
+        Input::<String>::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt)
+            .interact_text()
+            .map_err(|err| crate::error::Error::InvalidArgument {
+                message: format!("Failed to read {label}: {err}"),
+            })?
+    };
+
+    if value.is_empty() {
+        return InvalidArgumentSnafu {
+            message: format!("{label} cannot be empty."),
+        }
+        .fail();
+    }
+
+    Ok(value)
+}
+
+async fn save_token_and_print_login_result(token: &str) -> Result<()> {
     use crate::commands::login::merge_auth_config;
+
+    let authed_client = CloudClient::with_token(token)?;
+    let auth_context_result = authed_client.get_auth_context().await;
+
+    merge_auth_config("SPICEAI", &[("TOKEN", token)])?;
+
+    match auth_context_result {
+        Ok(context) => {
+            if let Some(api_key) = context.app_api_key {
+                merge_auth_config("SPICEAI", &[("API_KEY", &api_key)])?;
+            }
+
+            println!();
+            println!(
+                "\x1b[32m✓ Successfully logged in to Spice Cloud as {} ({})\x1b[0m",
+                context.username, context.email
+            );
+        }
+        Err(err) => {
+            println!();
+            println!(
+                "\x1b[33m! Login token saved, but Spice Cloud could not verify the authenticated user context: {err}\x1b[0m"
+            );
+            println!(
+                "\x1b[33m! Subsequent cloud commands may fail if the token is invalid or unauthorized.\x1b[0m"
+            );
+        }
+    }
+
+    print_post_login_help();
+    Ok(())
+}
+
+async fn execute_login_device_flow(open_browser: bool) -> Result<()> {
     use rand::RngExt;
 
     // Generate auth code
@@ -546,16 +830,24 @@ async fn execute_login(args: &LoginArgs) -> Result<()> {
     let client = CloudClient::new_unauthenticated()?;
     let auth_url = client.get_auth_url(&auth_code);
 
-    println!("Opening Spice Cloud authorization page in your default browser...");
+    if open_browser {
+        println!("Opening Spice Cloud authorization page in your default browser...");
+    } else {
+        println!("Complete Spice Cloud device login in a browser.");
+    }
     println!(
         "\nYour auth code:\n\n  {}-{}\n",
         &auth_code[..4],
         &auth_code[4..]
     );
-    println!("If the browser does not open, visit the following URL manually:");
+    if open_browser {
+        println!("If the browser does not open, visit the following URL manually:");
+    } else {
+        println!("Open this URL in a browser:");
+    }
     println!("\n  {auth_url}\n");
 
-    if !args.no_browser {
+    if open_browser {
         let _ = open::that(&auth_url);
     }
 
@@ -584,38 +876,21 @@ async fn execute_login(args: &LoginArgs) -> Result<()> {
             }
 
             if let Some(token) = response.access_token {
-                // Save the token
-                merge_auth_config("SPICEAI", &[("TOKEN", &token)])?;
-
-                // Get user info
-                let authed_client = CloudClient::new()?;
-                if let Ok(context) = authed_client.get_auth_context().await {
-                    if let Some(api_key) = context.app_api_key {
-                        merge_auth_config("SPICEAI", &[("API_KEY", &api_key)])?;
-                    }
-                    println!();
-                    println!(
-                        "\x1b[32m✓ Successfully logged in to Spice Cloud as {} ({})\x1b[0m",
-                        context.username, context.email
-                    );
-                } else {
-                    println!("\n\x1b[32m✓ Successfully logged in to Spice Cloud\x1b[0m");
-                }
-
-                println!();
-                println!(
-                    "You can now use 'spice cloud' commands to manage your apps and deployments."
-                );
-                println!();
-                println!("Quick start:");
-                println!("  spice cloud apps              - List your apps");
-                println!("  spice cloud create app <name> - Create a new app");
-                println!("  spice cloud deploy --app <org/app> - Deploy your app");
-
-                return Ok(());
+                return save_token_and_print_login_result(&token).await;
             }
         }
     }
+}
+
+fn print_post_login_help() {
+    println!();
+    println!("You can now use 'spice cloud' commands to manage your apps and deployments.");
+    println!();
+    println!("Quick start:");
+    println!("  spice cloud apps              - List your apps");
+    println!("  spice cloud create app <name> - Create a new app");
+    println!("  spice cloud deploy --app <org/app> - Deploy your app");
+    println!();
 }
 
 fn execute_logout() -> Result<()> {
@@ -1122,38 +1397,6 @@ async fn execute_inspect(args: &InspectArgs) -> Result<()> {
     Ok(())
 }
 
-async fn execute_rollback(args: &RollbackArgs) -> Result<()> {
-    let client = CloudClient::new()?;
-    let app_name = require_app(args.app.as_deref())?;
-
-    let target_id = if let Some(id) = args.target {
-        id
-    } else {
-        // Get the second-to-last deployment
-        let deployments = client.list_deployments(&app_name, 2, None).await?;
-        if deployments.len() < 2 {
-            return InvalidArgumentSnafu {
-                message: "No previous deployment to rollback to",
-            }
-            .fail();
-        }
-        deployments[1].id
-    };
-
-    let deployment = client.rollback(&app_name, target_id).await?;
-
-    if args.output == OutputFormat::Json {
-        return write_json(&deployment);
-    }
-
-    println!(
-        "\x1b[32m✓ Rollback to deployment {} initiated (new deployment: {})\x1b[0m",
-        target_id, deployment.id
-    );
-
-    Ok(())
-}
-
 async fn execute_api_keys(args: &ApiKeysArgs) -> Result<()> {
     let client = CloudClient::new()?;
     let app_name = require_app(args.app.as_deref())?;
@@ -1211,30 +1454,9 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
     }
     let has_window = args.window.is_some();
 
-    let mut table = TableOutput::new(vec![
-        "POD",
-        "CPU %",
-        "MEMORY",
-        "DISK USED",
-        "DISK AVAIL",
-        "DISK CAP",
-    ]);
+    let mut table = TableOutput::new(metrics_table_headers());
     for (pod, m) in &response.metrics {
-        table.add_row(vec![
-            pod.clone(),
-            m.cpu_usage_percent
-                .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
-            m.memory_usage_bytes
-                .map_or_else(|| "-".to_string(), format_bytes),
-            m.disk_read_bytes
-                .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
-            m.disk_read_operations
-                .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
-            m.disk_write_bytes
-                .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
-            m.disk_write_operations
-                .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
-        ]);
+        table.add_row(metrics_table_row(pod, m, has_window));
     }
     table.print();
 
@@ -1266,6 +1488,36 @@ async fn execute_metrics(args: &MetricsArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn metrics_table_headers() -> Vec<&'static str> {
+    vec![
+        "POD",
+        "CPU %",
+        "MEMORY",
+        "DISK READ",
+        "READ OPS",
+        "DISK WRITE",
+        "WRITE OPS",
+    ]
+}
+
+fn metrics_table_row(pod: &str, m: &PodMetrics, has_window: bool) -> Vec<String> {
+    vec![
+        pod.to_string(),
+        m.cpu_usage_percent
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
+        m.memory_usage_bytes
+            .map_or_else(|| "-".to_string(), format_bytes),
+        m.disk_read_bytes
+            .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
+        m.disk_read_operations
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
+        m.disk_write_bytes
+            .map_or_else(|| "-".to_string(), |v| format_bytes_f64(v, has_window)),
+        m.disk_write_operations
+            .map_or_else(|| "-".to_string(), |v| format!("{v:.1}")),
+    ]
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -1339,4 +1591,163 @@ fn require_app(flag_value: Option<&str>) -> Result<String> {
         message: "App name is required. Use --app <org/app> or run 'spice cloud link' to link an app",
     }
     .fail()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_table_row_matches_header_count() {
+        // Regression for #9989: row was emitting one more cell than the header
+        // had columns, so the `disk_write_operations` value rendered without a
+        // label and the disk columns were captioned with unrelated names.
+        let headers = metrics_table_headers();
+
+        let none_metrics = PodMetrics::default();
+        let none_row = metrics_table_row("pod-none", &none_metrics, false);
+        assert_eq!(
+            none_row.len(),
+            headers.len(),
+            "row count must match header count when fields are None"
+        );
+
+        let full_metrics = PodMetrics {
+            cpu_usage_percent: Some(123.4),
+            memory_usage_bytes: Some(1024 * 1024 * 1024),
+            disk_read_bytes: Some(2048.0),
+            disk_read_operations: Some(11.0),
+            disk_write_bytes: Some(4096.0),
+            disk_write_operations: Some(22.0),
+        };
+        let full_row = metrics_table_row("pod-full", &full_metrics, true);
+        assert_eq!(
+            full_row.len(),
+            headers.len(),
+            "row count must match header count when fields are populated"
+        );
+    }
+
+    #[test]
+    fn metrics_table_headers_label_every_disk_column() {
+        // Regression for #9989: the original labels "DISK USED / DISK AVAIL /
+        // DISK CAP" were both wrong (they described capacity, not I/O) and
+        // omitted `disk_write_operations` entirely. Lock the labels in.
+        let headers = metrics_table_headers();
+        assert_eq!(
+            headers,
+            vec![
+                "POD",
+                "CPU %",
+                "MEMORY",
+                "DISK READ",
+                "READ OPS",
+                "DISK WRITE",
+                "WRITE OPS",
+            ]
+        );
+    }
+
+    #[test]
+    fn metrics_table_row_renders_dash_for_missing_values() {
+        let m = PodMetrics::default();
+        let row = metrics_table_row("p", &m, false);
+        // Pod name is always present; the six metric cells should be "-".
+        assert_eq!(row[0], "p");
+        assert!(
+            row[1..].iter().all(|cell| cell == "-"),
+            "missing metric cells should render as '-', got: {row:?}"
+        );
+    }
+
+    #[test]
+    fn login_chooser_requires_tty() {
+        let err = ensure_login_chooser_tty(false).expect_err("non-TTY chooser should fail");
+
+        assert!(
+            err.to_string()
+                .contains("Choose a login type explicitly when running non-interactively"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_string_or_prompt_uses_non_empty_value() {
+        let value = resolve_string_or_prompt_with_terminal(
+            Some("client-id"),
+            "OAuth client ID",
+            "--client-id",
+            "SPICE_CLOUD_CLIENT_ID",
+            "OAuth client ID",
+            false,
+            false,
+        )
+        .expect("provided value should be accepted");
+
+        assert_eq!(value, "client-id");
+    }
+
+    #[test]
+    fn resolve_string_or_prompt_rejects_empty_value() {
+        let err = resolve_string_or_prompt_with_terminal(
+            Some(""),
+            "OAuth client ID",
+            "--client-id",
+            "SPICE_CLOUD_CLIENT_ID",
+            "OAuth client ID",
+            false,
+            false,
+        )
+        .expect_err("empty value should fail");
+
+        assert!(
+            err.to_string().contains("OAuth client ID cannot be empty."),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_string_or_prompt_requires_value_when_non_interactive() {
+        let err = resolve_string_or_prompt_with_terminal(
+            None,
+            "OAuth client ID",
+            "--client-id",
+            "SPICE_CLOUD_CLIENT_ID",
+            "OAuth client ID",
+            false,
+            false,
+        )
+        .expect_err("missing value should fail without a TTY");
+
+        assert!(
+            err.to_string().contains(
+                "OAuth client ID is required. Provide --client-id or set SPICE_CLOUD_CLIENT_ID."
+            ),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_string_or_prompt_falls_back_to_env_var() {
+        // Use a unique env var name so the test does not depend on host state.
+        let env_var = "SPICE_CLOUD_TEST_RESOLVE_FALLBACK";
+        // SAFETY: Setting environment variable for test purposes only.
+        unsafe { std::env::set_var(env_var, "from-env") };
+
+        let value = resolve_string_or_prompt_with_terminal(
+            None,
+            "test value",
+            "--test",
+            env_var,
+            "test value",
+            false,
+            false,
+        )
+        .expect("env var should be used when value is None");
+
+        // SAFETY: Removing environment variable for test purposes only.
+        unsafe { std::env::remove_var(env_var) };
+
+        assert_eq!(value, "from-env");
+    }
 }

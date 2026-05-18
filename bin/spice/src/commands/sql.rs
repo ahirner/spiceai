@@ -19,6 +19,7 @@ limitations under the License.
 use crate::context::RuntimeContext;
 use crate::error::Result;
 use clap::Args;
+use spice_cloud_client::endpoints::flight_endpoint as spice_cloud_flight_endpoint;
 
 /// Arguments for the sql command.
 #[derive(Args, Debug)]
@@ -31,6 +32,9 @@ Examples:
   Welcome to the Spice.ai SQL REPL! Type 'help' for help.
 
   show tables;  -- list available tables
+
+  $ spice sql --expanded
+  # Starts the REPL in expanded view (column-per-line). Toggle at runtime with `.expanded`.
 
 See more at: https://spiceai.org/docs/"#
 )]
@@ -68,6 +72,11 @@ pub struct SqlArgs {
     /// Custom HTTP headers in format 'Key:Value' (can be specified multiple times)
     #[arg(long = "headers", value_name = "KEY:VALUE")]
     custom_headers: Vec<String>,
+
+    /// Start the REPL in expanded view, rendering each column on its own line
+    /// per record. Useful for wide tables; can be toggled at runtime with `.expanded`.
+    #[arg(long, short = 'x')]
+    expanded: bool,
 }
 
 /// Execute the sql command.
@@ -91,7 +100,7 @@ fn build_repl_config(ctx: &RuntimeContext, args: &SqlArgs) -> repl::ReplConfig {
         .map_or_else(
             || {
                 if let Some(region) = ctx.cloud_region() {
-                    format!("https://{region}-prod-aws-flight.spiceai.io")
+                    spice_cloud_flight_endpoint(region)
                 } else {
                     "http://localhost:50051".to_string()
                 }
@@ -125,5 +134,6 @@ fn build_repl_config(ctx: &RuntimeContext, args: &SqlArgs) -> repl::ReplConfig {
         user_agent: Some(ctx.user_agent().to_string()),
         cache_control,
         custom_headers: args.custom_headers.clone(),
+        expanded: args.expanded,
     }
 }

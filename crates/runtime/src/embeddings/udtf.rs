@@ -51,9 +51,9 @@ use datafusion::{
 
 use datafusion_expr::{
     LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl, TableProviderFilterPushDown,
-    binary_expr, col, ident,
+    binary_expr, ident,
 };
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
 use futures::FutureExt;
 use itertools::Itertools;
 #[cfg(feature = "models")]
@@ -84,17 +84,20 @@ use crate::{
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
 
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
 use {
     crate::search::util::find_index_in_table_provider,
     search::index::SearchIndex,
     search::provider::{SearchQueryProvider, UdtfSource},
 };
 
+#[cfg(feature = "elasticsearch")]
+use crate::accelerated_table::AcceleratedTable;
+
 #[cfg(feature = "s3_vectors")]
 use search::index::s3_vectors::S3Vector;
 
-#[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+#[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
 use search::index::chunking::ChunkedSearchIndex;
 
 #[cfg(feature = "elasticsearch")]
@@ -500,7 +503,7 @@ impl VectorSearchTableFunc {
         })
     }
 
-    #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+    #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
     fn index_based_vector_table(
         tbl: &Arc<dyn TableProvider>,
         args: &VectorSearchTableFuncArgs,
@@ -523,6 +526,20 @@ impl VectorSearchTableFunc {
             if let Some((es_indexes, _)) = find_index_in_table_provider::<ElasticsearchIndex>(tbl) {
                 vector_indexes.extend(
                     es_indexes
+                        .into_iter()
+                        .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
+                );
+            }
+        }
+
+        #[cfg(feature = "duckdb")]
+        {
+            use search::index::duckdb::DuckDBVectorIndex;
+            if let Some((duckdb_indexes, _)) =
+                find_index_in_table_provider::<DuckDBVectorIndex>(tbl)
+            {
+                vector_indexes.extend(
+                    duckdb_indexes
                         .into_iter()
                         .map(|c| Arc::new(c.clone()) as Arc<dyn SearchIndex>),
                 );
@@ -563,7 +580,7 @@ impl VectorSearchTableFunc {
             return Ok(None);
         };
 
-        // Index-backed providers (S3 vectors, Elasticsearch, chunked) ignore
+        // Index-backed providers (S3 vectors, Elasticsearch, DuckDB, chunked) ignore
         // `args.distance_metric` because their underlying `SearchIndex::query_table_provider`
         // takes only the query string and uses the metric the index was configured with.
         // Silently picking an index-configured metric while accepting a different one
@@ -577,15 +594,35 @@ impl VectorSearchTableFunc {
             )));
         }
 
+        // For Elasticsearch indexes, normalize the base table provider schema to strip any
+        // List/FixedSizeList columns (e.g. the embedding vector). ES does not return these
+        // columns, so they must be projected out of the base-table schema before
+        // `SearchQueryProvider` builds the join — otherwise Arrow rejects the type mismatch.
+        //
+        // Prefer the federated provider's schema when the top-level table is an
+        // `AcceleratedTable`, since the federated side already has the correct Arrow types
+        // (e.g. FixedSizeList) whereas the accelerator may store them differently.
+        #[cfg(feature = "elasticsearch")]
+        let federated_tbl_storage: Arc<dyn TableProvider>;
+        #[cfg(feature = "elasticsearch")]
+        let normalized_tbl_storage: Arc<dyn TableProvider>;
         // For Elasticsearch indexes, normalize the base table provider schema to match
         // what the ES HTTP client produces (e.g. LargeUtf8 → Utf8). This ensures that
         // HashJoinExec key types match on both sides of the join.
         #[cfg(feature = "elasticsearch")]
-        let normalized_tbl_storage: Arc<dyn TableProvider>;
-        #[cfg(feature = "elasticsearch")]
         let tbl: &Arc<dyn TableProvider> =
             if let Some(es_index) = vector_index.as_any().downcast_ref::<ElasticsearchIndex>() {
-                normalized_tbl_storage = es_index.normalize_source_table(Arc::clone(tbl))?;
+                let source_for_normalize = if let Some(acc) =
+                    find_concrete_table_provider::<AcceleratedTable>(tbl)
+                    && let Some(fed) = acc.get_federated_table_ref().try_table_provider_sync_ref()
+                {
+                    federated_tbl_storage = Arc::clone(fed);
+                    &federated_tbl_storage
+                } else {
+                    tbl
+                };
+                normalized_tbl_storage =
+                    es_index.normalize_source_table(Arc::clone(source_for_normalize))?;
                 &normalized_tbl_storage
             } else {
                 tbl
@@ -634,7 +671,7 @@ impl TableFunctionImpl for VectorSearchTableFunc {
         };
 
         // For table with a vector engine, use it.
-        #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
+        #[cfg(any(feature = "s3_vectors", feature = "elasticsearch", feature = "duckdb"))]
         if let Some(table_provider) = Self::index_based_vector_table(&table_provider, &args)? {
             return Ok(table_provider);
         }
@@ -769,7 +806,7 @@ impl ScalarUDFImpl for VectorSearchTableFunc {
     }
 }
 
-/// The [`TableProvider`] produced from the [`VECTOR_SEARCH_UDTF_NAME`] UDTF.
+/// A [`TableProvider`] produced from the [`VECTOR_SEARCH_UDTF_NAME`] UDTF for tables that do not have an explicit vector index.
 ///
 /// This provider computes vector similarity scores on-the-fly using the embedding model,
 /// without relying on a pre-built vector index.
@@ -953,13 +990,25 @@ impl TableProvider for VectorSearchUDTFProvider {
                 }
             })
             .collect();
+
         let mut base_expr = final_expr.clone();
+
+        // Keep the embedding column in the inner projection even when it is not requested
+        // in the final output. This gives `_score` a stable slot that does not collide
+        // with other projected columns (e.g. recency columns used by RRF rewrites).
+        let embedding_col_name = embedding_col!(embed_col);
+        if !base_expr
+            .iter()
+            .any(|expr| expr.qualified_name().1 == embedding_col_name)
+        {
+            base_expr.push(ident(embedding_col_name.clone()));
+        }
 
         // Pick the scoring expression based on the requested distance metric.
         // In all cases the result is monotonically increasing with similarity
         // (higher == more similar) so the downstream `ORDER BY _score DESC` is correct.
         let metric = self.args.distance_metric.unwrap_or(DistanceMetric::Cosine);
-        let embed_expr = ident(embedding_col!(embed_col));
+        let embed_expr = ident(embedding_col_name);
         let query_lit = lit(ScalarValue::FixedSizeList(Arc::new(query_vector)));
 
         let score_expr: Expr = match metric {
@@ -979,7 +1028,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                     Operator::Minus,
                     Expr::ScalarFunction(ScalarFunction {
                         func: cosine_distance_udf,
-                        args: vec![query_lit, embed_expr],
+                        args: vec![query_lit.clone(), embed_expr.clone()],
                     }),
                 )
             }
@@ -997,7 +1046,7 @@ impl TableProvider for VectorSearchUDTFProvider {
                     Operator::Minus,
                     Expr::ScalarFunction(ScalarFunction {
                         func: array_distance_udf,
-                        args: vec![query_lit, embed_expr],
+                        args: vec![query_lit.clone(), embed_expr.clone()],
                     }),
                 )
             }
@@ -1020,25 +1069,22 @@ impl TableProvider for VectorSearchUDTFProvider {
             }
         };
 
-        base_expr.push(score_expr.alias(SEARCH_SCORE_COLUMN_NAME));
+        base_expr.push(score_expr.clone().alias(SEARCH_SCORE_COLUMN_NAME));
 
         // Only project `_score` into the output when the caller asked for it
         // AND either asked for all columns or explicitly projected that index.
         if let Some(idx) = search_field_index
             && (projection.is_none() || projection.is_some_and(|proj| proj.contains(&idx)))
         {
-            final_expr.push(col(SEARCH_SCORE_COLUMN_NAME));
+            final_expr.push(score_expr.clone().alias(SEARCH_SCORE_COLUMN_NAME));
         }
 
         let final_plan = scan
             .project(base_expr)?
-            .sort(vec![SortExpr::new(
-                Expr::Column(Column::from_name(SEARCH_SCORE_COLUMN_NAME)),
-                false,
-                false,
-            )])?
+            .sort(vec![SortExpr::new(score_expr, false, false)])?
             .limit(0, Some(self.limit_to_use(limit)))?
-            // wrap the score calculation in a subquery before final projection, to avoid collapsing away the score calculation.
+            // Keep the score calculation and helper columns in a subquery,
+            // then project the user-visible output schema.
             .alias("tbl")?
             .project(final_expr)?
             .build()?;

@@ -30,19 +30,12 @@ use datafusion::{
         execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
     },
-    sql::{
-        TableReference,
-        sqlparser::ast::{DataType, ExactNumberInfo},
-        unparser::{
-            Unparser,
-            dialect::{CustomDialect, CustomDialectBuilder},
-        },
-    },
+    sql::{TableReference, unparser::Unparser},
 };
 use futures::StreamExt;
 use snafu::ResultExt;
 
-use super::connection_manager::SqlServerConnectionPool;
+use super::{connection_manager::SqlServerConnectionPool, dialect::MsSqlDialect};
 
 pub type Result<T, E = super::Error> = std::result::Result<T, E>;
 
@@ -103,12 +96,6 @@ impl SqlServerExecPlan {
         })
     }
 
-    fn dialect() -> CustomDialect {
-        CustomDialectBuilder::new()
-            .with_float64_ast_dtype(DataType::Float(ExactNumberInfo::None))
-            .build()
-    }
-
     pub fn sql(&self) -> DataFusionResult<String> {
         let columns = self
             .projected_schema
@@ -123,7 +110,7 @@ impl SqlServerExecPlan {
             None => String::new(),
         };
 
-        let dialect = SqlServerExecPlan::dialect();
+        let dialect = MsSqlDialect::new();
 
         let where_expr = if self.filters.is_empty() {
             String::new()
@@ -134,7 +121,7 @@ impl SqlServerExecPlan {
                 .map(|f| {
                     Unparser::new(&dialect)
                         .expr_to_sql(f)
-                        .map(|e| e.to_string())
+                        .map(|e| format!("({e})"))
                 })
                 .collect::<DataFusionResult<Vec<String>>>()?
                 .join(" AND ");
@@ -248,13 +235,27 @@ impl ExecutionPlan for SqlServerExecPlan {
         order: &[PhysicalSortExpr],
     ) -> DataFusionResult<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
         // MSSQL treats NULLs as smallest: ASC => nulls first, DESC => nulls last.
-        // Track whether the requested null ordering matches MSSQL's native behavior.
+        // We can return Exact when the requested null ordering either:
+        //   (a) matches MSSQL's native behavior, or
+        //   (b) is irrelevant because the field is not nullable.
         let mut nulls_match_native = true;
         for sort_expr in order {
             // Only support simple column references
-            if sort_expr.expr.as_any().downcast_ref::<Column>().is_none() {
+            let Some(col) = sort_expr.expr.as_any().downcast_ref::<Column>() else {
                 return Ok(SortOrderPushdownResult::Unsupported);
+            };
+
+            // If the field is not nullable, null ordering is irrelevant — always Exact.
+            let is_nullable = self
+                .projected_schema
+                .field_with_name(col.name())
+                .map(arrow::datatypes::Field::is_nullable)
+                .unwrap_or(true);
+            if !is_nullable {
+                continue;
             }
+
+            // For nullable fields, check if the requested ordering matches MSSQL's native behavior.
             let expected_nulls_first = !sort_expr.options.descending;
             if sort_expr.options.nulls_first != expected_nulls_first {
                 nulls_match_native = false;

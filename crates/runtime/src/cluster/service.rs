@@ -53,10 +53,11 @@ use parking_lot::RwLock;
 use runtime_proto::{
     AllocateInitialPartitionsRequest, AllocateInitialPartitionsResponse, BytesArray,
     CancelTasksCommand, ExecutorControlMessage, ExpandSecretRequest, ExpandSecretResponse,
-    GetAppDefinitionRequest, GetAppDefinitionResponse, GetMetricsRequest, GetMetricsResponse,
-    GetSchedulersRequest, GetSchedulersResponse, GetTaskHistoryRequest, GetTaskHistoryResponse,
-    PollNowCommand, SchedulerControlMessage, SchedulerInstance, TaskCancelInfo,
-    cluster_service_server::ClusterService, executor_control_message::Message as ExecutorMessage,
+    GetAppDefinitionRequest, GetAppDefinitionResponse, GetDdlCatchupRequest, GetDdlCatchupResponse,
+    GetMetricsRequest, GetMetricsResponse, GetSchedulersRequest, GetSchedulersResponse,
+    GetTaskHistoryRequest, GetTaskHistoryResponse, PollNowCommand, SchedulerControlMessage,
+    SchedulerInstance, TaskCancelInfo, cluster_service_server::ClusterService,
+    executor_control_message::Message as ExecutorMessage,
     scheduler_control_message::Message as SchedulerMessage,
 };
 use runtime_secrets::Secrets;
@@ -182,6 +183,7 @@ pub struct ClusterServiceImpl {
     executor_registry: Arc<ExecutorRegistry>,
     /// Metrics reader for collecting local OTLP metrics on demand.
     metrics_reader: Option<MetricsReader>,
+    allow_secret_expansion: bool,
     /// Registry of connected executor streams for [`PollNow`] broadcasts.
     executor_streams: ExecutorControlStreamRegistry,
 }
@@ -189,6 +191,7 @@ pub struct ClusterServiceImpl {
 impl ClusterServiceImpl {
     /// Creates a new cluster service implementation.
     #[must_use]
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         app: Arc<TokioRwLock<Option<Arc<App>>>>,
         secrets: Arc<TokioRwLock<Secrets>>,
@@ -197,6 +200,7 @@ impl ClusterServiceImpl {
         datafusion: Arc<DataFusion>,
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
+        allow_secret_expansion: bool,
     ) -> Self {
         Self {
             app,
@@ -206,6 +210,7 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
+            allow_secret_expansion,
             executor_streams: ExecutorControlStreamRegistry::new(),
         }
     }
@@ -225,6 +230,7 @@ impl ClusterServiceImpl {
         executor_registry: Arc<ExecutorRegistry>,
         metrics_reader: Option<MetricsReader>,
         executor_streams: ExecutorControlStreamRegistry,
+        allow_secret_expansion: bool,
     ) -> Self {
         Self {
             app,
@@ -234,7 +240,7 @@ impl ClusterServiceImpl {
             datafusion,
             executor_registry,
             metrics_reader,
-
+            allow_secret_expansion,
             executor_streams,
         }
     }
@@ -301,15 +307,23 @@ impl ClusterService for ClusterServiceImpl {
             request.executor_id
         );
 
-        let app_guard = self.app.read().await;
-        let Some(ref app) = *app_guard else {
-            return Err(Status::internal("App context not available"));
+        let app_json = {
+            let app_guard = self.app.read().await;
+            let Some(ref app) = *app_guard else {
+                return Err(Status::internal("App context not available"));
+            };
+            serde_json::to_string(app.as_ref())
+                .map_err(|e| Status::internal(format!("Failed to serialize app: {e}")))?
         };
 
-        let app_json = serde_json::to_string(app.as_ref())
-            .map_err(|e| Status::internal(format!("Failed to serialize app: {e}")))?;
+        // Snapshot the DDL log so the executor can replay DDL-created tables/schemas.
+        let (ddl_statements, ddl_version) = self.executor_registry.ddl_snapshot().await;
 
-        Ok(Response::new(GetAppDefinitionResponse { app_json }))
+        Ok(Response::new(GetAppDefinitionResponse {
+            app_json,
+            ddl_statements,
+            ddl_version,
+        }))
     }
 
     async fn expand_secret(
@@ -317,6 +331,16 @@ impl ClusterService for ClusterServiceImpl {
         request: Request<ExpandSecretRequest>,
     ) -> Result<Response<ExpandSecretResponse>, Status> {
         let request = request.into_inner();
+
+        if !self.allow_secret_expansion {
+            tracing::warn!(
+                executor_id = %request.executor_id,
+                "Denied cluster secret expansion without mTLS"
+            );
+            return Err(Status::permission_denied(
+                "Secret expansion requires cluster mTLS",
+            ));
+        }
 
         let span = tracing::span!(
             target: "task_history",
@@ -593,7 +617,7 @@ impl ClusterService for ClusterServiceImpl {
             &executor_url
         };
 
-        let tls_config_opt = self.datafusion.cluster_config.client_tls_config().cloned();
+        let tls_config_opt = self.datafusion.cluster_config.client_tls_config();
         match create_executor_flight_client(&executor_url, tls_config_opt) {
             Ok(client) => {
                 self.executor_registry
@@ -614,8 +638,8 @@ impl ClusterService for ClusterServiceImpl {
         let mut total_assigned: usize = 0;
         if let Some(app) = app_guard.as_ref() {
             let max_partitions_per_executor = app.runtime.scheduler.as_ref().map_or(
-                runtime::PartitionManagement::default().max_partitions_per_executor,
-                runtime::Scheduler::max_partitions_per_executor,
+                runtime::default_max_partitions_per_executor(),
+                |scheduler| scheduler.max_partitions_per_executor,
             );
 
             // Find accelerated datasets with partitioning
@@ -714,6 +738,25 @@ impl ClusterService for ClusterServiceImpl {
         Ok(Response::new(AllocateInitialPartitionsResponse {
             table_partitions,
         }))
+    }
+
+    async fn get_ddl_catchup(
+        &self,
+        request: Request<GetDdlCatchupRequest>,
+    ) -> Result<Response<GetDdlCatchupResponse>, Status> {
+        let request = request.into_inner();
+        tracing::debug!(
+            "ClusterService::get_ddl_catchup for executor {}, since_version={}",
+            request.executor_id,
+            request.since_version
+        );
+
+        let ddl_statements = self
+            .executor_registry
+            .ddl_statements_since(request.since_version)
+            .await;
+
+        Ok(Response::new(GetDdlCatchupResponse { ddl_statements }))
     }
 }
 
@@ -978,6 +1021,140 @@ fn rewrite_task_history_sql(sql: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::MemTable;
+    use runtime_proto::{
+        cluster_service_client::ClusterServiceClient, cluster_service_server::ClusterServiceServer,
+    };
+    use tokio::net::TcpListener;
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::{Channel, Server};
+
+    async fn make_test_service() -> ClusterServiceImpl {
+        let runtime = crate::Runtime::builder().build().await;
+        let datafusion = Arc::new(
+            DataFusion::builder(
+                crate::status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+        let task_history_schema = Arc::new(Schema::new(vec![Field::new(
+            "trace_id",
+            DataType::Utf8,
+            false,
+        )]));
+        let task_history_table = Arc::new(
+            MemTable::try_new(Arc::clone(&task_history_schema), vec![vec![]])
+                .expect("empty task history table should be created"),
+        );
+        datafusion
+            .ctx
+            .register_table(
+                TableReference::partial(SPICE_RUNTIME_SCHEMA, LOCAL_TASK_HISTORY_TABLE),
+                task_history_table,
+            )
+            .expect("local task history table should be registered");
+
+        let store: Arc<dyn object_store::ObjectStore> =
+            Arc::new(object_store::memory::InMemory::new());
+        let cluster_state = Arc::new(runtime_cluster::ClusterStateStore::new(store, ""));
+        cluster_state
+            .bootstrap()
+            .await
+            .expect("cluster state should bootstrap");
+        let executor_registry = Arc::new(ExecutorRegistry::new(
+            Arc::new(runtime_cluster::PartitionStore::accelerations(Arc::clone(
+                &cluster_state,
+            ))),
+            Arc::new(runtime_cluster::PartitionStore::catalog(Arc::clone(
+                &cluster_state,
+            ))),
+        ));
+
+        ClusterServiceImpl::new(
+            Arc::new(TokioRwLock::new(None)),
+            Arc::new(TokioRwLock::new(Secrets::default())),
+            "127.0.0.1:0".to_string(),
+            Arc::new(TokioRwLock::new(HashMap::new())),
+            datafusion,
+            executor_registry,
+            None,
+            true,
+        )
+    }
+
+    async fn make_test_client() -> (ClusterServiceClient<Channel>, CancellationToken) {
+        let service = make_test_service().await;
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test cluster service listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test cluster service listener should have a local address");
+        let shutdown = CancellationToken::new();
+        let shutdown_signal = shutdown.clone();
+
+        tokio::spawn(async move {
+            Server::builder()
+                .add_service(ClusterServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
+                    shutdown_signal.cancelled().await;
+                })
+                .await
+                .expect("test cluster service server should run");
+        });
+
+        let client = ClusterServiceClient::connect(format!("http://{address}"))
+            .await
+            .expect("test cluster service client should connect");
+
+        (client, shutdown)
+    }
+
+    #[tokio::test]
+    async fn test_internal_get_metrics_transport_allows_repeated_requests() {
+        let (mut client, shutdown) = make_test_client().await;
+
+        // Internal cluster RPCs are intentionally not rate-limited; the Prometheus HTTP
+        // metrics endpoint applies the external scrape limit.
+        client
+            .get_metrics(Request::new(GetMetricsRequest {}))
+            .await
+            .expect("first metrics request should succeed");
+
+        client
+            .get_metrics(Request::new(GetMetricsRequest {}))
+            .await
+            .expect("second metrics request should also succeed");
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_internal_get_task_history_transport_allows_repeated_requests() {
+        let (mut client, shutdown) = make_test_client().await;
+        let request = || {
+            Request::new(GetTaskHistoryRequest {
+                sql: format!(
+                    "SELECT trace_id FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                ),
+            })
+        };
+
+        client
+            .get_task_history(request())
+            .await
+            .expect("first task history request should succeed");
+
+        client
+            .get_task_history(request())
+            .await
+            .expect("second task history request should also succeed");
+
+        shutdown.cancel();
+    }
 
     #[test]
     fn test_rewrite_task_history_sql_simple() {

@@ -20,8 +20,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use spice::commands::acceleration::{AccelerationArgs, SnapshotArgs, SnapshotsArgs};
 use spice::commands::{
     acceleration, add, catalogs, chat, cloud, cluster, completions, connect, dataset, datasets,
-    init, install, login, models, nsql, pods, query, refresh, run, search, sql, status, trace,
-    upgrade, validate, version, workers,
+    feedback, init, install, login, models, nsql, pods, query, refresh, run, search, sql, status,
+    trace, upgrade, validate, version, workers,
 };
 use spice::{Result, RuntimeContext};
 use tracing_subscriber::EnvFilter;
@@ -138,6 +138,9 @@ enum Commands {
 
     /// Validate a spicepod.yaml without starting the runtime
     Validate(validate::ValidateArgs),
+
+    /// Open the Spice.ai community Slack to share feedback
+    Feedback(feedback::FeedbackArgs),
 }
 
 fn main() {
@@ -207,7 +210,7 @@ fn is_json_output(cmd: &Commands) -> bool {
             cloud::CloudCommands::Metrics(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Logs(x) => x.output == OutputFormat::Json,
             cloud::CloudCommands::Deploy(x) => x.output == OutputFormat::Json,
-            cloud::CloudCommands::Rollback(x) => x.output == OutputFormat::Json,
+
             cloud::CloudCommands::Secrets(cloud::SecretsCommands::List(x)) => {
                 x.output == OutputFormat::Json
             }
@@ -380,6 +383,9 @@ fn run_cli(cli: Cli) -> Result<()> {
                 .map_err(|e| spice::error::Error::RuntimeExecution { source: e })?;
             rt.block_on(validate::execute(&args))?;
         }
+        Commands::Feedback(args) => {
+            feedback::execute(&args)?;
+        }
     }
 
     Ok(())
@@ -395,6 +401,50 @@ mod tests {
 
     fn is_json(args: &[&str]) -> bool {
         is_json_output(&parse(args).command)
+    }
+
+    #[test]
+    fn cloud_login_subscription_device_flag_parses() {
+        let cli = parse(&["spice", "cloud", "login", "subscription", "--device"]);
+
+        let Commands::Cloud(cloud::CloudArgs {
+            command: cloud::CloudCommands::Login(login_args),
+        }) = cli.command
+        else {
+            panic!("expected cloud login command");
+        };
+        let Some(cloud::LoginMethod::Subscription(args)) = login_args.method else {
+            panic!("expected subscription login method");
+        };
+
+        assert!(args.device);
+    }
+
+    #[test]
+    fn cloud_login_api_flags_parse_under_api_subcommand() {
+        let cli = parse(&[
+            "spice",
+            "cloud",
+            "login",
+            "api",
+            "--client-id",
+            "client-id",
+            "--client-secret",
+            "client-secret",
+        ]);
+
+        let Commands::Cloud(cloud::CloudArgs {
+            command: cloud::CloudCommands::Login(login_args),
+        }) = cli.command
+        else {
+            panic!("expected cloud login command");
+        };
+        let Some(cloud::LoginMethod::Api(args)) = login_args.method else {
+            panic!("expected api login method");
+        };
+
+        assert_eq!(args.client_id.as_deref(), Some("client-id"));
+        assert_eq!(args.client_secret.as_deref(), Some("client-secret"));
     }
 
     #[test]
@@ -427,7 +477,6 @@ mod tests {
             &["spice", "cloud", "metrics", "--output", "json"],
             &["spice", "cloud", "logs", "--output", "json"],
             &["spice", "cloud", "deploy", "--output", "json"],
-            &["spice", "cloud", "rollback", "--output", "json"],
             &["spice", "cloud", "secrets", "list", "--output", "json"],
             &[
                 "spice", "cloud", "secrets", "set", "name", "value", "--output", "json",

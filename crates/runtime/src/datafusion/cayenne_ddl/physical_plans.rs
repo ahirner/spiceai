@@ -328,6 +328,9 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
             }
 
             // 4. Build and forward CREATE TABLE DDL SQL.
+            // Intentionally omit PARTITION BY when forwarding to executors:
+            // the scheduler owns distributed partition metadata/routing, while
+            // executors store plain local Cayenne tables for the assigned rows.
             {
                 let columns_sql: Vec<String> = arrow_schema_fwd
                     .fields()
@@ -353,6 +356,8 @@ impl ExecutionPlan for DistributedCayenneCreateTableExec {
                      \"{catalog_name}\".\"{schema_name}\".\"{table_name}\" ({})",
                     table_elements.join(", ")
                 );
+
+                executor_registry.append_ddl(ddl_sql.clone()).await;
                 forward_ddl_to_executors(&executor_registry, &ddl_sql).await?;
             }
 
@@ -551,6 +556,7 @@ impl ExecutionPlan for DistributedCayenneDropTableExec {
                     "DROP TABLE IF EXISTS \
                      \"{catalog_name}\".\"{schema_name}\".\"{table_name}\""
                 );
+                executor_registry.append_ddl(ddl_sql.clone()).await;
                 forward_ddl_to_executors(&executor_registry, &ddl_sql).await?;
             }
 
@@ -679,6 +685,7 @@ impl ExecutionPlan for DistributedCayenneCreateSchemaExec {
             if message.contains("created") {
                 let ddl_sql =
                     format!("CREATE SCHEMA IF NOT EXISTS \"{catalog_name}\".\"{schema_name}\"");
+                executor_registry.append_ddl(ddl_sql.clone()).await;
                 forward_ddl_to_executors(&executor_registry, &ddl_sql).await?;
             }
 

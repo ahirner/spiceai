@@ -212,6 +212,12 @@ where
         .transpose()?
         .unwrap_or_default();
 
+    let captured_context = app
+        .as_ref()
+        .map(|app| app.runtime.task_history.get_captured_context())
+        .transpose()?
+        .unwrap_or_default();
+
     let min_sql_duration_ms = app
         .as_ref()
         .map(|app| app.runtime.task_history.min_sql_duration_as_millis())
@@ -237,14 +243,19 @@ where
         Some(format!("{host}:{port}").into())
     });
 
+    let (ballista_transform, ballista_retention) =
+        runtime::datafusion::query::stage_history::BallistaStageMiddleware::pair();
     let task_history_exporter = task_history::otel_exporter::TaskHistoryExporter::new(
         df,
         captured_output,
+        captured_context,
         min_sql_duration_ms,
         captured_plan,
         min_plan_duration_ms,
         node_id,
-    );
+    )
+    .with_transform(ballista_transform)
+    .with_retention(ballista_retention);
 
     let zipkin_exporter = zipkin_task_history_otel_exporter(config).await?;
 

@@ -31,7 +31,7 @@ use opentelemetry_sdk::{
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
 use runtime::{Runtime, task_history::otel_exporter::TaskHistoryExporter};
 use serde::Deserialize;
-use spicepod::component::runtime::TaskHistoryCapturedOutput;
+use spicepod::component::runtime::{TaskHistoryCapturedContext, TaskHistoryCapturedOutput};
 use tracing::subscriber::DefaultGuard;
 use tracing_subscriber::{EnvFilter, Layer, filter, fmt, layer::SubscriberExt};
 
@@ -152,6 +152,18 @@ pub(crate) fn init_tracing_with_task_history(
     default_level: Option<&str>,
     rt: &Runtime,
 ) -> (DefaultGuard, SdkTracerProvider) {
+    init_tracing_with_task_history_captured_context(
+        default_level,
+        rt,
+        TaskHistoryCapturedContext::Truncated,
+    )
+}
+
+pub(crate) fn init_tracing_with_task_history_captured_context(
+    default_level: Option<&str>,
+    rt: &Runtime,
+    captured_context: TaskHistoryCapturedContext,
+) -> (DefaultGuard, SdkTracerProvider) {
     let filter = match (default_level, std::env::var("SPICED_LOG").ok()) {
         (_, Some(log)) => EnvFilter::new(log),
         (Some(level), None) => EnvFilter::new(level),
@@ -160,14 +172,19 @@ pub(crate) fn init_tracing_with_task_history(
 
     let fmt_layer = fmt::layer().with_ansi(true).with_filter(filter);
 
+    let (ballista_transform, ballista_retention) =
+        runtime::datafusion::query::stage_history::BallistaStageMiddleware::pair();
     let task_history_exporter = TaskHistoryExporter::new(
         rt.datafusion(),
         TaskHistoryCapturedOutput::Truncated,
+        captured_context,
         None, // min_sql_duration_ms
         spicepod::component::runtime::TaskHistoryCapturedPlan::None,
         None, // min_plan_duration_ms
         None, // scheduler_id - not in cluster mode for tests
-    );
+    )
+    .with_transform(ballista_transform)
+    .with_retention(ballista_retention);
 
     // Tests hang if we don't use TokioCurrentThread here (similar to https://github.com/open-telemetry/opentelemetry-rust/issues/868)
     let processor = BatchSpanProcessor::builder(task_history_exporter, TokioCurrentThread).build();

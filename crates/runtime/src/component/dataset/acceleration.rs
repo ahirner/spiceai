@@ -43,6 +43,17 @@ pub enum RefreshMode {
     Append,
     Changes,
     Caching,
+    /// Reload accelerator data from newer snapshots only; the federated
+    /// source is never queried for refreshes.
+    Snapshot,
+}
+
+impl RefreshMode {
+    /// Returns true if this refresh mode never reads from the federated source.
+    #[must_use]
+    pub const fn is_snapshot_only(&self) -> bool {
+        matches!(self, RefreshMode::Snapshot)
+    }
 }
 
 impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
@@ -52,6 +63,7 @@ impl From<spicepod_acceleration::RefreshMode> for RefreshMode {
             spicepod_acceleration::RefreshMode::Append => RefreshMode::Append,
             spicepod_acceleration::RefreshMode::Changes => RefreshMode::Changes,
             spicepod_acceleration::RefreshMode::Caching => RefreshMode::Caching,
+            spicepod_acceleration::RefreshMode::Snapshot => RefreshMode::Snapshot,
         }
     }
 }
@@ -307,6 +319,8 @@ pub struct Acceleration {
 
     pub on_conflict: HashMap<ColumnReference, OnConflictBehavior>,
 
+    pub write_mode: spicepod_acceleration::WriteMode,
+
     pub disable_federation: bool,
 
     pub partition_by: Vec<PartitionedBy>,
@@ -340,14 +354,14 @@ impl Acceleration {
         self
     }
 
-    /// Returns whether `hash_index` is explicitly enabled in the acceleration params.
+    /// Returns whether Arrow `hash_index` is enabled for primary key upserts or indexes.
     #[must_use]
     pub fn is_hash_index_enabled(&self) -> bool {
-        self.engine == Engine::Arrow
-            && self
-                .params
-                .get("hash_index")
-                .is_some_and(|v| v.eq_ignore_ascii_case("enabled"))
+        matches!(self.engine, Engine::Arrow | Engine::PartitionedArrow)
+            && self.enabled
+            && (!self.indexes.is_empty()
+                || (self.primary_key.is_some()
+                    && !matches!(self.refresh_mode, Some(RefreshMode::Caching))))
     }
 }
 
@@ -418,35 +432,22 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             engine => engine,
         };
 
-        // Only warn about primary_key if hash_index is not enabled
-        let hash_index_enabled = params
-            .as_ref()
-            .and_then(|p| p.data.get("hash_index"))
-            .is_some_and(|v| v.as_string().eq_ignore_ascii_case("enabled"));
-
-        // Indexes require hash_index to be enabled for Arrow engine
         if matches!(engine, Engine::Arrow | Engine::PartitionedArrow)
-            && !indexes.is_empty()
-            && !hash_index_enabled
+            && let Some(params) = &mut params
+            && params.data.remove("hash_index").is_some()
         {
             tracing::warn!(
-                "Indexes specified but hash_index is not enabled for Arrow engine. Add 'hash_index: enabled' to use indexes for fast lookups."
-            );
-        }
-        if matches!(engine, Engine::Arrow | Engine::PartitionedArrow)
-            && primary_key.is_some()
-            && !hash_index_enabled
-        {
-            tracing::warn!(
-                "Primary key specified but hash_index is not enabled for Arrow engine. \
-                 Add 'hash_index: enabled' to use primary_key for fast lookups. Note, hash_index is experimental in Arrow acceleration."
+                "The hash_index acceleration parameter is ignored for Arrow acceleration; hash_index alone no longer enables indexing. Hash indexes are automatically enabled only when primary_key or indexes are configured."
             );
         }
         // Note: The warning for hash_index being experimental is logged once
         // at dataset registration time in init/dataset.rs, not during parsing.
-        if matches!(engine, Engine::Arrow | Engine::PartitionedArrow) && !on_conflict.is_empty() {
+        if matches!(engine, Engine::Arrow | Engine::PartitionedArrow)
+            && !on_conflict.is_empty()
+            && primary_key.is_none()
+        {
             tracing::warn!(
-                "Conflict resolution is not supported for Arrow engine acceleration. Ignoring on_conflict."
+                "Conflict resolution for Arrow engine acceleration requires primary_key. Ignoring on_conflict."
             );
         }
 
@@ -522,6 +523,7 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
             indexes,
             primary_key,
             on_conflict,
+            write_mode: acceleration.write_mode,
             partition_by: acceleration.partition_by,
             snapshot_behavior: SnapshotBehavior::disabled(),
             snapshots_trigger: acceleration.snapshots_trigger,
@@ -564,6 +566,7 @@ impl Default for Acceleration {
             indexes: HashMap::default(),
             primary_key: None,
             on_conflict: HashMap::default(),
+            write_mode: spicepod_acceleration::WriteMode::default(),
             disable_federation: false,
             refresh_on_startup: RefreshOnStartup::default(),
             partition_by: vec![],
@@ -736,5 +739,20 @@ mod tests {
         // Test missing parameter (default)
         let result = parse_caching_stale_if_error(&mut None).expect("to parse");
         assert_eq!(result, StaleIfError::Disabled);
+    }
+
+    #[test]
+    fn test_hash_index_param_is_ignored() {
+        let acceleration = spicepod_acceleration::Acceleration {
+            params: Some(Params::from_string_map(HashMap::from([(
+                "hash_index".to_string(),
+                "enabled".to_string(),
+            )]))),
+            ..Default::default()
+        };
+
+        let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
+        assert!(!parsed.params.contains_key("hash_index"));
+        assert!(!parsed.is_hash_index_enabled());
     }
 }

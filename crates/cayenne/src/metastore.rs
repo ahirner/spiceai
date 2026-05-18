@@ -20,6 +20,7 @@ limitations under the License.
 //! that can be used to store Cayenne metadata. This allows swapping between `SQLite`,
 //! Turso, or other storage implementations.
 
+pub mod snapshot;
 pub mod sqlite;
 
 #[cfg(feature = "turso")]
@@ -281,6 +282,14 @@ impl<T: Into<MetastoreValue>> From<Option<T>> for MetastoreValue {
 
 /// A row returned from a query.
 pub trait MetastoreRow: Send {
+    /// Get the raw `MetastoreValue` for a column by index. Used by
+    /// generic export/import logic that does not know the column types.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the column index is out of bounds.
+    fn get_value(&self, index: usize) -> CatalogResult<MetastoreValue>;
+
     /// Get an i64 value from the row by column index.
     ///
     /// # Errors
@@ -458,6 +467,19 @@ pub trait MetastoreBackend: Send + Sync {
     ///
     /// Returns an error if any statement in the batch fails.
     async fn execute_batch(&self, sql: &str) -> CatalogResult<()>;
+
+    /// Execute a batch of SQL statements inside one backend transaction.
+    ///
+    /// The backend must keep exclusive access to the connection until the
+    /// transaction commits or rolls back, so no other catalog operation can
+    /// observe or inherit a partially-applied transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot begin, any statement in the
+    /// batch fails, or the transaction cannot commit. Backends should make a
+    /// best-effort rollback before returning an error.
+    async fn execute_transaction_batch(&self, sql: &str) -> CatalogResult<()>;
 
     /// Query a single row from the database.
     ///

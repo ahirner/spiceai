@@ -117,6 +117,9 @@ pub enum QuerySetArg {
     Tpch,
     Tpcds,
     Clickbench,
+    #[value(name = "chbench")]
+    #[serde(rename = "chbench")]
+    ChBench,
     #[value(name = "tpch[parameterized]")]
     #[serde(rename = "tpch[parameterized]")]
     ParameterizedTpch,
@@ -165,7 +168,16 @@ pub enum QueryOverridesArg {
     #[serde(rename = "mysql-catalog")]
     MysqlCatalog,
     #[serde(rename = "mssql-catalog")]
+    #[value(name = "mssql-catalog")]
     MsSqlCatalog,
+    #[serde(rename = "oracle-catalog")]
+    OracleCatalog,
+    #[serde(rename = "snowflake-catalog")]
+    #[value(name = "snowflake-catalog")]
+    SnowflakeCatalog,
+    #[serde(rename = "ducklake-catalog")]
+    #[value(name = "ducklake-catalog")]
+    DucklakeCatalog,
     #[serde(rename = "spicecloud")]
     Spicecloud,
     #[serde(rename = "dynamodb")]
@@ -178,6 +190,9 @@ pub enum QueryOverridesArg {
     #[serde(rename = "bigquery")]
     #[value(name = "bigquery")]
     BigQuery,
+    #[serde(rename = "scylladb")]
+    #[value(name = "scylladb")]
+    ScyllaDB,
 }
 
 impl From<QuerySetArg> for QuerySet {
@@ -186,6 +201,7 @@ impl From<QuerySetArg> for QuerySet {
             QuerySetArg::Tpch => QuerySet::Tpch,
             QuerySetArg::Tpcds => QuerySet::Tpcds,
             QuerySetArg::Clickbench => QuerySet::Clickbench,
+            QuerySetArg::ChBench => QuerySet::ChBench,
             QuerySetArg::ParameterizedTpch => QuerySet::ParameterizedTpch,
             QuerySetArg::Scenario => {
                 // This should never be reached - callers must use DatasetTestArgs::load_query_set()
@@ -205,6 +221,7 @@ impl PartialEq<QuerySet> for QuerySetArg {
             (QuerySetArg::Tpch, QuerySet::Tpch)
                 | (QuerySetArg::Tpcds, QuerySet::Tpcds)
                 | (QuerySetArg::Clickbench, QuerySet::Clickbench)
+                | (QuerySetArg::ChBench, QuerySet::ChBench)
                 | (QuerySetArg::ParameterizedTpch, QuerySet::ParameterizedTpch)
                 | (QuerySetArg::Scenario, QuerySet::Scenario { .. })
         )
@@ -290,8 +307,12 @@ impl From<QueryOverridesArg> for QueryOverrides {
             QueryOverridesArg::PostgresCatalog => QueryOverrides::PostgresCatalog,
             QueryOverridesArg::MysqlCatalog => QueryOverrides::MysqlCatalog,
             QueryOverridesArg::MsSqlCatalog => QueryOverrides::MSSqlCatalog,
+            QueryOverridesArg::OracleCatalog => QueryOverrides::OracleCatalog,
+            QueryOverridesArg::SnowflakeCatalog => QueryOverrides::SnowflakeCatalog,
+            QueryOverridesArg::DucklakeCatalog => QueryOverrides::DucklakeCatalog,
             QueryOverridesArg::Turso => QueryOverrides::Turso,
             QueryOverridesArg::BigQuery => QueryOverrides::BigQuery,
+            QueryOverridesArg::ScyllaDB => QueryOverrides::ScyllaDB,
         }
     }
 }

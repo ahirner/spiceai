@@ -2,7 +2,7 @@
 edition.workspace = true
 exclude.workspace = true
 homepage.workspace = true
-license.workspace = true
+license-file.workspace = true
 name = "data_components"
 repository.workspace = true
 rust-version.workspace = true
@@ -16,6 +16,7 @@ arrow.workspace = true
 arrow-array.workspace = true
 arrow-buffer.workspace = true
 arrow-flight.workspace = true
+arrow-row.workspace = true
 arrow_tools = { path = "../arrow_tools" }
 async-stream.workspace = true
 async-trait.workspace = true
@@ -72,6 +73,7 @@ imap = { workspace = true, optional = true }
 indexmap.workspace = true
 logos.workspace = true
 mysql_async = { workspace = true, optional = true }
+mongodb = { workspace = true, optional = true }
 mailparse = { workspace = true, optional = true }
 num_cpus = "1.16"
 object_store = { workspace = true }
@@ -86,6 +88,7 @@ rdkafka = { workspace = true, features = ["ssl-vendored"], optional = true }
 regex.workspace = true
 reqwest.workspace = true
 runtime-rate-control = { path = "../runtime-rate-control" }
+runtime-request-context = { path = "../runtime-request-context" }
 rusqlite = { workspace = true, optional = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
 s3_vectors = { path = "../s3_vectors", optional = true }
@@ -152,7 +155,7 @@ dynamodb = [
 flightsql = []
 imap = ["dep:charset", "dep:imap", "dep:mailparse"]
 kafka = ["dep:rdkafka"]
-mongodb = ["datafusion-table-providers/mongodb"]
+mongodb = ["dep:mongodb", "datafusion-table-providers/mongodb"]
 mssql = ["dep:tiberius", "dep:tokio-util", "dep:bb8"]
 mysql = [
     "dep:mysql_async",
@@ -172,6 +175,9 @@ postgres = [
 s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
 scylladb = ["dep:scylla", "datafusion-table-providers/federation"]
 sharepoint = ["dep:graph-rs-sdk"]
+# Enables graph-rs-sdk's `test-util` feature so `GraphClient::use_test_endpoint`
+# accepts non-Microsoft hosts (e.g. localhost mocks). Intended for tests only.
+sharepoint-mock-host = ["sharepoint", "graph-rs-sdk/test-util"]
 snowflake = ["dep:snowflake-api", "datafusion-table-providers/federation", "db_connection_pool/snowflake"]
 spark_connect = ["dep:spark-connect-rs"]
 sqlite = [
@@ -209,3 +215,8 @@ required-features = ["bench"]
 [[bench]]
 harness = false
 name = "object_filter"
+
+[[bench]]
+harness = false
+name = "mongodb_change_stream"
+required-features = ["mongodb"]

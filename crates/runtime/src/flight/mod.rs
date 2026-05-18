@@ -18,9 +18,10 @@ use crate::auth::EndpointAuth;
 use crate::datafusion::DataFusion;
 use crate::datafusion::error::{SpiceExternalError, find_datafusion_root};
 use crate::datafusion::query::{self, QueryBuilder};
-use crate::dataupdate::DataUpdate;
+use crate::datafusion::sql_validator::validate_sql_query_read_only;
+use crate::dataupdate::DataUpdateBroadcaster;
 use crate::opentelemetry::create_metrics_service;
-use crate::tls::{TlsConfig, server_with_tls_config};
+use crate::tls::TlsConfig;
 use crate::{Runtime, metrics as runtime_metrics};
 use app::App;
 use arrow::array::RecordBatch;
@@ -36,10 +37,10 @@ use arrow_flight::{
 use arrow_ipc::writer::IpcWriteOptions;
 use async_stream::try_stream;
 use bytes::Bytes;
-use cache::result::CacheStatus;
+use cache::result::{CacheStatus, query::QueryResult};
 use datafusion::common::ParamValues;
 use datafusion::error::DataFusionError;
-use datafusion::sql::TableReference;
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::sqlparser::parser::ParserError;
 use flight_client::Error as FlightClientError;
 use futures::stream::{self, BoxStream, StreamExt};
@@ -47,15 +48,12 @@ use futures::{Stream, TryStreamExt};
 use governor::{Quota, RateLimiter};
 use metrics::track_flight_request;
 use middleware::{RequestContextLayer, WriteRateLimitLayer};
-use runtime_auth::{FlightBasicAuth, layer::flight::BasicAuthLayer};
+use runtime_auth::{AuthRequestContext, FlightBasicAuth, layer::flight::BasicAuthLayer};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use snafu::prelude::*;
-use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokio::sync::RwLock;
-use tokio::sync::broadcast::Sender;
 use tokio_util::sync::CancellationToken;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
@@ -71,6 +69,7 @@ mod get_schema;
 mod handshake;
 mod metrics;
 pub mod middleware;
+mod mtls;
 mod session;
 pub(crate) mod session_auth;
 mod util;
@@ -84,18 +83,20 @@ pub use session::SessionStore;
 pub use runtime_cluster::flight_config::{KEEPALIVE_APP_METADATA, do_put_idle_timeout};
 
 pub struct Service {
-    channel_map: Arc<RwLock<HashMap<TableReference, Arc<Sender<DataUpdate>>>>>,
+    data_update_broadcaster: DataUpdateBroadcaster,
     basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
     session_store: SessionStore,
 }
 
 impl Service {
-    /// Creates a new Service with pre-allocated channel map capacity
+    /// Creates a new Flight service using the shared data update broadcaster.
     #[must_use]
-    pub fn new(basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>) -> Self {
+    pub fn new(
+        basic_auth: Option<Arc<dyn FlightBasicAuth + Send + Sync>>,
+        data_update_broadcaster: DataUpdateBroadcaster,
+    ) -> Self {
         Self {
-            // Pre-allocate for typical workloads (avoid reallocation)
-            channel_map: Arc::new(RwLock::new(HashMap::with_capacity(64))),
+            data_update_broadcaster,
             basic_auth,
             session_store: SessionStore::new(),
         }
@@ -215,7 +216,10 @@ impl Service {
         datafusion: Arc<DataFusion>,
         sql: &str,
     ) -> Result<(Schema, Option<Schema>), Status> {
-        let query = QueryBuilder::new(sql, datafusion).build();
+        let read_only = crate::http::v1::current_principal_requires_read_only().await;
+        let query = QueryBuilder::new(sql, datafusion)
+            .read_only(read_only)
+            .build();
 
         let (dataset_schema, parameter_schema) =
             query.get_schema().await.map_err(handle_datafusion_error)?;
@@ -242,14 +246,56 @@ impl Service {
         datafusion: Arc<DataFusion>,
         sql: &str,
         parameters: Option<ParamValues>,
+        pre_parsed_plan: Option<LogicalPlan>,
     ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
-        let query_result = QueryBuilder::new(sql, Arc::clone(&datafusion))
-            .parameters(parameters)
+        let read_only = crate::http::v1::current_principal_requires_read_only().await;
+        let query_result = if let Some(plan) = pre_parsed_plan {
+            QueryBuilder::from_plan(plan, sql, Arc::clone(&datafusion))
+                .parameters(parameters)
+                .read_only(read_only)
+                .build()
+                .run()
+                .await
+                .map_err(handle_query_error)?
+        } else {
+            QueryBuilder::new(sql, Arc::clone(&datafusion))
+                .parameters(parameters)
+                .read_only(read_only)
+                .build()
+                .run()
+                .await
+                .map_err(handle_query_error)?
+        };
+
+        Ok(Self::query_result_to_flight_stream(query_result))
+    }
+
+    /// Run a pre-built [`LogicalPlan`] and stream results as Flight data.
+    ///
+    /// Used by surfaces that produce a logical plan outside the SQL parser
+    /// (e.g. `FlightSQL` `CommandStatementSubstraitPlan`). The `cache_key`
+    /// identifies the plan in the results cache; callers should derive it
+    /// from the plan source so that semantically identical inputs hit the
+    /// same cache entry.
+    pub(crate) async fn plan_to_flight_stream(
+        datafusion: Arc<DataFusion>,
+        plan: LogicalPlan,
+        cache_key: impl Into<Arc<str>>,
+    ) -> Result<(BoxStream<'static, Result<FlightData, Status>>, CacheStatus), Status> {
+        let read_only = crate::http::v1::current_principal_requires_read_only().await;
+        let query_result = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion))
+            .read_only(read_only)
             .build()
             .run()
             .await
             .map_err(handle_query_error)?;
 
+        Ok(Self::query_result_to_flight_stream(query_result))
+    }
+
+    fn query_result_to_flight_stream(
+        query_result: QueryResult,
+    ) -> (BoxStream<'static, Result<FlightData, Status>>, CacheStatus) {
         // Reuse the same options for all messages
         let options = datafusion::arrow::ipc::writer::IpcWriteOptions::default();
         let schema = query_result.data.schema();
@@ -303,7 +349,7 @@ impl Service {
             }
         };
 
-        Ok((flights_stream.boxed(), cache_status))
+        (flights_stream.boxed(), cache_status)
     }
 
     async fn wrap_response_stream_with_scope<S>(
@@ -329,6 +375,62 @@ pub(crate) fn record_batches_to_flight_stream(
         .map_err(to_tonic_err)
 }
 
+/// Returns `true` when the request has an authenticated principal that
+/// lacks write permission (`"write"` or `"read_write"` group).
+/// Returns `false` when there is no principal (auth not configured)
+/// or the principal has write access.
+pub(crate) fn is_auth_read_only(context: &RequestContext) -> bool {
+    context.auth_principal().is_some_and(|principal| {
+        !principal
+            .groups()
+            .iter()
+            .any(|g| *g == "write" || *g == "read_write")
+    })
+}
+
+/// If the current principal is read-only, validates that `sql` does not contain
+/// any write operations (DDL, DML, COPY, write-capable extensions) and returns
+/// the parsed [`LogicalPlan`] with parameters bound so callers can reuse it
+/// without re-parsing.
+///
+/// Unlike `QueryBuilder::read_only`, this check does NOT disable the results cache —
+/// read-only principals still benefit from cached SELECT results.
+///
+/// If the `sql` is guaranteed to be a write-based, [`is_auth_read_only`] is more efficient.
+///
+/// Returns:
+/// - `Ok(Some(plan))` — principal is read-only, SQL is safe (plan reusable, params bound)
+/// - `Ok(None)`       — principal has write access; no plan was parsed
+/// - `Err(_)`         — principal is read-only and SQL contains a write operation
+pub(crate) async fn check_read_only_sql(
+    context: &RequestContext,
+    datafusion: &Arc<DataFusion>,
+    sql: &str,
+    parameters: Option<&datafusion::common::ParamValues>,
+) -> Result<Option<LogicalPlan>, Status> {
+    if !is_auth_read_only(context) {
+        return Ok(None);
+    }
+    let session = datafusion.ctx.state();
+    let plan = datafusion
+        .create_logical_plan(&session, sql)
+        .await
+        .map_err(|e| Status::invalid_argument(format!("Failed to parse SQL: {e}")))?;
+    // Bind parameters to the plan so the returned plan is fully resolved.
+    let plan = if let Some(params) = parameters {
+        plan.with_param_values(params.clone())
+            .map_err(|e| Status::invalid_argument(format!("Failed to bind parameters: {e}")))?
+    } else {
+        plan
+    };
+    if let Err(e) = validate_sql_query_read_only(&plan) {
+        return Err(Status::permission_denied(format!(
+            "Write access denied. {e}"
+        )));
+    }
+    Ok(Some(plan))
+}
+
 fn to_tonic_err<E>(e: E) -> Status
 where
     E: std::fmt::Display + 'static,
@@ -345,11 +447,15 @@ fn handle_query_error(e: query::Error) -> Status {
     match e {
         query::Error::BindingParameters { source }
         | query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(source),
+        query::Error::QueryCancelled { .. } => Status::cancelled(e.to_string()),
         _ => to_tonic_err(e),
     }
 }
 
-fn handle_datafusion_error(e: DataFusionError) -> Status {
+pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
+    if query::is_cancellation_error(&e) {
+        return Status::cancelled(e.to_string());
+    }
     match e {
         DataFusionError::Plan(err_msg) | DataFusionError::Execution(err_msg) => {
             Status::invalid_argument(err_msg)
@@ -442,6 +548,12 @@ pub enum Error {
     #[snafu(display("Unable to configure TLS on the Flight server: {source}"))]
     UnableToConfigureTls { source: tonic::transport::Error },
 
+    #[snafu(display("Unable to bind Flight TCP listener: {source}"))]
+    UnableToBindFlightListener { source: std::io::Error },
+
+    #[snafu(display("Unable to bind cluster TCP listener: {source}"))]
+    UnableToBindClusterListener { source: std::io::Error },
+
     #[snafu(display(
         "Address {addr} is already in use by another process. Either stop the existing process or change the address: https://spiceai.org/docs/cli/reference/run"
     ))]
@@ -502,7 +614,10 @@ pub async fn start(
         });
     }
 
-    let service = Service::new(endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone));
+    let service = Service::new(
+        endpoint_auth.flight_basic_auth.as_ref().map(Arc::clone),
+        rt.datafusion().data_update_broadcaster(),
+    );
     let session_store = service.session_store.clone();
 
     let flight_message_size = app
@@ -524,17 +639,12 @@ pub async fn start(
             flight_message_size.unwrap_or(flight_client::MAX_ENCODING_MESSAGE_SIZE),
         );
 
-    let mut server = Server::builder();
-
-    if let Some(ref tls_config) = tls_config {
-        server = server_with_tls_config(server, tls_config).context(UnableToConfigureTlsSnafu)?;
-    }
-
-    // Wrap the auth in session-awareness to accept session IDs as bearer tokens
+    let server = Server::builder();
     let session_aware_auth = session_auth::with_session_awareness(
         endpoint_auth.flight_basic_auth,
         session_store.clone(),
     );
+    let identity_source = endpoint_auth.identity_source;
     let auth_layer = tower::ServiceBuilder::new()
         .layer(BasicAuthLayer::new(session_aware_auth))
         .into_inner();
@@ -551,6 +661,11 @@ pub async fn start(
             RequestContextLayer::new(app, rt.datafusion(), session_store, rt.secrets())
                 .with_job_executor(job_executor),
         )
+        // mTLS principal injection runs *after* RequestContextLayer
+        // (which sets up the AuthRequestContext extension) and
+        // *before* BasicAuthLayer (which short-circuits when a
+        // principal is already present).
+        .layer(mtls::MtlsLayer::new(identity_source))
         .layer(auth_layer)
         .layer(WriteRateLimitLayer::new(
             RateLimiter::direct(rate_limits.flight_write_limit),
@@ -561,17 +676,55 @@ pub async fn start(
         .add_service(spice_flight_service)
         .add_service(otel_service);
 
-    tracing::info!("Spice Runtime Flight listening on {bind_address}");
-    runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
-
-    if let Some(token) = shutdown_signal {
+    let serve_result = if let Some(ref tls_config) = tls_config {
+        // TLS path: bind a TCP listener ourselves, run tokio-rustls per
+        // connection so we can hot-swap the cert via the resolver, and feed
+        // the resulting TlsStreams into tonic via serve_with_incoming. This
+        // replaces the legacy `Server::tls_config(ServerTlsConfig::new()...)`
+        // approach which baked the cert in once at startup.
+        let listener = tokio::net::TcpListener::bind(bind_address)
+            .await
+            .map_err(|source| {
+                if source.kind() == std::io::ErrorKind::AddrInUse {
+                    Error::AddressAlreadyInUse {
+                        addr: bind_address.to_string(),
+                    }
+                } else {
+                    Error::UnableToBindFlightListener { source }
+                }
+            })?;
+        // Bind succeeded; emit the started log + metric now so a failed
+        // bind doesn't show up as a phantom "Flight listening" line.
+        tracing::info!("Spice Runtime Flight listening on {bind_address}");
+        runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
+        let incoming = crate::tls::flight_incoming::tls_incoming(
+            listener,
+            Arc::clone(&tls_config.flight_server_config),
+        );
+        if let Some(token) = shutdown_signal {
+            server
+                .serve_with_incoming_shutdown(incoming, token.cancelled())
+                .await
+        } else {
+            server.serve_with_incoming(incoming).await
+        }
+    } else if let Some(token) = shutdown_signal {
+        // Plain (no-TLS) path: tonic binds internally so we can't gate
+        // the log on a successful bind without a refactor; the
+        // is_address_in_use_error mapping below still surfaces
+        // bind-time failures to the caller.
+        tracing::info!("Spice Runtime Flight listening on {bind_address}");
+        runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
         server
             .serve_with_shutdown(bind_address, token.cancelled())
             .await
     } else {
+        tracing::info!("Spice Runtime Flight listening on {bind_address}");
+        runtime_metrics::spiced_runtime::FLIGHT_SERVER_START.add(1, &[]);
         server.serve(bind_address).await
-    }
-    .map_err(|e| {
+    };
+
+    serve_result.map_err(|e| {
         if is_address_in_use_error(&e) {
             return Error::AddressAlreadyInUse {
                 addr: bind_address.to_string(),
@@ -590,6 +743,13 @@ pub struct RateLimits {
     /// Whether write rate limiting is enabled. When `false`, the rate limiter
     /// layer is still present but the check function always succeeds.
     flight_write_enabled: AtomicBool,
+    /// Rate limit applied to every request served by the `/metrics` HTTP endpoint
+    /// (both local scrapes and `?scope=cluster` fan-out). It is independent of the
+    /// data-path write limit so that clients can still retrieve observability data
+    /// even when their data requests are rate-limited. Because this throttles all
+    /// `/metrics` callers, lowering it to protect the expensive cluster fan-out
+    /// will also throttle ordinary local Prometheus scrapes.
+    pub metrics_endpoint_limit: Quota,
 }
 
 impl RateLimits {
@@ -611,6 +771,12 @@ impl RateLimits {
     }
 
     #[must_use]
+    pub fn with_metrics_endpoint_limit(mut self, rate_limit: Quota) -> Self {
+        self.metrics_endpoint_limit = rate_limit;
+        self
+    }
+
+    #[must_use]
     pub fn flight_write_enabled(&self) -> bool {
         self.flight_write_enabled.load(Ordering::Acquire)
     }
@@ -628,6 +794,13 @@ impl Default for RateLimits {
                 NonZeroU32::new(100).unwrap_or_else(|| unreachable!("100 is always non-zero")),
             ),
             flight_write_enabled: AtomicBool::new(true),
+            // Allow 100 /metrics HTTP requests every 60 seconds by default.
+            // This is a separate limiter from the data-path write limit so that
+            // clients can still retrieve observability data even when data
+            // requests are rate-limited.
+            metrics_endpoint_limit: Quota::per_minute(
+                NonZeroU32::new(100).unwrap_or_else(|| unreachable!("100 is always non-zero")),
+            ),
         }
     }
 }
